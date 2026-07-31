@@ -92,10 +92,12 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         "import local.Helper;\nclass Demo { void javaCaller() { javaHelper(); } void javaHelper() {} } interface Contract {} enum Color { RED }\n",
     )
     .expect("Java fixture should be written");
-    std::fs::create_dir_all(repository.path().join("local"))
+    std::fs::create_dir_all(repository.path().join("src/main/java/local"))
         .expect("local package directory should exist");
+    std::fs::create_dir_all(repository.path().join("local"))
+        .expect("Go local package directory should exist");
     std::fs::write(
-        repository.path().join("local/Helper.java"),
+        repository.path().join("src/main/java/local/Helper.java"),
         "package local; class Helper {}\n",
     )
     .expect("Java local import fixture should be written");
@@ -108,6 +110,8 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         .expect("Go module fixture should be written");
     std::fs::write(repository.path().join("local/local.go"), "package local\n")
         .expect("Go local import fixture should be written");
+    std::fs::write(repository.path().join("local/extra.go"), "package local\n")
+        .expect("second Go package fixture should be written");
     std::fs::write(
         repository.path().join("duplicate.rs"),
         "fn shared() { rust_unique(); }\nfn rust_unique() {}\n",
@@ -260,10 +264,17 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         import.source_path == "pkg/service.py" && import.target_path == "pkg/util.py"
     }));
     assert!(map.imports.iter().any(|import| {
-        import.source_path == "Demo.java" && import.target_path == "local/Helper.java"
+        import.source_path == "Demo.java" && import.target_path == "src/main/java/local/Helper.java"
     }));
+    assert!(
+        map.imports
+            .iter()
+            .any(|import| { import.source_path == "sample.go" && import.target_path == "local" })
+    );
     assert!(map.imports.iter().any(|import| {
-        import.source_path == "sample.go" && import.target_path == "local/local.go"
+        import.source_path == "src/lib.rs"
+            && import.target_path == "src/helper.rs"
+            && import.evidence.line == 1
     }));
     assert!(map.calls.iter().all(|call| call.caller != "shared"));
     let neighbors = structural_neighbors(&map, "run");

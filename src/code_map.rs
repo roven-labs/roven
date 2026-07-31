@@ -419,6 +419,21 @@ fn collect_rust_imports(
             },
             confidence: Confidence::Exact,
         });
+    } else if node.kind() == "mod_item"
+        && let Some(module) = node
+            .child_by_field_name("name")
+            .and_then(|node| node.utf8_text(source).ok())
+        && let Some(target_path) = rust_module_target(path, module, known_paths)
+    {
+        imports.push(Import {
+            source_path: path.into(),
+            target_path,
+            evidence: Evidence {
+                path: path.into(),
+                line: node.start_position().row + 1,
+            },
+            confidence: Confidence::Exact,
+        });
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -439,6 +454,27 @@ fn rust_import_target(
     [format!("src/{module}.rs"), format!("src/{module}/mod.rs")]
         .into_iter()
         .find(|candidate| known_paths.contains(candidate))
+}
+
+fn rust_module_target(
+    source_path: &str,
+    module: &str,
+    known_paths: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    let directory = source_path
+        .rsplit_once('/')
+        .map_or("", |(directory, _)| directory);
+    let prefix = if directory.is_empty() {
+        String::new()
+    } else {
+        format!("{directory}/")
+    };
+    [
+        format!("{prefix}{module}.rs"),
+        format!("{prefix}{module}/mod.rs"),
+    ]
+    .into_iter()
+    .find(|candidate| known_paths.contains(candidate))
 }
 
 fn collect_ecmascript_imports(
@@ -622,7 +658,16 @@ fn java_import_target(
     known_paths: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
     let candidate = format!("{}.java", module.replace('.', "/"));
-    known_paths.contains(&candidate).then_some(candidate)
+    if known_paths.contains(&candidate) {
+        return Some(candidate);
+    }
+    let suffix = format!("/{candidate}");
+    let mut matches = known_paths
+        .iter()
+        .filter(|path| path.ends_with(&suffix))
+        .cloned();
+    let target = matches.next()?;
+    matches.next().is_none().then_some(target)
 }
 
 fn collect_go_imports(
@@ -678,11 +723,10 @@ fn go_import_target(
         return None;
     }
     let prefix = format!("{local_directory}/");
-    let mut matches = known_paths
+    known_paths
         .iter()
-        .filter(|path| path.starts_with(&prefix) && path.ends_with(".go"));
-    let target = matches.next()?.clone();
-    matches.next().is_none().then_some(target)
+        .any(|path| path.starts_with(&prefix) && path.ends_with(".go"))
+        .then(|| local_directory.to_owned())
 }
 
 fn rust_tree(source: &str) -> Option<tree_sitter::Tree> {
