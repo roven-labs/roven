@@ -52,7 +52,15 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
     let mut candidate_calls = Vec::new();
 
     for file in inventory.files {
-        if !matches!(file.language, Language::Rust | Language::Python) {
+        if !matches!(
+            file.language,
+            Language::Rust
+                | Language::Python
+                | Language::JavaScript
+                | Language::TypeScript
+                | Language::Jsx
+                | Language::Tsx
+        ) {
             if !matches!(file.language, Language::GenericText) {
                 map.unsupported_paths.push(file.path);
             }
@@ -65,6 +73,10 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
         let tree = match file.language {
             Language::Rust => rust_tree(&source),
             Language::Python => python_tree(&source),
+            Language::JavaScript => javascript_tree(&source),
+            Language::TypeScript => typescript_tree(&source),
+            Language::Jsx => javascript_tree(&source),
+            Language::Tsx => tsx_tree(&source),
             _ => None,
         };
         let Some(tree) = tree else {
@@ -85,6 +97,22 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
                 &mut candidate_calls,
             ),
             Language::Python => visit_python(
+                tree.root_node(),
+                source.as_bytes(),
+                &file.path,
+                None,
+                &mut map.symbols,
+                &mut candidate_calls,
+            ),
+            Language::JavaScript => visit_javascript(
+                tree.root_node(),
+                source.as_bytes(),
+                &file.path,
+                None,
+                &mut map.symbols,
+                &mut candidate_calls,
+            ),
+            Language::TypeScript | Language::Jsx | Language::Tsx => visit_javascript(
                 tree.root_node(),
                 source.as_bytes(),
                 &file.path,
@@ -130,6 +158,73 @@ fn python_tree(source: &str) -> Option<tree_sitter::Tree> {
         .set_language(&tree_sitter_python::LANGUAGE.into())
         .ok()?;
     parser.parse(source, None)
+}
+
+fn javascript_tree(source: &str) -> Option<tree_sitter::Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_javascript::LANGUAGE.into())
+        .ok()?;
+    parser.parse(source, None)
+}
+
+fn typescript_tree(source: &str) -> Option<tree_sitter::Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .ok()?;
+    parser.parse(source, None)
+}
+
+fn tsx_tree(source: &str) -> Option<tree_sitter::Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
+        .ok()?;
+    parser.parse(source, None)
+}
+
+fn visit_javascript(
+    node: Node<'_>,
+    source: &[u8],
+    path: &str,
+    current_function: Option<&str>,
+    symbols: &mut Vec<Symbol>,
+    calls: &mut Vec<DirectCall>,
+) {
+    let mut next_function = current_function;
+    if node.kind() == "function_declaration" {
+        if let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|node| node.utf8_text(source).ok())
+        {
+            symbols.push(Symbol {
+                path: path.into(),
+                name: name.into(),
+                kind: SymbolKind::Function,
+                line: node.start_position().row + 1,
+            });
+            next_function = Some(name);
+        }
+    } else if node.kind() == "call_expression"
+        && let (Some(caller), Some(callee)) = (
+            current_function,
+            node.child_by_field_name("function")
+                .and_then(|node| node.utf8_text(source).ok()),
+        )
+        && callee
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+    {
+        calls.push(DirectCall {
+            caller: caller.into(),
+            callee: callee.into(),
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_javascript(child, source, path, next_function, symbols, calls);
+    }
 }
 
 fn visit_python(

@@ -31,6 +31,26 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         "def caller():\n    py_helper()\n\ndef py_helper():\n    pass\n",
     )
     .expect("Python fixture should be written");
+    std::fs::write(
+        repository.path().join("web.js"),
+        "function webCaller() { webHelper(); }\nfunction webHelper() {}\n",
+    )
+    .expect("JavaScript fixture should be written");
+    std::fs::write(
+        repository.path().join("typed.ts"),
+        "function typedCaller(): void { typedHelper(); }\nfunction typedHelper(): void {}\n",
+    )
+    .expect("TypeScript fixture should be written");
+    std::fs::write(
+        repository.path().join("view.tsx"),
+        "function viewCaller() { viewHelper(); return <div />; }\nfunction viewHelper() {}\n",
+    )
+    .expect("TSX fixture should be written");
+    std::fs::write(
+        repository.path().join("widget.jsx"),
+        "function jsxCaller() { jsxHelper(); return <div />; }\nfunction jsxHelper() {}\n",
+    )
+    .expect("JSX fixture should be written");
 
     let map = build_code_map(repository.path()).expect("map should be built");
 
@@ -64,5 +84,25 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         map.calls
             .iter()
             .any(|call| call.caller == "caller" && call.callee == "py_helper")
+    );
+    assert!(
+        map.calls
+            .iter()
+            .any(|call| call.caller == "webCaller" && call.callee == "webHelper")
+    );
+    assert!(
+        map.calls
+            .iter()
+            .any(|call| call.caller == "typedCaller" && call.callee == "typedHelper")
+    );
+    assert!(
+        map.calls
+            .iter()
+            .any(|call| call.caller == "viewCaller" && call.callee == "viewHelper")
+    );
+    assert!(
+        map.calls
+            .iter()
+            .any(|call| call.caller == "jsxCaller" && call.callee == "jsxHelper")
     );
 }
