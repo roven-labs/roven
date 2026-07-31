@@ -10,13 +10,13 @@ use clap::{Parser, Subcommand};
     long_about = None,
     arg_required_else_help = true
 )]
-struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
-enum Command {
+pub(crate) enum Command {
     /// Initialize PMEMC local storage.
     Init,
     /// Register or display projects.
@@ -47,7 +47,7 @@ enum Command {
 }
 
 #[derive(Debug, Subcommand)]
-enum ProjectCommand {
+pub(crate) enum ProjectCommand {
     /// Register a local Git working tree.
     Add {
         /// Path to the local Git working tree.
@@ -62,6 +62,6 @@ enum ProjectCommand {
     },
 }
 
-pub(crate) fn parse() {
-    let _cli = Cli::parse();
+pub(crate) fn parse() -> Command {
+    Cli::parse().command
 }
