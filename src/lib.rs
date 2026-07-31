@@ -3,6 +3,7 @@
 pub mod code_map;
 pub mod domain;
 pub mod git;
+pub mod inspection;
 pub mod inventory;
 pub mod storage;
 
