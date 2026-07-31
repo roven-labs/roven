@@ -257,7 +257,10 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
         });
     map.calls = candidate_calls
         .into_iter()
-        .filter(|call| counts.get(call.callee.as_str()) == Some(&1))
+        .filter(|call| {
+            counts.get(call.caller.as_str()) == Some(&1)
+                && counts.get(call.callee.as_str()) == Some(&1)
+        })
         .collect();
     map.symbols.sort_by(|left, right| {
         (&left.path, left.line, &left.name).cmp(&(&right.path, right.line, &right.name))
@@ -864,6 +867,18 @@ fn visit_python(
                 line: node.start_position().row + 1,
             });
             next_function = Some(name);
+        }
+    } else if node.kind() == "class_definition" {
+        if let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|node| node.utf8_text(source).ok())
+        {
+            symbols.push(Symbol {
+                path: path.into(),
+                name: name.into(),
+                kind: SymbolKind::Class,
+                line: node.start_position().row + 1,
+            });
         }
     } else if node.kind() == "call"
         && let (Some(caller), Some(callee)) = (

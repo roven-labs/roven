@@ -35,7 +35,7 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         .expect("malformed fixture should be written");
     std::fs::write(
         repository.path().join("good.py"),
-        "from .py_util import py_utility\ndef caller():\n    py_helper()\n\ndef py_helper():\n    pass\n",
+        "from .py_util import py_utility\nclass PythonService:\n    pass\n\ndef caller():\n    py_helper()\n\ndef py_helper():\n    pass\n",
     )
     .expect("Python fixture should be written");
     std::fs::write(
@@ -89,6 +89,16 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         .expect("Go module fixture should be written");
     std::fs::write(repository.path().join("local/local.go"), "package local\n")
         .expect("Go local import fixture should be written");
+    std::fs::write(
+        repository.path().join("duplicate.rs"),
+        "fn shared() { rust_unique(); }\nfn rust_unique() {}\n",
+    )
+    .expect("duplicate Rust caller fixture should be written");
+    std::fs::write(
+        repository.path().join("duplicate.py"),
+        "def shared():\n    python_unique()\n\ndef python_unique():\n    pass\n",
+    )
+    .expect("duplicate Python caller fixture should be written");
 
     let map = build_code_map(repository.path()).expect("map should be built");
 
@@ -132,6 +142,11 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         map.symbols
             .iter()
             .any(|symbol| symbol.name == "caller" && symbol.kind == SymbolKind::Function)
+    );
+    assert!(
+        map.symbols
+            .iter()
+            .any(|symbol| symbol.name == "PythonService" && symbol.kind == SymbolKind::Class)
     );
     assert!(
         map.calls
@@ -217,6 +232,7 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
     assert!(map.imports.iter().any(|import| {
         import.source_path == "sample.go" && import.target_path == "local/local.go"
     }));
+    assert!(map.calls.iter().all(|call| call.caller != "shared"));
     let neighbors = structural_neighbors(&map, "run");
     let neighbor_names = neighbors
         .iter()
