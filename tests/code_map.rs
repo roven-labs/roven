@@ -2,7 +2,7 @@ mod support;
 
 use std::process::Command;
 
-use pmemc::code_map::{SymbolKind, build_code_map};
+use pmemc::code_map::{SymbolKind, build_code_map, structural_neighbors};
 use support::TemporaryDirectory;
 
 fn git(repository: &std::path::Path, arguments: &[&str]) {
@@ -133,4 +133,10 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
     assert!(map.imports.iter().any(|import| {
         import.source_path == "src/lib.rs" && import.target_path == "src/helper.rs"
     }));
+    let neighbors = structural_neighbors(&map, "run");
+    let neighbor_names = neighbors
+        .iter()
+        .map(|symbol| symbol.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(neighbor_names, ["helper", "utility"]);
 }

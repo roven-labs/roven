@@ -209,6 +209,34 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
     Ok(map)
 }
 
+/// Return exact direct-call neighbours for one unambiguous symbol name.
+#[must_use]
+pub fn structural_neighbors(map: &CodeMap, symbol_name: &str) -> Vec<Symbol> {
+    let names = map
+        .calls
+        .iter()
+        .filter_map(|call| {
+            if call.caller == symbol_name {
+                Some(call.callee.as_str())
+            } else if call.callee == symbol_name {
+                Some(call.caller.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut neighbours = map
+        .symbols
+        .iter()
+        .filter(|symbol| names.contains(symbol.name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    neighbours.sort_by(|left, right| {
+        (&left.name, &left.path, left.line).cmp(&(&right.name, &right.path, right.line))
+    });
+    neighbours
+}
+
 fn collect_rust_imports(
     node: Node<'_>,
     source: &[u8],
