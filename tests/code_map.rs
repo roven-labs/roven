@@ -51,6 +51,16 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         "function jsxCaller() { jsxHelper(); return <div />; }\nfunction jsxHelper() {}\n",
     )
     .expect("JSX fixture should be written");
+    std::fs::write(
+        repository.path().join("Demo.java"),
+        "class Demo { void javaCaller() { javaHelper(); } void javaHelper() {} }\n",
+    )
+    .expect("Java fixture should be written");
+    std::fs::write(
+        repository.path().join("sample.go"),
+        "package sample\nfunc goCaller() { goHelper() }\nfunc goHelper() {}\n",
+    )
+    .expect("Go fixture should be written");
 
     let map = build_code_map(repository.path()).expect("map should be built");
 
@@ -104,5 +114,15 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         map.calls
             .iter()
             .any(|call| call.caller == "jsxCaller" && call.callee == "jsxHelper")
+    );
+    assert!(
+        map.calls
+            .iter()
+            .any(|call| call.caller == "javaCaller" && call.callee == "javaHelper")
+    );
+    assert!(
+        map.calls
+            .iter()
+            .any(|call| call.caller == "goCaller" && call.callee == "goHelper")
     );
 }

@@ -60,6 +60,8 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
                 | Language::TypeScript
                 | Language::Jsx
                 | Language::Tsx
+                | Language::Java
+                | Language::Go
         ) {
             if !matches!(file.language, Language::GenericText) {
                 map.unsupported_paths.push(file.path);
@@ -77,6 +79,8 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
             Language::TypeScript => typescript_tree(&source),
             Language::Jsx => javascript_tree(&source),
             Language::Tsx => tsx_tree(&source),
+            Language::Java => java_tree(&source),
+            Language::Go => go_tree(&source),
             _ => None,
         };
         let Some(tree) = tree else {
@@ -113,6 +117,22 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
                 &mut candidate_calls,
             ),
             Language::TypeScript | Language::Jsx | Language::Tsx => visit_javascript(
+                tree.root_node(),
+                source.as_bytes(),
+                &file.path,
+                None,
+                &mut map.symbols,
+                &mut candidate_calls,
+            ),
+            Language::Java => visit_java(
+                tree.root_node(),
+                source.as_bytes(),
+                &file.path,
+                None,
+                &mut map.symbols,
+                &mut candidate_calls,
+            ),
+            Language::Go => visit_go(
                 tree.root_node(),
                 source.as_bytes(),
                 &file.path,
@@ -182,6 +202,111 @@ fn tsx_tree(source: &str) -> Option<tree_sitter::Tree> {
         .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
         .ok()?;
     parser.parse(source, None)
+}
+
+fn java_tree(source: &str) -> Option<tree_sitter::Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .ok()?;
+    parser.parse(source, None)
+}
+
+fn go_tree(source: &str) -> Option<tree_sitter::Tree> {
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
+    parser.parse(source, None)
+}
+
+fn visit_java(
+    node: Node<'_>,
+    source: &[u8],
+    path: &str,
+    current_function: Option<&str>,
+    symbols: &mut Vec<Symbol>,
+    calls: &mut Vec<DirectCall>,
+) {
+    let mut next_function = current_function;
+    if node.kind() == "method_declaration" {
+        if let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|node| node.utf8_text(source).ok())
+        {
+            symbols.push(Symbol {
+                path: path.into(),
+                name: name.into(),
+                kind: SymbolKind::Method,
+                line: node.start_position().row + 1,
+            });
+            next_function = Some(name);
+        }
+    } else if node.kind() == "method_invocation"
+        && let (Some(caller), Some(callee)) = (
+            current_function,
+            node.child_by_field_name("name")
+                .and_then(|node| node.utf8_text(source).ok()),
+        )
+        && callee
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+    {
+        calls.push(DirectCall {
+            caller: caller.into(),
+            callee: callee.into(),
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_java(child, source, path, next_function, symbols, calls);
+    }
+}
+
+fn visit_go(
+    node: Node<'_>,
+    source: &[u8],
+    path: &str,
+    current_function: Option<&str>,
+    symbols: &mut Vec<Symbol>,
+    calls: &mut Vec<DirectCall>,
+) {
+    let mut next_function = current_function;
+    if matches!(node.kind(), "function_declaration" | "method_declaration") {
+        if let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|node| node.utf8_text(source).ok())
+        {
+            let kind = if node.kind() == "method_declaration" {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            };
+            symbols.push(Symbol {
+                path: path.into(),
+                name: name.into(),
+                kind,
+                line: node.start_position().row + 1,
+            });
+            next_function = Some(name);
+        }
+    } else if node.kind() == "call_expression"
+        && let (Some(caller), Some(callee)) = (
+            current_function,
+            node.child_by_field_name("function")
+                .and_then(|node| node.utf8_text(source).ok()),
+        )
+        && callee
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+    {
+        calls.push(DirectCall {
+            caller: caller.into(),
+            callee: callee.into(),
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_go(child, source, path, next_function, symbols, calls);
+    }
 }
 
 fn visit_javascript(
