@@ -35,9 +35,14 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         .expect("malformed fixture should be written");
     std::fs::write(
         repository.path().join("good.py"),
-        "def caller():\n    py_helper()\n\ndef py_helper():\n    pass\n",
+        "from .py_util import py_utility\ndef caller():\n    py_helper()\n\ndef py_helper():\n    pass\n",
     )
     .expect("Python fixture should be written");
+    std::fs::write(
+        repository.path().join("py_util.py"),
+        "def py_utility():\n    pass\n",
+    )
+    .expect("Python utility fixture should be written");
     std::fs::write(
         repository.path().join("web.js"),
         "import { utility } from \"./util.js\";\nfunction webCaller() { webHelper(); }\nfunction webHelper() {}\n",
@@ -189,6 +194,11 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         map.imports
             .iter()
             .any(|import| { import.source_path == "web.js" && import.target_path == "util.js" })
+    );
+    assert!(
+        map.imports.iter().any(|import| {
+            import.source_path == "good.py" && import.target_path == "py_util.py"
+        })
     );
     let neighbors = structural_neighbors(&map, "run");
     let neighbor_names = neighbors

@@ -219,6 +219,14 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
                 &known_paths,
                 &mut map.imports,
             );
+        } else if file.language == Language::Python {
+            collect_python_imports(
+                tree.root_node(),
+                source.as_bytes(),
+                &file.path,
+                &known_paths,
+                &mut map.imports,
+            );
         }
     }
 
@@ -436,6 +444,40 @@ fn relative_import_target(
         format!("{directory}/{module}")
     };
     known_paths.contains(&candidate).then_some(candidate)
+}
+
+fn collect_python_imports(
+    node: Node<'_>,
+    source: &[u8],
+    path: &str,
+    known_paths: &std::collections::BTreeSet<String>,
+    imports: &mut Vec<Import>,
+) {
+    if node.kind() == "import_from_statement"
+        && let Some(text) = node.utf8_text(source).ok()
+        && let Some(module) = text
+            .trim()
+            .strip_prefix("from ")
+            .and_then(|value| value.split(" import ").next())
+        && let Some(module) = module.strip_prefix('.')
+    {
+        let candidate = format!("{module}.py");
+        if known_paths.contains(&candidate) {
+            imports.push(Import {
+                source_path: path.into(),
+                target_path: candidate,
+                evidence: Evidence {
+                    path: path.into(),
+                    line: node.start_position().row + 1,
+                },
+                confidence: Confidence::Exact,
+            });
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_python_imports(child, source, path, known_paths, imports);
+    }
 }
 
 fn rust_tree(source: &str) -> Option<tree_sitter::Tree> {
