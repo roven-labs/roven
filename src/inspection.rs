@@ -38,7 +38,6 @@ pub struct EvidenceBundle {
     pub project_id: String,
     pub initial_inspection: bool,
     pub files: Vec<EvidenceFile>,
-    pub code_map: CodeMap,
 }
 
 /// Errors that prevent evidence construction after the approval gate.
@@ -133,6 +132,10 @@ fn build_bundle(
             content,
             redacted,
         });
+        if !bundle_fits(project_id, initial_inspection, &files) {
+            files.pop();
+            break;
+        }
     }
 
     Ok(EvidenceBundle {
@@ -140,8 +143,17 @@ fn build_bundle(
         project_id: project_id.into(),
         initial_inspection,
         files,
-        code_map,
     })
+}
+
+fn bundle_fits(project_id: &str, initial_inspection: bool, files: &[EvidenceFile]) -> bool {
+    serde_json::to_vec(&EvidenceBundle {
+        schema_version: BUNDLE_SCHEMA_VERSION,
+        project_id: project_id.into(),
+        initial_inspection,
+        files: files.into(),
+    })
+    .is_ok_and(|serialized| serialized.len() <= MAX_BUNDLE_BYTES)
 }
 
 fn incremental_paths(code_map: &CodeMap, status: &WorkingTreeStatus) -> BTreeSet<String> {
@@ -243,6 +255,9 @@ fn redact_suspected_secrets(content: String) -> (String, bool) {
                 "secret",
                 "token",
                 "authorization",
+                "private_key",
+                "private key",
+                "-----begin",
             ]
             .iter()
             .any(|marker| lower.contains(marker));

@@ -1,6 +1,9 @@
 //! Testable application entry points for PMEMC.
 
-use std::io::{self, Write};
+use std::{
+    collections::BTreeSet,
+    io::{self, Write},
+};
 
 pub mod code_map;
 pub mod domain;
@@ -41,8 +44,17 @@ fn inspect_command(project_id: &str) -> anyhow::Result<()> {
     let project = storage::project_by_id(&data_paths, id)?
         .ok_or_else(|| anyhow::anyhow!("project {project_id} is not registered"))?;
     let status = git::working_tree_status(&project.canonical_path)?;
-    println!("inspection scope for project-{id}: initial repository context");
+    let initial_inspection = project.lifecycle_state == "registered_needs_inspection";
+    let scope_description = if initial_inspection {
+        "initial repository context"
+    } else {
+        "changed files and direct structural context"
+    };
+    println!("inspection scope for project-{id}: {scope_description}");
     println!("changed paths detected: {}", changed_path_count(&status));
+    for path in inspection_scope_paths(&status) {
+        println!("scope\t{path}");
+    }
     print!("Inspect the reported repository files? [y/N] ");
     io::stdout().flush()?;
     let mut response = String::new();
@@ -52,7 +64,11 @@ fn inspect_command(project_id: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let bundle = inspection::build_initial_bundle(&project.canonical_path, project_id, &status)?;
+    let bundle = if initial_inspection {
+        inspection::build_initial_bundle(&project.canonical_path, project_id, &status)?
+    } else {
+        inspection::build_incremental_bundle(&project.canonical_path, project_id, &status)?
+    };
     let bundle_json = serde_json::to_string(&bundle)?;
     let attempt_id =
         storage::stage_inspection_attempt(&data_paths, id, bundle.schema_version, &bundle_json)?;
@@ -67,6 +83,24 @@ fn changed_path_count(status: &git::WorkingTreeStatus) -> usize {
         + status.staged_paths.len()
         + status.unstaged_paths.len()
         + status.deleted_paths.len()
+}
+
+fn inspection_scope_paths(status: &git::WorkingTreeStatus) -> BTreeSet<&str> {
+    status
+        .added_paths
+        .iter()
+        .chain(&status.modified_paths)
+        .chain(&status.untracked_paths)
+        .chain(&status.staged_paths)
+        .chain(&status.unstaged_paths)
+        .chain(&status.deleted_paths)
+        .map(String::as_str)
+        .chain(
+            status.relationships.iter().flat_map(|relationship| {
+                [relationship.source.as_str(), relationship.target.as_str()]
+            }),
+        )
+        .collect()
 }
 
 fn status_command(project_id: Option<String>) -> anyhow::Result<()> {

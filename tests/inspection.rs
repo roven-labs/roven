@@ -54,6 +54,11 @@ fn initial_bundle_is_bounded_deterministic_and_redacts_suspected_secrets() {
     .expect("source fixture should be written");
     std::fs::write(repository.path().join("README.md"), "# Fixture\n")
         .expect("readme fixture should be written");
+    std::fs::write(
+        repository.path().join("config.toml"),
+        "PRIVATE_KEY = \"-----BEGIN PRIVATE KEY-----sensitive-value\"\n",
+    )
+    .expect("private-key fixture should be written");
     std::fs::write(repository.path().join(".env"), "API_KEY=blocked-secret\n")
         .expect("blocked fixture should be written");
 
@@ -67,6 +72,8 @@ fn initial_bundle_is_bounded_deterministic_and_redacts_suspected_secrets() {
     assert_eq!(first, second);
     assert!(serialized.contains("[REDACTED]"));
     assert!(!serialized.contains("actual-secret-value"));
+    assert!(!serialized.contains("sensitive-value"));
+    assert!(!serialized.contains("-----BEGIN PRIVATE KEY-----"));
     assert!(!serialized.contains("blocked-secret"));
     assert!(first.files.iter().any(|file| file.path == "src/lib.rs"));
     assert!(first.files.iter().any(|file| file.path == "README.md"));
@@ -98,6 +105,7 @@ fn denied_inspection_does_not_read_source_or_create_a_pending_attempt() {
     assert!(inspection.status.success());
     let output = String::from_utf8_lossy(&inspection.stdout);
     assert!(output.contains("inspection cancelled"));
+    assert!(output.contains("unread-source.rs"));
     assert!(!output.contains("must-never-be-read"));
 
     let connection =
@@ -209,4 +217,77 @@ fn incremental_bundle_selects_changed_code_neighbours_tests_and_manifests() {
         paths,
         ["Cargo.toml", "src/helper.rs", "src/lib.rs", "tests/lib.rs"]
     );
+}
+
+#[test]
+fn inspect_uses_incremental_selection_after_a_baseline_exists() {
+    let data_directory = TemporaryDirectory::new();
+    let repository = TemporaryDirectory::new();
+    git_command(repository.path(), &["init"]);
+    git_command(
+        repository.path(),
+        &["config", "user.email", "pmemc-test@example.invalid"],
+    );
+    git_command(repository.path(), &["config", "user.name", "PMEMC Test"]);
+    std::fs::write(repository.path().join("main.rs"), "pub fn run() {}\n")
+        .expect("source fixture should be written");
+    git_command(repository.path(), &["add", "main.rs"]);
+    git_command(repository.path(), &["commit", "-m", "initial fixture"]);
+    let add = Command::new(env!("CARGO_BIN_EXE_pmemc"))
+        .args([
+            "project",
+            "add",
+            repository.path().to_str().expect("UTF-8 test path"),
+        ])
+        .env("LOCALAPPDATA", data_directory.path())
+        .output()
+        .expect("project should be registered");
+    assert!(add.status.success());
+    let database_path = data_directory.path().join("PMEMC").join("pmemc.sqlite3");
+    let connection = rusqlite::Connection::open(&database_path).expect("database should open");
+    connection
+        .execute(
+            "UPDATE projects SET lifecycle_state = 'baselined' WHERE id = 1",
+            [],
+        )
+        .expect("project should be marked baselined");
+    std::fs::write(
+        repository.path().join("main.rs"),
+        "pub fn run() {}\n// changed\n",
+    )
+    .expect("source fixture should change");
+
+    let inspection = pmemc_with_input(&data_directory, &["inspect", "project-1"], b"y\n");
+    assert!(inspection.status.success());
+    let stored_bundle: String = connection
+        .query_row(
+            "SELECT bundle_json FROM inspection_attempts ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("incremental bundle should be staged");
+    let bundle: serde_json::Value =
+        serde_json::from_str(&stored_bundle).expect("bundle should be valid JSON");
+    assert_eq!(bundle["initial_inspection"], false);
+}
+
+#[test]
+fn initial_bundle_never_exceeds_its_serialized_size_limit() {
+    let repository = TemporaryDirectory::new();
+    git_command(repository.path(), &["init"]);
+    for index in 0..20 {
+        std::fs::write(
+            repository.path().join(format!("notes-{index}.md")),
+            "x".repeat(8 * 1024),
+        )
+        .expect("large text fixture should be written");
+    }
+
+    let status = git::working_tree_status(repository.path()).expect("status should be read");
+    let bundle = build_initial_bundle(repository.path(), "project-1", &status)
+        .expect("bundle should be built");
+    let serialized = serde_json::to_vec(&bundle).expect("bundle should serialize");
+
+    assert!(serialized.len() <= 64 * 1024);
+    assert!(bundle.files.len() < 20);
 }
