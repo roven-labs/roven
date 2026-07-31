@@ -70,14 +70,25 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
     .expect("JSX fixture should be written");
     std::fs::write(
         repository.path().join("Demo.java"),
-        "class Demo { void javaCaller() { javaHelper(); } void javaHelper() {} } interface Contract {} enum Color { RED }\n",
+        "import local.Helper;\nclass Demo { void javaCaller() { javaHelper(); } void javaHelper() {} } interface Contract {} enum Color { RED }\n",
     )
     .expect("Java fixture should be written");
+    std::fs::create_dir_all(repository.path().join("local"))
+        .expect("local package directory should exist");
+    std::fs::write(
+        repository.path().join("local/Helper.java"),
+        "package local; class Helper {}\n",
+    )
+    .expect("Java local import fixture should be written");
     std::fs::write(
         repository.path().join("sample.go"),
-        "package sample\nfunc goCaller() { goHelper() }\nfunc goHelper() {}\n",
+        "package sample\nimport \"example/local\"\nfunc goCaller() { goHelper() }\nfunc goHelper() {}\n",
     )
     .expect("Go fixture should be written");
+    std::fs::write(repository.path().join("go.mod"), "module example\n")
+        .expect("Go module fixture should be written");
+    std::fs::write(repository.path().join("local/local.go"), "package local\n")
+        .expect("Go local import fixture should be written");
 
     let map = build_code_map(repository.path()).expect("map should be built");
 
@@ -200,6 +211,12 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
             import.source_path == "good.py" && import.target_path == "py_util.py"
         })
     );
+    assert!(map.imports.iter().any(|import| {
+        import.source_path == "Demo.java" && import.target_path == "local/Helper.java"
+    }));
+    assert!(map.imports.iter().any(|import| {
+        import.source_path == "sample.go" && import.target_path == "local/local.go"
+    }));
     let neighbors = structural_neighbors(&map, "run");
     let neighbor_names = neighbors
         .iter()

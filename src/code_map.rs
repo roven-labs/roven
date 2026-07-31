@@ -227,6 +227,23 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
                 &known_paths,
                 &mut map.imports,
             );
+        } else if file.language == Language::Java {
+            collect_java_imports(
+                tree.root_node(),
+                source.as_bytes(),
+                &file.path,
+                &known_paths,
+                &mut map.imports,
+            );
+        } else if file.language == Language::Go {
+            collect_go_imports(
+                tree.root_node(),
+                source.as_bytes(),
+                &file.path,
+                go_module_name(&root).as_deref(),
+                &known_paths,
+                &mut map.imports,
+            );
         }
     }
 
@@ -478,6 +495,107 @@ fn collect_python_imports(
     for child in node.children(&mut cursor) {
         collect_python_imports(child, source, path, known_paths, imports);
     }
+}
+
+fn collect_java_imports(
+    node: Node<'_>,
+    source: &[u8],
+    path: &str,
+    known_paths: &std::collections::BTreeSet<String>,
+    imports: &mut Vec<Import>,
+) {
+    if node.kind() == "import_declaration"
+        && let Some(text) = node.utf8_text(source).ok()
+        && let Some(module) = text
+            .trim()
+            .strip_prefix("import ")
+            .map(str::trim)
+            .and_then(|value| value.strip_suffix(';'))
+            .filter(|value| !value.starts_with("static ") && !value.ends_with(".*"))
+        && let Some(target_path) = java_import_target(module, known_paths)
+    {
+        imports.push(Import {
+            source_path: path.into(),
+            target_path,
+            evidence: Evidence {
+                path: path.into(),
+                line: node.start_position().row + 1,
+            },
+            confidence: Confidence::Exact,
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_java_imports(child, source, path, known_paths, imports);
+    }
+}
+
+fn java_import_target(
+    module: &str,
+    known_paths: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    let candidate = format!("{}.java", module.replace('.', "/"));
+    known_paths.contains(&candidate).then_some(candidate)
+}
+
+fn collect_go_imports(
+    node: Node<'_>,
+    source: &[u8],
+    path: &str,
+    module_name: Option<&str>,
+    known_paths: &std::collections::BTreeSet<String>,
+    imports: &mut Vec<Import>,
+) {
+    if node.kind() == "import_spec"
+        && let Some(text) = node.utf8_text(source).ok()
+        && let Some(module) = text
+            .split_whitespace()
+            .last()
+            .and_then(|value| value.strip_prefix('"'))
+            .and_then(|value| value.strip_suffix('"'))
+        && let Some(target_path) = go_import_target(module, module_name, known_paths)
+    {
+        imports.push(Import {
+            source_path: path.into(),
+            target_path,
+            evidence: Evidence {
+                path: path.into(),
+                line: node.start_position().row + 1,
+            },
+            confidence: Confidence::Exact,
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_go_imports(child, source, path, module_name, known_paths, imports);
+    }
+}
+
+fn go_module_name(root: &Path) -> Option<String> {
+    fs::read_to_string(root.join("go.mod"))
+        .ok()?
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("module ").map(str::trim))
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+fn go_import_target(
+    import_path: &str,
+    module_name: Option<&str>,
+    known_paths: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    let local_directory = import_path.strip_prefix(module_name?)?.trim_matches('/');
+    if local_directory.is_empty() {
+        return None;
+    }
+    let prefix = format!("{local_directory}/");
+    let mut matches = known_paths
+        .iter()
+        .filter(|path| path.starts_with(&prefix) && path.ends_with(".go"));
+    let target = matches.next()?.clone();
+    matches.next().is_none().then_some(target)
 }
 
 fn rust_tree(source: &str) -> Option<tree_sitter::Tree> {
