@@ -180,6 +180,19 @@ fn approved_inspection_with_missing_provider_configuration_preserves_a_redacted_
         })
         .expect("attempt should be retained for retry");
     assert_eq!(attempt_status, "provider_failed");
+    let snapshot_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM code_map_snapshots", [], |row| {
+            row.get(0)
+        })
+        .expect("approved inspection should retain one code-map snapshot");
+    let linked_snapshot_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM inspection_attempts WHERE code_map_snapshot_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("attempt should reference its code-map snapshot");
+    assert_eq!((snapshot_count, linked_snapshot_count), (1, 1));
 }
 
 #[test]
@@ -201,6 +214,16 @@ fn a_later_inspect_retries_the_retained_provider_attempt() {
     assert!(add.status.success());
 
     let first = pmemc_with_input(&data_directory, &["inspect", "project-1"], b"y\n");
+    let database_path = data_directory.path().join("PMEMC").join("pmemc.sqlite3");
+    let first_connection = rusqlite::Connection::open(&database_path)
+        .expect("database should open after the first failed attempt");
+    let original_snapshot_id: i64 = first_connection
+        .query_row(
+            "SELECT code_map_snapshot_id FROM inspection_attempts WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the first attempt should retain a code-map snapshot");
     std::fs::write(repository.path().join("later.rs"), "pub fn later() {}\n")
         .expect("later source fixture should be written");
     let second = pmemc_with_input(&data_directory, &["inspect", "project-1"], b"y\n");
@@ -211,9 +234,7 @@ fn a_later_inspect_retries_the_retained_provider_attempt() {
     assert!(retry_output.contains("retained approved evidence"));
     assert!(retry_output.contains("scope\tmain.rs"));
     assert!(!retry_output.contains("scope\tlater.rs"));
-    let connection =
-        rusqlite::Connection::open(data_directory.path().join("PMEMC").join("pmemc.sqlite3"))
-            .expect("database should open");
+    let connection = rusqlite::Connection::open(&database_path).expect("database should open");
     let attempt_count: i64 = connection
         .query_row("SELECT COUNT(*) FROM inspection_attempts", [], |row| {
             row.get(0)
@@ -224,7 +245,20 @@ fn a_later_inspect_retries_the_retained_provider_attempt() {
             row.get(0)
         })
         .expect("invocation count should be readable");
-    assert_eq!((attempt_count, invocation_count), (1, 2));
+    let retained_snapshot_id: i64 = connection
+        .query_row(
+            "SELECT code_map_snapshot_id FROM inspection_attempts WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("retry should retain the original code-map snapshot");
+    let snapshot_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM code_map_snapshots", [], |row| {
+            row.get(0)
+        })
+        .expect("retry should not create another snapshot");
+    assert_eq!((attempt_count, invocation_count, snapshot_count), (1, 2, 1));
+    assert_eq!(retained_snapshot_id, original_snapshot_id);
 }
 
 #[test]

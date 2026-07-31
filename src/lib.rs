@@ -113,19 +113,20 @@ fn inspect_command(project_id: &str) -> anyhow::Result<()> {
         storage::retry_provider_attempt(&data_paths, attempt.id)?;
         (attempt.bundle, attempt.id)
     } else {
-        let bundle = if initial_inspection {
-            inspection::build_initial_bundle(&project.canonical_path, project_id, &status)?
+        let package = if initial_inspection {
+            inspection::build_initial_package(&project.canonical_path, project_id, &status)?
         } else {
-            inspection::build_incremental_bundle(&project.canonical_path, project_id, &status)?
+            inspection::build_incremental_package(&project.canonical_path, project_id, &status)?
         };
-        let bundle_json = serde_json::to_string(&bundle)?;
-        let attempt_id = storage::stage_inspection_attempt(
+        let bundle_json = serde_json::to_string(&package.bundle)?;
+        let attempt_id = storage::stage_inspection_attempt_with_code_map(
             &data_paths,
             id,
-            bundle.schema_version,
+            package.bundle.schema_version,
             &bundle_json,
+            Some(&package.code_map_json),
         )?;
-        (bundle, attempt_id)
+        (package.bundle, attempt_id)
     };
     let provider = match provider::OpenRouterProvider::from_environment() {
         Ok(provider) => provider,

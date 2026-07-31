@@ -20,6 +20,7 @@ const APPLICATION_DIRECTORY: &str = "PMEMC";
 const DATABASE_FILE: &str = "pmemc.sqlite3";
 const CACHE_DIRECTORY: &str = "cache";
 const EXPORTS_DIRECTORY: &str = "exports";
+const CODE_MAP_SNAPSHOT_SCHEMA_VERSION: i64 = 1;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -91,6 +92,19 @@ const MIGRATIONS: &[Migration] = &[
             status TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+    ",
+    },
+    Migration {
+        version: 5,
+        sql: "
+        CREATE TABLE code_map_snapshots (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES projects(id),
+            schema_version INTEGER NOT NULL,
+            serialized_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        ALTER TABLE inspection_attempts ADD COLUMN code_map_snapshot_id INTEGER REFERENCES code_map_snapshots(id);
     ",
     },
 ];
@@ -375,6 +389,28 @@ pub fn stage_inspection_attempt(
     bundle_schema_version: u8,
     bundle_json: &str,
 ) -> Result<i64, StorageError> {
+    stage_inspection_attempt_with_code_map(
+        data_paths,
+        project_id,
+        bundle_schema_version,
+        bundle_json,
+        None,
+    )
+}
+
+/// Persist an approval-gated evidence bundle and its structural-map snapshot.
+///
+/// # Errors
+///
+/// Returns an error when the project is missing or SQLite cannot atomically
+/// retain the attempt and supplied map snapshot.
+pub fn stage_inspection_attempt_with_code_map(
+    data_paths: &DataPaths,
+    project_id: i64,
+    bundle_schema_version: u8,
+    bundle_json: &str,
+    code_map_json: Option<&str>,
+) -> Result<i64, StorageError> {
     initialize(data_paths)?;
     let mut connection = Connection::open(data_paths.database_path())
         .map_err(|source| StorageError::ProjectDatabase { source })?;
@@ -392,10 +428,25 @@ pub fn stage_inspection_attempt(
         .ok_or_else(|| StorageError::ProjectDatabase {
             source: rusqlite::Error::QueryReturnedNoRows,
         })?;
+    let code_map_snapshot_id = if let Some(code_map_json) = code_map_json {
+        transaction
+            .execute(
+                "INSERT INTO code_map_snapshots (project_id, schema_version, serialized_json) VALUES (?1, ?2, ?3)",
+                params![
+                    project_id,
+                    CODE_MAP_SNAPSHOT_SCHEMA_VERSION,
+                    code_map_json
+                ],
+            )
+            .map_err(|source| StorageError::ProjectDatabase { source })?;
+        Some(transaction.last_insert_rowid())
+    } else {
+        None
+    };
     transaction
         .execute(
-            "INSERT INTO inspection_attempts (project_id, status, previous_lifecycle_state, bundle_schema_version, bundle_json) VALUES (?1, 'staged_pending_provider', ?2, ?3, ?4)",
-            params![project_id, previous_lifecycle_state, bundle_schema_version, bundle_json],
+            "INSERT INTO inspection_attempts (project_id, status, previous_lifecycle_state, bundle_schema_version, bundle_json, code_map_snapshot_id) VALUES (?1, 'staged_pending_provider', ?2, ?3, ?4, ?5)",
+            params![project_id, previous_lifecycle_state, bundle_schema_version, bundle_json, code_map_snapshot_id],
         )
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let attempt_id = transaction.last_insert_rowid();
@@ -749,5 +800,59 @@ mod tests {
             )
             .expect("SQLite metadata query should succeed");
         assert_eq!(table_count, 0);
+    }
+
+    #[test]
+    fn code_map_snapshot_migration_preserves_existing_provider_records() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite should open");
+        apply_migrations(&mut connection, &MIGRATIONS[..4])
+            .expect("version four database should initialize");
+        connection
+            .execute(
+                "INSERT INTO projects (id, display_name, canonical_path, lifecycle_state) VALUES (1, 'fixture', 'C:/fixture', 'registered_needs_inspection')",
+                [],
+            )
+            .expect("project fixture should insert");
+        connection
+            .execute(
+                "INSERT INTO inspection_attempts (id, project_id, status, previous_lifecycle_state, bundle_schema_version, bundle_json) VALUES (1, 1, 'provider_failed', 'registered_needs_inspection', 1, '{}')",
+                [],
+            )
+            .expect("attempt fixture should insert");
+        connection
+            .execute(
+                "INSERT INTO provider_invocations (inspection_attempt_id, provider_id, model_id, prompt_schema_version, status, failure_category) VALUES (1, 'fake', 'fixture-model', 1, 'failed', 'configuration')",
+                [],
+            )
+            .expect("provider fixture should insert");
+
+        apply_migrations(&mut connection, MIGRATIONS)
+            .expect("code-map snapshot migration should upgrade version four data");
+
+        let preserved_rows: (i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM inspection_attempts), (SELECT COUNT(*) FROM provider_invocations)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("existing records should remain readable");
+        let original_snapshot: Option<i64> = connection
+            .query_row(
+                "SELECT code_map_snapshot_id FROM inspection_attempts WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preexisting attempt should gain a nullable snapshot reference");
+        let snapshot_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'code_map_snapshots'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("snapshot table should exist after migration");
+
+        assert_eq!(preserved_rows, (1, 1));
+        assert_eq!(original_snapshot, None);
+        assert_eq!(snapshot_table_count, 1);
     }
 }

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    code_map::{CodeMap, CodeMapError, build_code_map, structural_neighbors},
+    code_map::{CodeMap, CodeMapError, build_code_map, serialize_code_map, structural_neighbors},
     git::WorkingTreeStatus,
     inventory::Language,
 };
@@ -40,11 +40,22 @@ pub struct EvidenceBundle {
     pub files: Vec<EvidenceFile>,
 }
 
+/// Immutable inspection material retained locally for later review finalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectionPackage {
+    /// The minimized, provider-approved evidence bundle.
+    pub bundle: EvidenceBundle,
+    /// Deterministic serialization of the structural map used to select evidence.
+    pub code_map_json: String,
+}
+
 /// Errors that prevent evidence construction after the approval gate.
 #[derive(Debug, Error)]
 pub enum InspectionError {
     #[error(transparent)]
     CodeMap(#[from] CodeMapError),
+    #[error("cannot serialize the compact code map")]
+    SerializeCodeMap(#[source] serde_json::Error),
 }
 
 /// Build the initial inspection bundle without executing repository code.
@@ -60,21 +71,42 @@ pub fn build_initial_bundle(
     project_id: &str,
     status: &WorkingTreeStatus,
 ) -> Result<EvidenceBundle, InspectionError> {
+    Ok(build_initial_package(repository, project_id, status)?.bundle)
+}
+
+/// Build the initial provider bundle together with its immutable structural map.
+///
+/// Callers must obtain operator approval before calling this function because it
+/// reads repository content through the compact-map and excerpt steps.
+///
+/// # Errors
+///
+/// Returns an error when the compact map cannot be built or serialized.
+pub fn build_initial_package(
+    repository: &Path,
+    project_id: &str,
+    status: &WorkingTreeStatus,
+) -> Result<InspectionPackage, InspectionError> {
     let code_map = build_code_map(repository)?;
+    let code_map_json = serialize_code_map(&code_map).map_err(InspectionError::SerializeCodeMap)?;
     let selected_paths = code_map
         .files
         .iter()
         .filter(|file| !matches!(file.language, Language::Unsupported))
         .map(|file| file.path.clone())
         .collect();
-    build_bundle(
+    let bundle = build_bundle(
         repository,
         project_id,
         status,
         true,
         code_map,
         &selected_paths,
-    )
+    )?;
+    Ok(InspectionPackage {
+        bundle,
+        code_map_json,
+    })
 }
 
 /// Build a minimized bundle for changed files and their exact local context.
@@ -87,16 +119,34 @@ pub fn build_incremental_bundle(
     project_id: &str,
     status: &WorkingTreeStatus,
 ) -> Result<EvidenceBundle, InspectionError> {
+    Ok(build_incremental_package(repository, project_id, status)?.bundle)
+}
+
+/// Build an incremental provider bundle together with its immutable structural map.
+///
+/// # Errors
+///
+/// Returns an error when the compact map cannot be built or serialized.
+pub fn build_incremental_package(
+    repository: &Path,
+    project_id: &str,
+    status: &WorkingTreeStatus,
+) -> Result<InspectionPackage, InspectionError> {
     let code_map = build_code_map(repository)?;
+    let code_map_json = serialize_code_map(&code_map).map_err(InspectionError::SerializeCodeMap)?;
     let selected_paths = incremental_paths(&code_map, status);
-    build_bundle(
+    let bundle = build_bundle(
         repository,
         project_id,
         status,
         false,
         code_map,
         &selected_paths,
-    )
+    )?;
+    Ok(InspectionPackage {
+        bundle,
+        code_map_json,
+    })
 }
 
 fn build_bundle(
