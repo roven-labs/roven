@@ -21,9 +21,14 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
     std::fs::create_dir_all(repository.path().join("src")).expect("source directory should exist");
     std::fs::write(
         repository.path().join("src/lib.rs"),
-        "pub struct Service;\nimpl Service { pub fn start(&self) {} }\npub fn run() { helper(); }\nfn helper() {}\n",
+        "mod helper;\nuse crate::helper::utility;\npub struct Service;\nimpl Service { pub fn start(&self) {} }\npub fn run() { helper(); utility(); }\nfn helper() {}\n",
     )
     .expect("Rust fixture should be written");
+    std::fs::write(
+        repository.path().join("src/helper.rs"),
+        "pub fn utility() {}\n",
+    )
+    .expect("Rust helper fixture should be written");
     std::fs::write(repository.path().join("broken.py"), "def unfinished(:\n")
         .expect("malformed fixture should be written");
     std::fs::write(
@@ -125,4 +130,7 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
             .iter()
             .any(|call| call.caller == "goCaller" && call.callee == "goHelper")
     );
+    assert!(map.imports.iter().any(|import| {
+        import.source_path == "src/lib.rs" && import.target_path == "src/helper.rs"
+    }));
 }

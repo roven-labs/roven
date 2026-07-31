@@ -26,12 +26,36 @@ pub struct Symbol {
 pub struct DirectCall {
     pub caller: String,
     pub callee: String,
+    pub evidence: Evidence,
+    pub confidence: Confidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confidence {
+    Exact,
+    Inferred,
+    UserConfirmed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Evidence {
+    pub path: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Import {
+    pub source_path: String,
+    pub target_path: String,
+    pub evidence: Evidence,
+    pub confidence: Confidence,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CodeMap {
     pub symbols: Vec<Symbol>,
     pub calls: Vec<DirectCall>,
+    pub imports: Vec<Import>,
     pub unsupported_paths: Vec<String>,
 }
 
@@ -48,6 +72,11 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
         message: source.to_string(),
     })?;
     let inventory = inventory(&root)?;
+    let known_paths = inventory
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
     let mut map = CodeMap::default();
     let mut candidate_calls = Vec::new();
 
@@ -142,6 +171,15 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
             ),
             _ => unreachable!("only structural languages reach this branch"),
         }
+        if file.language == Language::Rust {
+            collect_rust_imports(
+                tree.root_node(),
+                source.as_bytes(),
+                &file.path,
+                &known_paths,
+                &mut map.imports,
+            );
+        }
     }
 
     let counts = map
@@ -161,7 +199,56 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
     map.calls
         .sort_by(|left, right| (&left.caller, &left.callee).cmp(&(&right.caller, &right.callee)));
     map.unsupported_paths.sort();
+    map.imports.sort_by(|left, right| {
+        (&left.source_path, &left.target_path, left.evidence.line).cmp(&(
+            &right.source_path,
+            &right.target_path,
+            right.evidence.line,
+        ))
+    });
     Ok(map)
+}
+
+fn collect_rust_imports(
+    node: Node<'_>,
+    source: &[u8],
+    path: &str,
+    known_paths: &std::collections::BTreeSet<String>,
+    imports: &mut Vec<Import>,
+) {
+    if node.kind() == "use_declaration"
+        && let Some(text) = node.utf8_text(source).ok()
+        && let Some(target_path) = rust_import_target(text, known_paths)
+    {
+        imports.push(Import {
+            source_path: path.into(),
+            target_path,
+            evidence: Evidence {
+                path: path.into(),
+                line: node.start_position().row + 1,
+            },
+            confidence: Confidence::Exact,
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_rust_imports(child, source, path, known_paths, imports);
+    }
+}
+
+fn rust_import_target(
+    declaration: &str,
+    known_paths: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    let module = declaration
+        .trim()
+        .strip_prefix("use crate::")?
+        .split("::")
+        .next()?
+        .trim();
+    [format!("src/{module}.rs"), format!("src/{module}/mod.rs")]
+        .into_iter()
+        .find(|candidate| known_paths.contains(candidate))
 }
 
 fn rust_tree(source: &str) -> Option<tree_sitter::Tree> {
@@ -253,6 +340,11 @@ fn visit_java(
         calls.push(DirectCall {
             caller: caller.into(),
             callee: callee.into(),
+            evidence: Evidence {
+                path: path.into(),
+                line: node.start_position().row + 1,
+            },
+            confidence: Confidence::Exact,
         });
     }
     let mut cursor = node.walk();
@@ -301,6 +393,11 @@ fn visit_go(
         calls.push(DirectCall {
             caller: caller.into(),
             callee: callee.into(),
+            evidence: Evidence {
+                path: path.into(),
+                line: node.start_position().row + 1,
+            },
+            confidence: Confidence::Exact,
         });
     }
     let mut cursor = node.walk();
@@ -344,6 +441,11 @@ fn visit_javascript(
         calls.push(DirectCall {
             caller: caller.into(),
             callee: callee.into(),
+            evidence: Evidence {
+                path: path.into(),
+                line: node.start_position().row + 1,
+            },
+            confidence: Confidence::Exact,
         });
     }
     let mut cursor = node.walk();
@@ -387,6 +489,11 @@ fn visit_python(
         calls.push(DirectCall {
             caller: caller.into(),
             callee: callee.into(),
+            evidence: Evidence {
+                path: path.into(),
+                line: node.start_position().row + 1,
+            },
+            confidence: Confidence::Exact,
         });
     }
     let mut cursor = node.walk();
@@ -447,6 +554,11 @@ fn visit_rust(
         calls.push(DirectCall {
             caller: caller.into(),
             callee: callee.into(),
+            evidence: Evidence {
+                path: path.into(),
+                line: node.start_position().row + 1,
+            },
+            confidence: Confidence::Exact,
         });
     }
     let mut cursor = node.walk();
