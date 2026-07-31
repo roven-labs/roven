@@ -59,6 +59,11 @@ fn initial_bundle_is_bounded_deterministic_and_redacts_suspected_secrets() {
         "PRIVATE_KEY = \"-----BEGIN PRIVATE KEY-----sensitive-value\"\n",
     )
     .expect("private-key fixture should be written");
+    std::fs::write(
+        repository.path().join("notes.md"),
+        "-----BEGIN PRIVATE KEY-----\nprivate-key-body-must-not-leak\n-----END PRIVATE KEY-----\n",
+    )
+    .expect("PEM fixture should be written");
     std::fs::write(repository.path().join(".env"), "API_KEY=blocked-secret\n")
         .expect("blocked fixture should be written");
 
@@ -74,6 +79,7 @@ fn initial_bundle_is_bounded_deterministic_and_redacts_suspected_secrets() {
     assert!(!serialized.contains("actual-secret-value"));
     assert!(!serialized.contains("sensitive-value"));
     assert!(!serialized.contains("-----BEGIN PRIVATE KEY-----"));
+    assert!(!serialized.contains("private-key-body-must-not-leak"));
     assert!(!serialized.contains("blocked-secret"));
     assert!(first.files.iter().any(|file| file.path == "src/lib.rs"));
     assert!(first.files.iter().any(|file| file.path == "README.md"));

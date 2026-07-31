@@ -244,31 +244,39 @@ fn truncate_to_byte_limit(value: &str, limit: usize) -> String {
 
 fn redact_suspected_secrets(content: String) -> (String, bool) {
     let mut redacted = false;
-    let lines = content
-        .split_inclusive('\n')
-        .map(|line| {
-            let lower = line.to_ascii_lowercase();
-            let looks_sensitive = [
-                "api_key",
-                "api_token",
-                "password",
-                "secret",
-                "token",
-                "authorization",
-                "private_key",
-                "private key",
-                "-----begin",
-            ]
-            .iter()
-            .any(|marker| lower.contains(marker));
-            let separator = line.find('=').or_else(|| line.find(':'));
-            if looks_sensitive && let Some(separator) = separator {
-                redacted = true;
-                format!("{} [REDACTED]\n", &line[..=separator])
-            } else {
-                line.into()
-            }
-        })
-        .collect();
-    (lines, redacted)
+    let mut private_key_block = false;
+    let mut result = String::new();
+    for line in content.split_inclusive('\n') {
+        let lower = line.to_ascii_lowercase();
+        let begins_private_key = lower.contains("-----begin");
+        let ends_private_key = lower.contains("-----end");
+        if private_key_block || begins_private_key {
+            redacted = true;
+            private_key_block = !ends_private_key;
+            result.push_str("[REDACTED]\n");
+            continue;
+        }
+
+        let looks_sensitive = [
+            "api_key",
+            "api_token",
+            "password",
+            "secret",
+            "token",
+            "authorization",
+            "private_key",
+            "private key",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
+        let separator = line.find('=').or_else(|| line.find(':'));
+        if looks_sensitive && let Some(separator) = separator {
+            redacted = true;
+            result.push_str(&line[..=separator]);
+            result.push_str(" [REDACTED]\n");
+        } else {
+            result.push_str(line);
+        }
+    }
+    (result, redacted)
 }
