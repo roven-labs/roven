@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 const APPLICATION_DIRECTORY: &str = "PMEMC";
@@ -14,15 +14,31 @@ const DATABASE_FILE: &str = "pmemc.sqlite3";
 const CACHE_DIRECTORY: &str = "cache";
 const EXPORTS_DIRECTORY: &str = "exports";
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: "
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: "
         CREATE TABLE pmemc_metadata (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
     ",
-}];
+    },
+    Migration {
+        version: 2,
+        sql: "
+        CREATE TABLE projects (
+            id INTEGER PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            canonical_path TEXT NOT NULL UNIQUE,
+            lifecycle_state TEXT NOT NULL,
+            current_branch TEXT,
+            head_commit TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+    ",
+    },
+];
 
 struct Migration {
     version: i64,
@@ -73,6 +89,23 @@ pub struct Initialization {
     database_path: PathBuf,
 }
 
+/// A registered repository record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Project {
+    /// Stable project identifier.
+    pub id: i64,
+    /// User-visible repository name.
+    pub display_name: String,
+    /// Canonical repository path.
+    pub canonical_path: PathBuf,
+    /// Durable lifecycle state.
+    pub lifecycle_state: String,
+    /// Current Git branch when available.
+    pub current_branch: Option<String>,
+    /// Current Git HEAD when available.
+    pub head_commit: Option<String>,
+}
+
 impl Initialization {
     /// Return the initialized SQLite database file path.
     #[must_use]
@@ -111,6 +144,15 @@ pub enum StorageError {
     #[error("cannot migrate the PMEMC database")]
     Migration {
         /// Underlying SQLite error.
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// A project with the same canonical path is already registered.
+    #[error("the repository at {path} is already registered")]
+    DuplicateProject { path: PathBuf },
+    /// A database operation for projects failed.
+    #[error("cannot update the PMEMC project store")]
+    ProjectDatabase {
         #[source]
         source: rusqlite::Error,
     },
@@ -164,6 +206,80 @@ pub fn initialize(data_paths: &DataPaths) -> Result<Initialization, StorageError
     apply_migrations(&mut connection, MIGRATIONS)?;
 
     Ok(Initialization { database_path })
+}
+
+/// Store a new registered project without inspecting repository source content.
+///
+/// # Errors
+///
+/// Returns an error if the project already exists or SQLite cannot persist it.
+pub fn add_project(
+    data_paths: &DataPaths,
+    display_name: &str,
+    canonical_path: &Path,
+    current_branch: Option<&str>,
+    head_commit: Option<&str>,
+) -> Result<Project, StorageError> {
+    initialize(data_paths)?;
+    let database_path = data_paths.database_path();
+    let connection = Connection::open(database_path)
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let result = connection.execute(
+        "INSERT INTO projects (display_name, canonical_path, lifecycle_state, current_branch, head_commit) VALUES (?1, ?2, 'registered_needs_inspection', ?3, ?4)",
+        params![display_name, canonical_path.to_string_lossy(), current_branch, head_commit],
+    );
+    match result {
+        Ok(_) => Ok(Project {
+            id: connection.last_insert_rowid(),
+            display_name: display_name.into(),
+            canonical_path: canonical_path.into(),
+            lifecycle_state: "registered_needs_inspection".into(),
+            current_branch: current_branch.map(str::to_owned),
+            head_commit: head_commit.map(str::to_owned),
+        }),
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+        {
+            Err(StorageError::DuplicateProject {
+                path: canonical_path.into(),
+            })
+        }
+        Err(source) => Err(StorageError::ProjectDatabase { source }),
+    }
+}
+
+/// List every registered project.
+///
+/// # Errors
+///
+/// Returns an error if SQLite cannot read the project records.
+pub fn list_projects(data_paths: &DataPaths) -> Result<Vec<Project>, StorageError> {
+    initialize(data_paths)?;
+    let connection = Connection::open(data_paths.database_path())
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let mut statement = connection.prepare("SELECT id, display_name, canonical_path, lifecycle_state, current_branch, head_commit FROM projects ORDER BY id").map_err(|source| StorageError::ProjectDatabase { source })?;
+    statement
+        .query_map([], |row| {
+            Ok(Project {
+                id: row.get(0)?,
+                display_name: row.get(1)?,
+                canonical_path: PathBuf::from(row.get::<_, String>(2)?),
+                lifecycle_state: row.get(3)?,
+                current_branch: row.get(4)?,
+                head_commit: row.get(5)?,
+            })
+        })
+        .map_err(|source| StorageError::ProjectDatabase { source })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| StorageError::ProjectDatabase { source })
+}
+
+/// Look up a project by its numeric ID.
+pub fn project_by_id(data_paths: &DataPaths, id: i64) -> Result<Option<Project>, StorageError> {
+    initialize(data_paths)?;
+    let connection = Connection::open(data_paths.database_path())
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    connection.query_row("SELECT id, display_name, canonical_path, lifecycle_state, current_branch, head_commit FROM projects WHERE id = ?1", params![id], |row| Ok(Project { id: row.get(0)?, display_name: row.get(1)?, canonical_path: PathBuf::from(row.get::<_, String>(2)?), lifecycle_state: row.get(3)?, current_branch: row.get(4)?, head_commit: row.get(5)? })).optional().map_err(|source| StorageError::ProjectDatabase { source })
 }
 
 fn create_directory(path: &Path) -> Result<(), StorageError> {
