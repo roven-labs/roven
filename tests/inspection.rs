@@ -5,7 +5,10 @@ use std::{
     process::{Command, Stdio},
 };
 
-use pmemc::{git, inspection::build_initial_bundle};
+use pmemc::{
+    git,
+    inspection::{build_incremental_bundle, build_initial_bundle},
+};
 use support::TemporaryDirectory;
 
 fn git_command(repository: &std::path::Path, arguments: &[&str]) {
@@ -151,4 +154,59 @@ fn approved_inspection_stages_a_redacted_bundle_and_marks_the_project_pending_re
         )
         .expect("project should exist");
     assert_eq!(lifecycle_state, "inspection_pending_review");
+}
+
+#[test]
+fn incremental_bundle_selects_changed_code_neighbours_tests_and_manifests() {
+    let repository = TemporaryDirectory::new();
+    git_command(repository.path(), &["init"]);
+    git_command(
+        repository.path(),
+        &["config", "user.email", "pmemc-test@example.invalid"],
+    );
+    git_command(repository.path(), &["config", "user.name", "PMEMC Test"]);
+    std::fs::create_dir_all(repository.path().join("src")).expect("src directory should exist");
+    std::fs::create_dir_all(repository.path().join("tests")).expect("test directory should exist");
+    std::fs::write(
+        repository.path().join("src/lib.rs"),
+        "pub fn run() { helper(); }\n",
+    )
+    .expect("source fixture should be written");
+    std::fs::write(
+        repository.path().join("src/helper.rs"),
+        "pub fn helper() {}\n",
+    )
+    .expect("neighbour fixture should be written");
+    std::fs::write(
+        repository.path().join("tests/lib.rs"),
+        "#[test] fn run_works() {}\n",
+    )
+    .expect("test fixture should be written");
+    std::fs::write(
+        repository.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\n",
+    )
+    .expect("manifest fixture should be written");
+    git_command(repository.path(), &["add", "."]);
+    git_command(repository.path(), &["commit", "-m", "initial fixture"]);
+    std::fs::write(
+        repository.path().join("src/lib.rs"),
+        "pub fn run() { helper(); }\n// changed\n",
+    )
+    .expect("changed fixture should be written");
+
+    let status = git::working_tree_status(repository.path()).expect("status should be read");
+    let bundle = build_incremental_bundle(repository.path(), "project-1", &status)
+        .expect("incremental bundle should be built");
+    let paths = bundle
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(!bundle.initial_inspection);
+    assert_eq!(
+        paths,
+        ["Cargo.toml", "src/helper.rs", "src/lib.rs", "tests/lib.rs"]
+    );
 }
