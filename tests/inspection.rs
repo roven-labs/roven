@@ -489,6 +489,197 @@ fn review_interactively_applies_all_normal_and_conflict_decisions() {
 }
 
 #[test]
+fn finalization_is_atomic_and_defers_conflict_supersession_until_commit() {
+    let data_directory = TemporaryDirectory::new();
+    let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
+    let project = storage::add_project(
+        &data_paths,
+        "fixture",
+        data_directory.path().join("repository").as_path(),
+        None,
+        None,
+    )
+    .expect("project should be stored");
+    let bundle = EvidenceBundle {
+        schema_version: 1,
+        project_id: format!("project-{}", project.id),
+        initial_inspection: true,
+        files: vec![EvidenceFile {
+            path: "src/lib.rs".into(),
+            state: EvidenceState::Committed,
+            content: "pub fn run() {}".into(),
+            redacted: false,
+        }],
+    };
+    let bundle_json = serde_json::to_string(&bundle).expect("bundle should serialize");
+    let attempt_id = storage::stage_inspection_attempt_with_provenance(
+        &data_paths,
+        project.id,
+        1,
+        &bundle_json,
+        Some(r#"{"symbols":[{"path":"src/lib.rs","line":1,"name":"run"}]}"#),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    )
+    .expect("attempt should stage");
+    let connection = rusqlite::Connection::open(data_paths.database_path())
+        .expect("database should be readable");
+    connection
+        .execute(
+            "INSERT INTO verified_facts (project_id, fact_kind, statement, lifecycle_state, verification_status) VALUES (?1, 'repository_observation', 'The project does not use SQLite.', 'committed', 'verified')",
+            [project.id],
+        )
+        .expect("existing verified fact should be stored");
+    let existing_fact_id = connection.last_insert_rowid();
+    connection
+        .execute(
+            "INSERT INTO fact_evidence (fact_id, project_id, relative_path, repository_commit, working_tree_state, excerpt, evidence_type, confidence) VALUES (?1, ?2, 'src/lib.rs', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'committed', 'existing evidence', 'source', 'exact')",
+            [existing_fact_id, project.id],
+        )
+        .expect("existing fact evidence should be stored");
+    let response = parse_response(
+        r#"{"schema_version":1,"proposals":[
+            {"fact_kind":"repository_observation","statement":"The project exposes a run function.","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
+            {"fact_kind":"repository_observation","statement":"The project has a command entry point.","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
+            {"fact_kind":"repository_observation","statement":"The project uses SQLite.","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]}
+        ],"questions":[]}"#,
+        &bundle,
+    )
+    .expect("response should validate");
+    let metadata = ProviderInvocationMetadata::new("fake", "offline-test-model", 1)
+        .expect("metadata should validate");
+    storage::store_provider_response(&data_paths, attempt_id, &metadata, &response)
+        .expect("response should be stored for review");
+    let duplicate_attempt = storage::stage_inspection_attempt(
+        &data_paths,
+        project.id,
+        bundle.schema_version,
+        &bundle_json,
+    );
+    assert!(matches!(
+        duplicate_attempt,
+        Err(storage::StorageError::ReviewInProgress)
+    ));
+    storage::record_review_decision(&data_paths, 1, &storage::ReviewDecision::Approve)
+        .expect("approval should be recorded");
+    storage::record_review_decision(
+        &data_paths,
+        2,
+        &storage::ReviewDecision::CorrectAndApprove {
+            statement: "The project has an operator-confirmed command entry point.".into(),
+        },
+    )
+    .expect("correction should be recorded");
+    storage::resolve_proposal_conflicts(
+        &data_paths,
+        3,
+        storage::ConflictResolution::SupersedeExisting,
+    )
+    .expect("conflict resolution should be recorded without mutating facts early");
+
+    connection
+        .execute(
+            "UPDATE proposals SET evidence_paths_json = '[\"missing.rs\"]' WHERE id = 1",
+            [],
+        )
+        .expect("proposal should be corruptible for the atomicity check");
+    let failed_finalization = storage::finalize_review(&data_paths, project.id);
+    assert!(matches!(
+        failed_finalization,
+        Err(storage::StorageError::InvalidStoredEvidence)
+    ));
+    let retained_state: (i64, String, i64, i64) = connection
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM inspection_baselines), (SELECT verification_status FROM verified_facts WHERE id = 1), (SELECT COUNT(*) FROM verified_facts), (SELECT COUNT(*) FROM review_decisions WHERE finalized_at IS NOT NULL)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("failed finalization should leave durable state readable");
+    assert_eq!(retained_state, (0, "verified".into(), 1, 0));
+
+    connection
+        .execute(
+            "UPDATE proposals SET evidence_paths_json = '[\"src/lib.rs\"]' WHERE id = 1",
+            [],
+        )
+        .expect("proposal should be restorable");
+    let finalization = pmemc_with_input(
+        &data_directory,
+        &["review", &format!("project-{}", project.id)],
+        b"y\n",
+    );
+    assert!(finalization.status.success());
+    let finalization_output = String::from_utf8_lossy(&finalization.stdout);
+    assert!(finalization_output.contains("Finalize this reviewed inspection?"));
+    assert!(finalization_output.contains(&format!(
+        "finalized inspection {attempt_id} with 3 verified facts"
+    )));
+    let finalized_state: (String, String, i64, i64, i64, String) = connection
+        .query_row(
+            "SELECT (SELECT lifecycle_state FROM projects WHERE id = 1), (SELECT status FROM inspection_attempts WHERE id = 1), (SELECT COUNT(*) FROM inspection_baselines), (SELECT COUNT(*) FROM verified_facts), (SELECT COUNT(*) FROM review_decisions WHERE finalized_at IS NOT NULL), (SELECT verification_status FROM verified_facts WHERE id = 1)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )
+        .expect("finalized state should be readable");
+    assert_eq!(
+        finalized_state,
+        (
+            "baselined".into(),
+            "finalized".into(),
+            1,
+            4,
+            3,
+            "superseded".into(),
+        )
+    );
+    let corrected_fact: String = connection
+        .query_row(
+            "SELECT statement FROM verified_facts WHERE statement = 'The project has an operator-confirmed command entry point.'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("corrected statement should become the verified fact");
+    assert_eq!(
+        corrected_fact,
+        "The project has an operator-confirmed command entry point."
+    );
+    let history = pmemc_with_input(
+        &data_directory,
+        &["history", &format!("project-{}", project.id)],
+        b"",
+    );
+    assert!(history.status.success());
+    let history_output = String::from_utf8_lossy(&history.stdout);
+    for kind in [
+        "inspection",
+        "proposal",
+        "decision",
+        "conflict",
+        "evidence",
+        "baseline",
+    ] {
+        assert!(
+            history_output.contains(kind),
+            "history should contain {kind}"
+        );
+    }
+    let history_positions = [
+        "\tinspection\t",
+        "\tproposal\t",
+        "\tconflict\t",
+        "\tdecision\t",
+        "\tevidence\t",
+        "\tbaseline\t",
+    ]
+    .map(|kind| {
+        history_output
+            .find(kind)
+            .expect("history event should be present")
+    });
+    assert!(history_positions.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(history_output.contains("operator-confirmed command entry point"));
+}
+
+#[test]
 fn incremental_bundle_selects_changed_code_neighbours_tests_and_manifests() {
     let repository = TemporaryDirectory::new();
     git_command(repository.path(), &["init"]);

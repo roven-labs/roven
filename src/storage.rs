@@ -1,7 +1,7 @@
 //! Local data-directory and SQLite initialization.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
 };
@@ -347,6 +347,26 @@ pub enum ConflictResolution {
     CorrectAndSupersede { statement: String },
 }
 
+/// Summary of one atomically finalized inspection review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFinalization {
+    /// Finalized inspection attempt.
+    pub inspection_attempt_id: i64,
+    /// Number of approved proposals retained as verified facts.
+    pub accepted_fact_count: usize,
+}
+
+/// One time-ordered durable audit record for a project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntry {
+    /// SQLite timestamp of the recorded event.
+    pub created_at: String,
+    /// Stable audit record category.
+    pub kind: String,
+    /// Human-readable, non-secret record detail.
+    pub detail: String,
+}
+
 impl Initialization {
     /// Return the initialized SQLite database file path.
     #[must_use]
@@ -414,6 +434,14 @@ pub enum StorageError {
     /// A requested review action cannot be applied to a pending proposal.
     #[error("review decision is invalid or the proposal is no longer pending")]
     InvalidReviewDecision,
+    /// A review cannot be finalized until every proposal and conflict is resolved.
+    #[error("review is not ready for finalization")]
+    ReviewNotReady,
+    /// A project already has proposals awaiting operator review.
+    #[error(
+        "project already has a review in progress; resolve or finalize it before another inspection"
+    )]
+    ReviewInProgress,
     /// Inspection provenance did not contain a Git object identifier.
     #[error("inspection commit provenance is invalid")]
     InvalidCommitProvenance,
@@ -563,7 +591,7 @@ pub fn stage_inspection_attempt(
         project_id,
         bundle_schema_version,
         bundle_json,
-        None,
+        Some(r#"{"symbols":[]}"#),
     )
 }
 
@@ -602,6 +630,7 @@ pub fn stage_inspection_attempt_with_provenance(
     if repository_commit.is_some_and(|commit| !valid_repository_commit(commit)) {
         return Err(StorageError::InvalidCommitProvenance);
     }
+    let code_map_json = code_map_json.ok_or(StorageError::InvalidStoredEvidence)?;
     initialize(data_paths)?;
     let mut connection = open_connection(&data_paths.database_path())
         .map_err(|source| StorageError::ProjectDatabase { source })?;
@@ -619,21 +648,23 @@ pub fn stage_inspection_attempt_with_provenance(
         .ok_or_else(|| StorageError::ProjectDatabase {
             source: rusqlite::Error::QueryReturnedNoRows,
         })?;
-    let code_map_snapshot_id = if let Some(code_map_json) = code_map_json {
-        transaction
-            .execute(
-                "INSERT INTO code_map_snapshots (project_id, schema_version, serialized_json) VALUES (?1, ?2, ?3)",
-                params![
-                    project_id,
-                    CODE_MAP_SNAPSHOT_SCHEMA_VERSION,
-                    code_map_json
-                ],
-            )
-            .map_err(|source| StorageError::ProjectDatabase { source })?;
-        Some(transaction.last_insert_rowid())
-    } else {
-        None
-    };
+    let review_in_progress: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM inspection_attempts WHERE project_id = ?1 AND status = 'pending_review')",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    if review_in_progress {
+        return Err(StorageError::ReviewInProgress);
+    }
+    transaction
+        .execute(
+            "INSERT INTO code_map_snapshots (project_id, schema_version, serialized_json) VALUES (?1, ?2, ?3)",
+            params![project_id, CODE_MAP_SNAPSHOT_SCHEMA_VERSION, code_map_json],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let code_map_snapshot_id = transaction.last_insert_rowid();
     transaction
         .execute(
             "INSERT INTO inspection_attempts (project_id, status, previous_lifecycle_state, bundle_schema_version, bundle_json, code_map_snapshot_id, repository_commit) VALUES (?1, 'staged_pending_provider', ?2, ?3, ?4, ?5, ?6)",
@@ -965,6 +996,352 @@ pub fn resolve_proposal_conflicts(
     transaction
         .commit()
         .map_err(|source| StorageError::ProjectDatabase { source })
+}
+
+/// Atomically turn one fully reviewed inspection into verified project memory.
+///
+/// # Errors
+///
+/// Returns an error without changing facts or baselines unless every proposal
+/// and conflict for the pending review is resolved and all stored evidence is
+/// valid.
+pub fn finalize_review(
+    data_paths: &DataPaths,
+    project_id: i64,
+) -> Result<ReviewFinalization, StorageError> {
+    initialize(data_paths)?;
+    let mut connection = open_connection(&data_paths.database_path())
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let transaction = connection
+        .transaction()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let (attempt_id, bundle_json, code_map_json, code_map_snapshot_id, repository_commit) = transaction
+        .query_row(
+            "SELECT attempts.id, attempts.bundle_json, snapshots.serialized_json, snapshots.id, attempts.repository_commit FROM inspection_attempts attempts JOIN code_map_snapshots snapshots ON snapshots.id = attempts.code_map_snapshot_id WHERE attempts.project_id = ?1 AND attempts.status = 'pending_review' ORDER BY attempts.id DESC LIMIT 1",
+            params![project_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, Option<String>>(4)?)),
+        )
+        .optional()
+        .map_err(|source| StorageError::ProjectDatabase { source })?
+        .ok_or(StorageError::ReviewNotReady)?;
+    if repository_commit
+        .as_deref()
+        .is_some_and(|commit| !valid_repository_commit(commit))
+    {
+        return Err(StorageError::InvalidStoredEvidence);
+    }
+    let bundle: EvidenceBundle =
+        serde_json::from_str(&bundle_json).map_err(|_| StorageError::InvalidStoredEvidence)?;
+    let unresolved_proposals: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM proposals proposals LEFT JOIN review_decisions decisions ON decisions.proposal_id = proposals.id WHERE proposals.inspection_attempt_id = ?1 AND (proposals.status NOT IN ('approved', 'rejected') OR decisions.id IS NULL)",
+            params![attempt_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let unresolved_conflicts: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM conflicts conflicts JOIN proposals proposals ON proposals.id = conflicts.proposal_id WHERE proposals.inspection_attempt_id = ?1 AND conflicts.status = 'pending'",
+            params![attempt_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    if unresolved_proposals != 0 || unresolved_conflicts != 0 {
+        return Err(StorageError::ReviewNotReady);
+    }
+
+    let mut statement = transaction
+        .prepare(
+            "SELECT proposals.id, proposals.fact_kind, proposals.statement, proposals.lifecycle_state, proposals.confidence, proposals.evidence_paths_json, decisions.corrected_statement FROM proposals JOIN review_decisions decisions ON decisions.proposal_id = proposals.id WHERE proposals.inspection_attempt_id = ?1 AND proposals.status = 'approved' ORDER BY proposals.id",
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let approved_proposals = statement
+        .query_map(params![attempt_id], |row| {
+            Ok(FinalizedProposal {
+                fact_kind: row.get(1)?,
+                statement: row.get(2)?,
+                lifecycle_state: row.get(3)?,
+                confidence: row.get(4)?,
+                evidence_paths_json: row.get(5)?,
+                corrected_statement: row.get(6)?,
+            })
+        })
+        .map_err(|source| StorageError::ProjectDatabase { source })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    drop(statement);
+    let evidence_by_path = bundle
+        .files
+        .into_iter()
+        .map(|file| (file.path.clone(), file))
+        .collect::<BTreeMap<_, _>>();
+    let mut finalized = Vec::with_capacity(approved_proposals.len());
+    for proposal in approved_proposals {
+        let final_statement = proposal
+            .corrected_statement
+            .clone()
+            .unwrap_or_else(|| proposal.statement.clone());
+        let final_statement = final_statement.trim().to_owned();
+        if !valid_stored_proposal(&proposal, &final_statement) {
+            return Err(StorageError::InvalidStoredEvidence);
+        }
+        let evidence_paths: Vec<String> = serde_json::from_str(&proposal.evidence_paths_json)
+            .map_err(|_| StorageError::InvalidStoredEvidence)?;
+        let unique_paths = evidence_paths.iter().collect::<BTreeSet<_>>();
+        if evidence_paths.is_empty() || unique_paths.len() != evidence_paths.len() {
+            return Err(StorageError::InvalidStoredEvidence);
+        }
+        let evidence = unique_paths
+            .iter()
+            .map(|path| {
+                evidence_by_path
+                    .get(path.as_str())
+                    .cloned()
+                    .ok_or(StorageError::InvalidStoredEvidence)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let locators = evidence_locators(&code_map_json, &unique_paths)?;
+        finalized.push((proposal, final_statement, evidence, locators));
+    }
+
+    transaction
+        .execute(
+            "UPDATE verified_facts SET verification_status = 'superseded', updated_at = CURRENT_TIMESTAMP WHERE id IN (SELECT conflicts.existing_fact_id FROM conflicts JOIN proposals ON proposals.id = conflicts.proposal_id WHERE proposals.inspection_attempt_id = ?1 AND proposals.status = 'approved' AND conflicts.status IN ('supersede_requested', 'corrected_and_supersede_requested'))",
+            params![attempt_id],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    for (proposal, final_statement, evidence, locators) in &finalized {
+        transaction
+            .execute(
+                "INSERT INTO verified_facts (project_id, fact_kind, statement, lifecycle_state, verification_status) VALUES (?1, ?2, ?3, ?4, 'verified')",
+                params![project_id, proposal.fact_kind, final_statement, proposal.lifecycle_state],
+            )
+            .map_err(|source| StorageError::ProjectDatabase { source })?;
+        let fact_id = transaction.last_insert_rowid();
+        for file in evidence {
+            let matching_locators = locators
+                .iter()
+                .filter(|locator| locator.path == file.path)
+                .collect::<Vec<_>>();
+            if matching_locators.is_empty() {
+                insert_fact_evidence(
+                    &transaction,
+                    fact_id,
+                    project_id,
+                    file,
+                    repository_commit.as_deref(),
+                    None,
+                    &proposal.confidence,
+                )?;
+            } else {
+                for locator in matching_locators {
+                    insert_fact_evidence(
+                        &transaction,
+                        fact_id,
+                        project_id,
+                        file,
+                        repository_commit.as_deref(),
+                        Some(locator),
+                        &proposal.confidence,
+                    )?;
+                }
+            }
+        }
+    }
+    transaction
+        .execute(
+            "UPDATE review_decisions SET finalized_at = CURRENT_TIMESTAMP WHERE proposal_id IN (SELECT id FROM proposals WHERE inspection_attempt_id = ?1)",
+            params![attempt_id],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    transaction
+        .execute(
+            "INSERT INTO inspection_baselines (project_id, inspection_attempt_id, code_map_snapshot_id, repository_commit) VALUES (?1, ?2, ?3, ?4)",
+            params![project_id, attempt_id, code_map_snapshot_id, repository_commit],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    transaction
+        .execute(
+            "UPDATE inspection_attempts SET status = 'finalized' WHERE id = ?1",
+            params![attempt_id],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    transaction
+        .execute(
+            "UPDATE projects SET lifecycle_state = 'baselined' WHERE id = ?1",
+            params![project_id],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    transaction
+        .commit()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    Ok(ReviewFinalization {
+        inspection_attempt_id: attempt_id,
+        accepted_fact_count: finalized.len(),
+    })
+}
+
+/// Return whether a pending inspection has every proposal and conflict resolved.
+///
+/// # Errors
+///
+/// Returns an error when local storage cannot be read.
+pub fn review_ready(data_paths: &DataPaths, project_id: i64) -> Result<bool, StorageError> {
+    initialize(data_paths)?;
+    let connection = open_connection(&data_paths.database_path())
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let attempt_id = connection
+        .query_row(
+            "SELECT id FROM inspection_attempts WHERE project_id = ?1 AND status = 'pending_review' ORDER BY id DESC LIMIT 1",
+            params![project_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let Some(attempt_id) = attempt_id else {
+        return Ok(false);
+    };
+    let unresolved: i64 = connection
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM proposals proposals LEFT JOIN review_decisions decisions ON decisions.proposal_id = proposals.id WHERE proposals.inspection_attempt_id = ?1 AND (proposals.status NOT IN ('approved', 'rejected') OR decisions.id IS NULL)) + (SELECT COUNT(*) FROM conflicts conflicts JOIN proposals proposals ON proposals.id = conflicts.proposal_id WHERE proposals.inspection_attempt_id = ?1 AND conflicts.status = 'pending')",
+            params![attempt_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    Ok(unresolved == 0)
+}
+
+/// Return a project's ordered local audit trail without invoking a provider.
+///
+/// # Errors
+///
+/// Returns an error when the project is absent or local storage cannot be read.
+pub fn project_history(
+    data_paths: &DataPaths,
+    project_id: i64,
+) -> Result<Vec<HistoryEntry>, StorageError> {
+    initialize(data_paths)?;
+    let connection = open_connection(&data_paths.database_path())
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let project_exists = connection
+        .query_row(
+            "SELECT 1 FROM projects WHERE id = ?1",
+            params![project_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|source| StorageError::ProjectDatabase { source })?
+        .is_some();
+    if !project_exists {
+        return Err(StorageError::ProjectDatabase {
+            source: rusqlite::Error::QueryReturnedNoRows,
+        });
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT created_at, kind, detail FROM (
+                SELECT created_at, 1 AS event_rank, 'inspection' AS kind, printf('attempt=%d status=%s', id, status) AS detail, id AS record_id FROM inspection_attempts WHERE project_id = ?1
+                UNION ALL
+                SELECT proposals.created_at, 2, 'proposal', printf('proposal=%d status=%s statement=%s', proposals.id, proposals.status, proposals.statement), proposals.id FROM proposals JOIN inspection_attempts attempts ON attempts.id = proposals.inspection_attempt_id WHERE attempts.project_id = ?1
+                UNION ALL
+                SELECT decisions.created_at, 4, 'decision', printf('proposal=%d action=%s corrected=%s reason=%s', decisions.proposal_id, decisions.action, COALESCE(decisions.corrected_statement, '-'), COALESCE(decisions.reason, '-')), decisions.id FROM review_decisions decisions JOIN proposals ON proposals.id = decisions.proposal_id JOIN inspection_attempts attempts ON attempts.id = proposals.inspection_attempt_id WHERE attempts.project_id = ?1
+                UNION ALL
+                SELECT conflicts.created_at, 3, 'conflict', printf('proposal=%d status=%s rationale=%s', conflicts.proposal_id, conflicts.status, conflicts.rationale), conflicts.id FROM conflicts JOIN proposals ON proposals.id = conflicts.proposal_id JOIN inspection_attempts attempts ON attempts.id = proposals.inspection_attempt_id WHERE attempts.project_id = ?1
+                UNION ALL
+                SELECT evidence.created_at, 5, 'evidence', printf('fact=%d path=%s state=%s commit=%s', evidence.fact_id, evidence.relative_path, evidence.working_tree_state, COALESCE(evidence.repository_commit, 'working-tree-only')), evidence.id FROM fact_evidence evidence WHERE evidence.project_id = ?1
+                UNION ALL
+                SELECT created_at, 6, 'baseline', printf('attempt=%d commit=%s', inspection_attempt_id, COALESCE(repository_commit, 'working-tree-only')), id FROM inspection_baselines WHERE project_id = ?1
+            ) ORDER BY created_at, event_rank, record_id",
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    statement
+        .query_map(params![project_id], |row| {
+            Ok(HistoryEntry {
+                created_at: row.get(0)?,
+                kind: row.get(1)?,
+                detail: row.get(2)?,
+            })
+        })
+        .map_err(|source| StorageError::ProjectDatabase { source })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| StorageError::ProjectDatabase { source })
+}
+
+#[derive(Debug)]
+struct FinalizedProposal {
+    fact_kind: String,
+    statement: String,
+    lifecycle_state: String,
+    confidence: String,
+    evidence_paths_json: String,
+    corrected_statement: Option<String>,
+}
+
+fn valid_stored_proposal(proposal: &FinalizedProposal, statement: &str) -> bool {
+    !proposal.fact_kind.is_empty()
+        && proposal.fact_kind.len() <= 64
+        && proposal
+            .fact_kind
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        && !statement.is_empty()
+        && matches!(
+            proposal.lifecycle_state.as_str(),
+            "committed" | "in_progress" | "user_confirmed"
+        )
+        && matches!(
+            proposal.confidence.as_str(),
+            "exact" | "supported" | "uncertain"
+        )
+}
+
+fn insert_fact_evidence(
+    transaction: &rusqlite::Transaction<'_>,
+    fact_id: i64,
+    project_id: i64,
+    file: &EvidenceFile,
+    repository_commit: Option<&str>,
+    locator: Option<&EvidenceLocator>,
+    confidence: &str,
+) -> Result<(), StorageError> {
+    let line = locator
+        .map(|locator| i64::try_from(locator.line))
+        .transpose()
+        .map_err(|_| StorageError::InvalidStoredEvidence)?;
+    transaction
+        .execute(
+            "INSERT INTO fact_evidence (fact_id, project_id, relative_path, repository_commit, working_tree_state, line_start, line_end, symbol_id, excerpt, evidence_type, confidence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'repository_file', ?10)",
+            params![
+                fact_id,
+                project_id,
+                file.path,
+                repository_commit,
+                evidence_state_name(file.state),
+                line,
+                line,
+                locator.map(|locator| locator.symbol_id.as_str()),
+                evidence_excerpt(&file.content),
+                confidence,
+            ],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    Ok(())
+}
+
+fn evidence_state_name(state: crate::inspection::EvidenceState) -> &'static str {
+    match state {
+        crate::inspection::EvidenceState::Committed => "committed",
+        crate::inspection::EvidenceState::Staged => "staged",
+        crate::inspection::EvidenceState::Unstaged => "unstaged",
+        crate::inspection::EvidenceState::StagedAndUnstaged => "staged-and-unstaged",
+        crate::inspection::EvidenceState::Untracked => "untracked",
+    }
+}
+
+fn evidence_excerpt(content: &str) -> &str {
+    content
+        .get(..content.floor_char_boundary(512))
+        .unwrap_or(content)
 }
 
 /// Persist a schema-validated provider response as pending review records.

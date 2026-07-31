@@ -36,8 +36,17 @@ pub fn run() -> anyhow::Result<()> {
         cli::Command::Status { project_id } => status_command(project_id),
         cli::Command::Inspect { project_id } => inspect_command(&project_id),
         cli::Command::Review { project_id } => review_command(project_id),
-        _ => anyhow::bail!("this command is not available until a later Version 1 phase"),
+        cli::Command::History { project_id } => history_command(&project_id),
     }
+}
+
+fn history_command(project_id: &str) -> anyhow::Result<()> {
+    let data_paths = storage::default_data_paths()?;
+    let id = parse_project_id(project_id)?;
+    for entry in storage::project_history(&data_paths, id)? {
+        println!("{}\t{}\t{}", entry.created_at, entry.kind, entry.detail);
+    }
+    Ok(())
 }
 
 fn review_command(project_id: Option<String>) -> anyhow::Result<()> {
@@ -173,6 +182,21 @@ fn review_command(project_id: Option<String>) -> anyhow::Result<()> {
                 }
                 "s" | "skip" => println!("proposal-{} left pending", proposal.id),
                 _ => println!("proposal-{} left pending", proposal.id),
+            }
+        }
+        if storage::review_ready(&data_paths, project.id)? {
+            print!("Finalize this reviewed inspection? [y/N] ");
+            io::stdout().flush()?;
+            let mut response = String::new();
+            io::stdin().read_line(&mut response)?;
+            if matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                let finalization = storage::finalize_review(&data_paths, project.id)?;
+                println!(
+                    "finalized inspection {} with {} verified facts",
+                    finalization.inspection_attempt_id, finalization.accepted_fact_count
+                );
+            } else {
+                println!("review remains ready for finalization");
             }
         }
     }
