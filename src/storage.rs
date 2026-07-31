@@ -279,6 +279,39 @@ pub struct PendingReviewProposal {
     pub provider_id: String,
     /// Non-secret provider model identifier.
     pub model_id: String,
+    /// Existing verified statements in unresolved conflict with this proposal.
+    pub conflicts: Vec<PendingConflict>,
+}
+
+/// An unresolved conflict that requires an operator decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingConflict {
+    /// Persistent conflict identifier.
+    pub id: i64,
+    /// Existing verified statement that conflicts with the proposal.
+    pub existing_statement: String,
+    /// Deterministic reason the tool flagged the contradiction.
+    pub rationale: String,
+    /// Retained provenance for the existing verified fact.
+    pub evidence: Vec<ConflictEvidence>,
+}
+
+/// Retained evidence provenance for the existing side of a conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictEvidence {
+    /// Evidence-relative path.
+    pub path: String,
+    /// Commit represented by the evidence, when it came from a commit.
+    pub repository_commit: Option<String>,
+    /// Working-tree state recorded for the evidence.
+    pub working_tree_state: String,
+    /// Evidence source classification.
+    pub evidence_type: String,
+    /// Optional one-based source range.
+    pub line_start: Option<i64>,
+    pub line_end: Option<i64>,
+    /// Optional structural symbol identifier.
+    pub symbol_id: Option<String>,
 }
 
 /// A structural location available for a selected evidence path.
@@ -301,6 +334,17 @@ pub enum ReviewDecision {
     CorrectAndApprove { statement: String },
     /// Reject the proposal, optionally recording why.
     Reject { reason: Option<String> },
+}
+
+/// Operator choice for every unresolved conflict on one proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictResolution {
+    /// Keep the existing verified facts and reject the new proposal.
+    PreserveExisting,
+    /// Supersede conflicting facts and approve the new proposal for finalization.
+    SupersedeExisting,
+    /// Replace the provider text, then supersede conflicting facts during finalization.
+    CorrectAndSupersede { statement: String },
 }
 
 impl Initialization {
@@ -709,6 +753,7 @@ pub fn pending_review_proposals(
         {
             return Err(StorageError::InvalidStoredEvidence);
         }
+        let conflicts = pending_conflicts(&connection, id)?;
         Ok(PendingReviewProposal {
             id,
             inspection_attempt_id,
@@ -721,9 +766,69 @@ pub fn pending_review_proposals(
             evidence_locators: evidence_locators.unwrap_or_default(),
             provider_id,
             model_id,
+            conflicts,
         })
     })
     .collect()
+}
+
+fn pending_conflicts(
+    connection: &Connection,
+    proposal_id: i64,
+) -> Result<Vec<PendingConflict>, StorageError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT conflicts.id, facts.statement, conflicts.rationale FROM conflicts JOIN verified_facts facts ON facts.id = conflicts.existing_fact_id WHERE conflicts.proposal_id = ?1 AND conflicts.status = 'pending' ORDER BY conflicts.id",
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let conflicts = statement
+        .query_map(params![proposal_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|source| StorageError::ProjectDatabase { source })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    conflicts
+        .into_iter()
+        .map(|(id, existing_statement, rationale)| {
+            Ok(PendingConflict {
+                id,
+                existing_statement,
+                rationale,
+                evidence: conflict_evidence(connection, id)?,
+            })
+        })
+        .collect()
+}
+
+fn conflict_evidence(
+    connection: &Connection,
+    conflict_id: i64,
+) -> Result<Vec<ConflictEvidence>, StorageError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT evidence.relative_path, evidence.repository_commit, evidence.working_tree_state, evidence.evidence_type, evidence.line_start, evidence.line_end, evidence.symbol_id FROM conflicts JOIN fact_evidence evidence ON evidence.fact_id = conflicts.existing_fact_id WHERE conflicts.id = ?1 ORDER BY evidence.id",
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    statement
+        .query_map(params![conflict_id], |row| {
+            Ok(ConflictEvidence {
+                path: row.get(0)?,
+                repository_commit: row.get(1)?,
+                working_tree_state: row.get(2)?,
+                evidence_type: row.get(3)?,
+                line_start: row.get(4)?,
+                line_end: row.get(5)?,
+                symbol_id: row.get(6)?,
+            })
+        })
+        .map_err(|source| StorageError::ProjectDatabase { source })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| StorageError::ProjectDatabase { source })
 }
 
 /// Persist an operator decision and remove the proposal from the pending queue.
@@ -766,7 +871,7 @@ pub fn record_review_decision(
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let updated = transaction
         .execute(
-            "UPDATE proposals SET status = ?1 WHERE id = ?2 AND status = 'pending_review'",
+            "UPDATE proposals SET status = ?1 WHERE id = ?2 AND status = 'pending_review' AND NOT EXISTS (SELECT 1 FROM conflicts WHERE proposal_id = ?2 AND status = 'pending')",
             params![proposal_status, proposal_id],
         )
         .map_err(|source| StorageError::ProjectDatabase { source })?;
@@ -777,6 +882,84 @@ pub fn record_review_decision(
         .execute(
             "INSERT INTO review_decisions (proposal_id, action, corrected_statement, reason) VALUES (?1, ?2, ?3, ?4)",
             params![proposal_id, action, corrected_statement, reason],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    transaction
+        .commit()
+        .map_err(|source| StorageError::ProjectDatabase { source })
+}
+
+/// Resolve every pending conflict attached to a proposal in one transaction.
+///
+/// # Errors
+///
+/// Returns an error unless the proposal is still pending and has at least one
+/// unresolved conflict. No partial decision, conflict, or fact update is kept.
+pub fn resolve_proposal_conflicts(
+    data_paths: &DataPaths,
+    proposal_id: i64,
+    resolution: ConflictResolution,
+) -> Result<(), StorageError> {
+    initialize(data_paths)?;
+    let mut connection = open_connection(&data_paths.database_path())
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let transaction = connection
+        .transaction()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let has_pending_conflicts = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT 1 FROM conflicts WHERE proposal_id = ?1 AND status = 'pending' LIMIT 1",
+            )
+            .map_err(|source| StorageError::ProjectDatabase { source })?;
+        statement
+            .exists(params![proposal_id])
+            .map_err(|source| StorageError::ProjectDatabase { source })?
+    };
+    if !has_pending_conflicts {
+        return Err(StorageError::InvalidReviewDecision);
+    }
+    let (action, corrected_statement, proposal_status, conflict_status) = match resolution {
+        ConflictResolution::PreserveExisting => {
+            ("preserved_existing", None, "rejected", "preserved")
+        }
+        ConflictResolution::SupersedeExisting => (
+            "superseded_existing",
+            None,
+            "approved",
+            "supersede_requested",
+        ),
+        ConflictResolution::CorrectAndSupersede { statement } if !statement.trim().is_empty() => (
+            "corrected_and_superseded_existing",
+            Some(statement),
+            "approved",
+            "corrected_and_supersede_requested",
+        ),
+        ConflictResolution::CorrectAndSupersede { .. } => {
+            return Err(StorageError::InvalidReviewDecision);
+        }
+    };
+    if transaction
+        .execute(
+            "UPDATE proposals SET status = ?1 WHERE id = ?2 AND status = 'pending_review'",
+            params![proposal_status, proposal_id],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?
+        != 1
+    {
+        return Err(StorageError::InvalidReviewDecision);
+    }
+    transaction
+        .execute(
+            "INSERT INTO review_decisions (proposal_id, action, corrected_statement) VALUES (?1, ?2, ?3)",
+            params![proposal_id, action, corrected_statement],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let decision_id = transaction.last_insert_rowid();
+    transaction
+        .execute(
+            "UPDATE conflicts SET status = ?1, resolution_decision_id = ?2 WHERE proposal_id = ?3 AND status = 'pending'",
+            params![conflict_status, decision_id, proposal_id],
         )
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     transaction
@@ -843,6 +1026,36 @@ pub fn store_provider_response(
                 ],
             )
             .map_err(|source| StorageError::ProjectDatabase { source })?;
+        let proposal_id = transaction.last_insert_rowid();
+        let mut existing_fact_ids = BTreeSet::new();
+        for evidence_path in &proposal.evidence_paths {
+            let mut conflicts = transaction
+                .prepare(
+                    "SELECT DISTINCT facts.id, facts.statement FROM verified_facts facts JOIN fact_evidence evidence ON evidence.fact_id = facts.id WHERE facts.project_id = ?1 AND evidence.project_id = ?1 AND facts.verification_status = 'verified' AND facts.fact_kind = ?2 AND evidence.relative_path = ?3",
+                )
+                .map_err(|source| StorageError::ProjectDatabase { source })?;
+            let matched_fact_ids = conflicts
+                .query_map(
+                    params![project_id, proposal.fact_kind, evidence_path],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(|source| StorageError::ProjectDatabase { source })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|source| StorageError::ProjectDatabase { source })?;
+            existing_fact_ids.extend(matched_fact_ids.into_iter().filter_map(
+                |(fact_id, statement)| {
+                    explicit_statement_negation(&proposal.statement, &statement).then_some(fact_id)
+                },
+            ));
+        }
+        for existing_fact_id in existing_fact_ids {
+            transaction
+                .execute(
+                    "INSERT INTO conflicts (proposal_id, existing_fact_id, rationale, status) VALUES (?1, ?2, 'different statement for the same fact kind and evidence path', 'pending')",
+                    params![proposal_id, existing_fact_id],
+                )
+                .map_err(|source| StorageError::ProjectDatabase { source })?;
+        }
     }
     for question in &response.questions {
         transaction
@@ -867,6 +1080,51 @@ pub fn store_provider_response(
     transaction
         .commit()
         .map_err(|source| StorageError::ProjectDatabase { source })
+}
+
+fn explicit_statement_negation(left: &str, right: &str) -> bool {
+    let normalize = |statement: &str| {
+        let words = statement
+            .trim()
+            .trim_end_matches(['.', '!', '?'])
+            .split_whitespace()
+            .map(|word| word.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let mut negated = false;
+        let mut normalized = Vec::with_capacity(words.len());
+        let mut index = 0;
+        while index < words.len() {
+            if matches!(
+                words[index].as_str(),
+                "does" | "do" | "is" | "are" | "was" | "were"
+            ) && words.get(index + 1).is_some_and(|word| word == "not")
+            {
+                negated = true;
+                index += 2;
+                continue;
+            }
+            if words[index] == "not" {
+                negated = true;
+                index += 1;
+                continue;
+            }
+            let word = match words[index].as_str() {
+                "uses" => "use",
+                "includes" => "include",
+                "contains" => "contain",
+                "supports" => "support",
+                "exposes" => "expose",
+                "depends" => "depend",
+                _ => words[index].as_str(),
+            };
+            normalized.push(word);
+            index += 1;
+        }
+        (negated, normalized.join(" "))
+    };
+    let (left_negated, left) = normalize(left);
+    let (right_negated, right) = normalize(right);
+    left == right && left_negated != right_negated && !left.is_empty()
 }
 
 /// Mark a provider attempt as failed and restore its prior durable lifecycle.
@@ -1137,6 +1395,18 @@ mod tests {
         let result = data_paths_from_environment(|_| None);
 
         assert!(matches!(result, Err(StorageError::MissingLocalAppData)));
+    }
+
+    #[test]
+    fn explicit_statement_negation_normalizes_common_auxiliary_negation() {
+        assert!(explicit_statement_negation(
+            "The project uses SQLite.",
+            "The project does not use SQLite."
+        ));
+        assert!(!explicit_statement_negation(
+            "The project uses SQLite.",
+            "The project uses SQLite."
+        ));
     }
 
     #[test]

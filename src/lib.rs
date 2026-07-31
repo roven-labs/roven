@@ -81,6 +81,60 @@ fn review_command(project_id: Option<String>) -> anyhow::Result<()> {
                     locator.path, locator.line, locator.symbol_id
                 );
             }
+            for conflict in &proposal.conflicts {
+                println!("conflict-{}\t{}", conflict.id, conflict.rationale);
+                println!("existing-fact\t{}", conflict.existing_statement);
+                for evidence in &conflict.evidence {
+                    println!(
+                        "existing-evidence\t{}\t{}\t{}\t{}\t{:?}-{:?}\t{}",
+                        evidence.path,
+                        evidence
+                            .repository_commit
+                            .as_deref()
+                            .unwrap_or("working-tree-only"),
+                        evidence.working_tree_state,
+                        evidence.evidence_type,
+                        evidence.line_start,
+                        evidence.line_end,
+                        evidence.symbol_id.as_deref().unwrap_or("-")
+                    );
+                }
+            }
+            if !proposal.conflicts.is_empty() {
+                print!(
+                    "[p]reserve existing facts, [u]supersede them, [c]orrect and supersede, or [s]kip? "
+                );
+                io::stdout().flush()?;
+                let mut action = String::new();
+                io::stdin().read_line(&mut action)?;
+                match action.trim().to_ascii_lowercase().as_str() {
+                    "p" | "preserve" => storage::resolve_proposal_conflicts(
+                        &data_paths,
+                        proposal.id,
+                        storage::ConflictResolution::PreserveExisting,
+                    )?,
+                    "u" | "supersede" => storage::resolve_proposal_conflicts(
+                        &data_paths,
+                        proposal.id,
+                        storage::ConflictResolution::SupersedeExisting,
+                    )?,
+                    "c" | "correct" => {
+                        print!("Corrected statement: ");
+                        io::stdout().flush()?;
+                        let mut statement = String::new();
+                        io::stdin().read_line(&mut statement)?;
+                        storage::resolve_proposal_conflicts(
+                            &data_paths,
+                            proposal.id,
+                            storage::ConflictResolution::CorrectAndSupersede {
+                                statement: statement.trim().into(),
+                            },
+                        )?;
+                    }
+                    _ => println!("proposal-{} left pending", proposal.id),
+                }
+                continue;
+            }
             print!("[a]pprove, [c]orrect, [r]eject, or [s]kip? ");
             io::stdout().flush()?;
             let mut action = String::new();

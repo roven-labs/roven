@@ -456,6 +456,12 @@ pub fn validate_response(
             || proposal
                 .evidence_paths
                 .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != proposal.evidence_paths.len()
+            || proposal
+                .evidence_paths
+                .iter()
                 .any(|path| !selected_paths.contains(path.as_str()))
         {
             return Err(ProviderError::InvalidResponse);

@@ -266,7 +266,7 @@ fn a_later_inspect_retries_the_retained_provider_attempt() {
 }
 
 #[test]
-fn review_interactively_approves_corrects_rejects_and_skips_without_losing_proposals() {
+fn review_interactively_applies_all_normal_and_conflict_decisions() {
     let data_directory = TemporaryDirectory::new();
     let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
     let project = storage::add_project(
@@ -303,20 +303,40 @@ fn review_interactively_approves_corrects_rejects_and_skips_without_losing_propo
             {"fact_kind":"repository_observation","statement":"approve me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
             {"fact_kind":"repository_observation","statement":"correct me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
             {"fact_kind":"repository_observation","statement":"reject me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
-            {"fact_kind":"repository_observation","statement":"skip me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]}
+            {"fact_kind":"repository_observation","statement":"skip me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
+            {"fact_kind":"repository_observation","statement":"preserve me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
+            {"fact_kind":"repository_observation","statement":"supersede me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
+            {"fact_kind":"repository_observation","statement":"normal approve me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]}
         ],"questions":[]}"#,
         &bundle,
     )
     .expect("fixture response should validate");
     let metadata = ProviderInvocationMetadata::new("fake", "offline-test-model", 1)
         .expect("metadata should validate");
+    let conflict_connection = rusqlite::Connection::open(data_paths.database_path())
+        .expect("database should be readable while preparing the existing fact");
+    for statement in ["not approve me.", "not preserve me.", "not supersede me."] {
+        conflict_connection
+            .execute(
+                "INSERT INTO verified_facts (project_id, fact_kind, statement, lifecycle_state, verification_status) VALUES (?1, 'repository_observation', ?2, 'committed', 'verified')",
+                rusqlite::params![project.id, statement],
+            )
+            .expect("existing verified fact should be stored");
+        let existing_fact_id = conflict_connection.last_insert_rowid();
+        conflict_connection
+            .execute(
+                "INSERT INTO fact_evidence (fact_id, project_id, relative_path, repository_commit, working_tree_state, line_start, line_end, symbol_id, excerpt, evidence_type, confidence) VALUES (?1, ?2, 'src/lib.rs', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'committed', 1, 1, 'src/lib.rs:1:run', 'fixture excerpt', 'source', 'exact')",
+                [existing_fact_id, project.id],
+            )
+            .expect("existing fact evidence should be stored");
+    }
     storage::store_provider_response(&data_paths, attempt_id, &metadata, &response)
         .expect("pending proposals should be stored");
 
     let review = pmemc_with_input(
         &data_directory,
         &["review", &format!("project-{}", project.id)],
-        b"a\nc\ncorrected statement\nr\nnot supported by the evidence\ns\n",
+        b"c\noperator-corrected approval\nc\ncorrected statement\nr\nnot supported by the evidence\ns\np\nu\na\n",
     );
 
     assert!(review.status.success());
@@ -325,6 +345,8 @@ fn review_interactively_approves_corrects_rejects_and_skips_without_losing_propo
     assert!(output.contains("commit\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
     assert!(output.contains("evidence\tsrc/lib.rs\tcommitted"));
     assert!(output.contains("locator\tsrc/lib.rs\t1\tsrc/lib.rs:1:run"));
+    assert!(output.contains("existing-fact\tnot approve me."));
+    assert!(output.contains("existing-evidence\tsrc/lib.rs\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tcommitted\tsource\tSome(1)-Some(1)\tsrc/lib.rs:1:run"));
     let connection = rusqlite::Connection::open(data_paths.database_path())
         .expect("database should be readable");
     let proposal_statuses = connection
@@ -336,7 +358,42 @@ fn review_interactively_approves_corrects_rejects_and_skips_without_losing_propo
         .expect("statuses should decode");
     assert_eq!(
         proposal_statuses,
-        ["approved", "approved", "rejected", "pending_review"]
+        [
+            "approved",
+            "approved",
+            "rejected",
+            "pending_review",
+            "rejected",
+            "approved",
+            "approved",
+        ]
+    );
+    let conflict_correction: (String, String) = connection
+        .query_row(
+            "SELECT action, corrected_statement FROM review_decisions WHERE proposal_id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("conflict correction should retain the original proposal and correction");
+    assert_eq!(
+        conflict_correction,
+        (
+            "corrected_and_superseded_existing".into(),
+            "operator-corrected approval".into(),
+        )
+    );
+    let conflict_actions = connection
+        .prepare(
+            "SELECT d.action FROM review_decisions d WHERE d.proposal_id IN (5, 6) ORDER BY d.proposal_id",
+        )
+        .expect("conflict actions should be queryable")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("conflict actions should query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("conflict actions should decode");
+    assert_eq!(
+        conflict_actions,
+        ["preserved_existing", "superseded_existing"]
     );
     let correction: (String, String) = connection
         .query_row(

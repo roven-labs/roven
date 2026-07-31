@@ -118,10 +118,15 @@ fn provider_response_rejects_unknown_fields_and_unselected_evidence() {
         r#"{"schema_version":1,"proposals":[{"fact_kind":"Repository Fact","statement":"Bad kind.","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]}],"questions":[]}"#,
         &bundle(),
     );
+    let duplicate_evidence = parse_response(
+        r#"{"schema_version":1,"proposals":[{"fact_kind":"repository_observation","statement":"Duplicated evidence.","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs","src/lib.rs"]}],"questions":[]}"#,
+        &bundle(),
+    );
 
     assert!(unknown_field.is_err());
     assert!(unknown_evidence.is_err());
     assert!(invalid_fact_kind.is_err());
+    assert!(duplicate_evidence.is_err());
 }
 
 #[test]
@@ -163,6 +168,21 @@ fn provider_results_are_pending_review_with_invocation_metadata() {
     .expect("response should validate");
     let metadata = ProviderInvocationMetadata::new("fake", "offline-test-model", 1)
         .expect("metadata should be valid");
+    let connection = rusqlite::Connection::open(data_paths.database_path())
+        .expect("database should be readable");
+    connection
+        .execute(
+            "INSERT INTO verified_facts (project_id, fact_kind, statement, lifecycle_state, verification_status) VALUES (?1, 'repository_observation', 'not The project exposes a run function.', 'committed', 'verified')",
+            [project.id],
+        )
+        .expect("existing fact should be stored");
+    let existing_fact_id = connection.last_insert_rowid();
+    connection
+        .execute(
+            "INSERT INTO fact_evidence (fact_id, project_id, relative_path, working_tree_state, excerpt, evidence_type, confidence) VALUES (?1, ?2, 'src/lib.rs', 'committed', 'fixture excerpt', 'source', 'exact')",
+            [existing_fact_id, project.id],
+        )
+        .expect("existing fact evidence should be stored");
 
     storage::store_provider_response(&data_paths, attempt_id, &metadata, &response)
         .expect("response should be persisted");
@@ -175,8 +195,6 @@ fn provider_results_are_pending_review_with_invocation_metadata() {
         "inspection_pending_review"
     );
 
-    let connection = rusqlite::Connection::open(data_paths.database_path())
-        .expect("database should be readable");
     let invocation: (String, String, i64, String) = connection
         .query_row(
             "SELECT provider_id, model_id, prompt_schema_version, status FROM provider_invocations",
@@ -208,6 +226,20 @@ fn provider_results_are_pending_review_with_invocation_metadata() {
         )
         .expect("question should be pending review");
     assert_eq!((proposal_count, question_count), (1, 1));
+    let conflict: (String, String) = connection
+        .query_row(
+            "SELECT rationale, status FROM conflicts WHERE proposal_id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("contradictory proposal should be recorded as pending conflict");
+    assert_eq!(
+        conflict,
+        (
+            "different statement for the same fact kind and evidence path".into(),
+            "pending".into(),
+        )
+    );
 
     let pending = storage::pending_review_proposals(&data_paths, project.id)
         .expect("pending review proposals should include immutable evidence and metadata");
@@ -217,6 +249,22 @@ fn provider_results_are_pending_review_with_invocation_metadata() {
     assert_eq!(pending[0].statement, "The project exposes a run function.");
     assert_eq!(pending[0].provider_id, "fake");
     assert_eq!(pending[0].model_id, "offline-test-model");
+    assert_eq!(pending[0].conflicts.len(), 1);
+    assert_eq!(
+        pending[0].conflicts[0].existing_statement,
+        "not The project exposes a run function."
+    );
+    assert_eq!(pending[0].conflicts[0].evidence.len(), 1);
+    assert_eq!(
+        (
+            pending[0].conflicts[0].evidence[0].path.as_str(),
+            pending[0].conflicts[0].evidence[0]
+                .working_tree_state
+                .as_str(),
+            pending[0].conflicts[0].evidence[0].evidence_type.as_str(),
+        ),
+        ("src/lib.rs", "committed", "source")
+    );
     assert_eq!(
         pending[0]
             .evidence
@@ -243,29 +291,121 @@ fn provider_results_are_pending_review_with_invocation_metadata() {
             [],
         )
         .expect("fixture proposal should be restored");
-    storage::record_review_decision(
+    let bypassed_review =
+        storage::record_review_decision(&data_paths, 1, &storage::ReviewDecision::Approve);
+    assert!(matches!(
+        bypassed_review,
+        Err(storage::StorageError::InvalidReviewDecision)
+    ));
+    storage::resolve_proposal_conflicts(
         &data_paths,
         1,
-        &storage::ReviewDecision::CorrectAndApprove {
-            statement: "The project provides the corrected run entry point.".into(),
+        storage::ConflictResolution::CorrectAndSupersede {
+            statement: "The project exposes an operator-approved run function.".into(),
         },
     )
-    .expect("correct-and-approve should retain an immutable decision");
-    let proposal_and_decision: (String, String, String, Option<String>) = connection
+    .expect("correcting and superseding should resolve every proposal conflict atomically");
+    let proposal_and_decision: (String, String, String, String) = connection
         .query_row(
             "SELECT p.statement, p.status, d.action, d.corrected_statement FROM proposals p JOIN review_decisions d ON d.proposal_id = p.id WHERE p.id = 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .expect("original proposal and correction should be retained together");
+        .expect("original proposal and conflict resolution should be retained together");
     assert_eq!(
         proposal_and_decision,
         (
             "The project exposes a run function.".into(),
             "approved".into(),
-            "corrected_and_approved".into(),
-            Some("The project provides the corrected run entry point.".into()),
+            "corrected_and_superseded_existing".into(),
+            "The project exposes an operator-approved run function.".into(),
         )
+    );
+    let fact_state: String = connection
+        .query_row(
+            "SELECT verification_status FROM verified_facts WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("verified fact should remain authoritative until finalization");
+    assert_eq!(fact_state, "verified");
+    let conflict_status: String = connection
+        .query_row(
+            "SELECT status FROM conflicts WHERE proposal_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("resolution should remain pending finalization");
+    assert_eq!(conflict_status, "corrected_and_supersede_requested");
+
+    connection
+        .execute(
+            "INSERT INTO proposals (inspection_attempt_id, provider_invocation_id, fact_kind, statement, lifecycle_state, confidence, evidence_paths_json, status) SELECT 1, id, 'repository_observation', 'preserve candidate', 'committed', 'exact', '[\"src/lib.rs\"]', 'pending_review' FROM provider_invocations LIMIT 1",
+            [],
+        )
+        .expect("preserve fixture proposal should be stored");
+    let preserve_proposal_id = connection.last_insert_rowid();
+    connection
+        .execute(
+            "INSERT INTO conflicts (proposal_id, existing_fact_id, rationale, status) VALUES (?1, 1, 'fixture contradiction', 'pending')",
+            [preserve_proposal_id],
+        )
+        .expect("preserve fixture conflict should be stored");
+    storage::resolve_proposal_conflicts(
+        &data_paths,
+        preserve_proposal_id,
+        storage::ConflictResolution::PreserveExisting,
+    )
+    .expect("preserving should resolve the conflict without changing existing facts");
+
+    connection
+        .execute(
+            "INSERT INTO proposals (inspection_attempt_id, provider_invocation_id, fact_kind, statement, lifecycle_state, confidence, evidence_paths_json, status) SELECT 1, id, 'repository_observation', 'supersede candidate', 'committed', 'exact', '[\"src/lib.rs\"]', 'pending_review' FROM provider_invocations LIMIT 1",
+            [],
+        )
+        .expect("supersede fixture proposal should be stored");
+    let supersede_proposal_id = connection.last_insert_rowid();
+    connection
+        .execute(
+            "INSERT INTO conflicts (proposal_id, existing_fact_id, rationale, status) VALUES (?1, 1, 'fixture contradiction', 'pending')",
+            [supersede_proposal_id],
+        )
+        .expect("supersede fixture conflict should be stored");
+    storage::resolve_proposal_conflicts(
+        &data_paths,
+        supersede_proposal_id,
+        storage::ConflictResolution::SupersedeExisting,
+    )
+    .expect("superseding should record a finalization request without changing facts early");
+    let extra_decisions = connection
+        .prepare(
+            "SELECT p.status, d.action, c.status FROM proposals p JOIN review_decisions d ON d.proposal_id = p.id JOIN conflicts c ON c.proposal_id = p.id WHERE p.id IN (?1, ?2) ORDER BY p.id",
+        )
+        .expect("extra decisions should be queryable")
+        .query_map([preserve_proposal_id, supersede_proposal_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("extra decisions should query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("extra decisions should decode");
+    assert_eq!(
+        extra_decisions,
+        [
+            (
+                "rejected".into(),
+                "preserved_existing".into(),
+                "preserved".into()
+            ),
+            (
+                "approved".into(),
+                "superseded_existing".into(),
+                "supersede_requested".into(),
+            ),
+        ]
     );
 }
 
