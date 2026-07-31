@@ -26,6 +26,7 @@ pub struct Symbol {
     pub name: String,
     pub kind: SymbolKind,
     pub line: usize,
+    pub container: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -298,6 +299,7 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
             },
             confidence: Confidence::Exact,
         }))
+        .chain(type_member_relationships(&map.symbols))
         .chain(map.imports.iter().map(|import| Relationship {
             kind: RelationKind::Imports,
             source: import.source_path.clone(),
@@ -321,6 +323,40 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
         ))
     });
     Ok(map)
+}
+
+fn type_member_relationships(symbols: &[Symbol]) -> Vec<Relationship> {
+    symbols
+        .iter()
+        .filter_map(|member| {
+            let container = member.container.as_deref()?;
+            let mut types = symbols.iter().filter(|symbol| {
+                symbol.path == member.path && symbol.name == container && is_type_symbol(symbol)
+            });
+            let container = types.next()?;
+            types.next().is_none().then(|| Relationship {
+                kind: RelationKind::Contains,
+                source: symbol_id(container),
+                target: symbol_id(member),
+                evidence: Evidence {
+                    path: member.path.clone(),
+                    line: member.line,
+                },
+                confidence: Confidence::Exact,
+            })
+        })
+        .collect()
+}
+
+fn is_type_symbol(symbol: &Symbol) -> bool {
+    matches!(
+        symbol.kind,
+        SymbolKind::Class
+            | SymbolKind::Interface
+            | SymbolKind::Trait
+            | SymbolKind::Struct
+            | SymbolKind::Enum
+    )
 }
 
 fn symbol_id(symbol: &Symbol) -> String {
@@ -472,7 +508,23 @@ fn relative_import_target(
         }
     }
     let candidate = components.join("/");
-    known_paths.contains(&candidate).then_some(candidate)
+    let mut candidates = vec![candidate.clone()];
+    if !candidate
+        .rsplit('/')
+        .next()
+        .is_some_and(|filename| filename.contains('.'))
+    {
+        candidates.extend(
+            ["js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"]
+                .into_iter()
+                .map(|extension| format!("{candidate}.{extension}")),
+        );
+    }
+    let mut matches = candidates
+        .into_iter()
+        .filter(|candidate| known_paths.contains(candidate));
+    let target = matches.next()?;
+    matches.next().is_none().then_some(target)
 }
 
 fn collect_python_imports(
@@ -488,25 +540,48 @@ fn collect_python_imports(
             .trim()
             .strip_prefix("from ")
             .and_then(|value| value.split(" import ").next())
-        && let Some(module) = module.strip_prefix('.')
+        && let Some(target_path) = python_import_target(path, module, known_paths)
     {
-        let candidate = format!("{module}.py");
-        if known_paths.contains(&candidate) {
-            imports.push(Import {
-                source_path: path.into(),
-                target_path: candidate,
-                evidence: Evidence {
-                    path: path.into(),
-                    line: node.start_position().row + 1,
-                },
-                confidence: Confidence::Exact,
-            });
-        }
+        imports.push(Import {
+            source_path: path.into(),
+            target_path,
+            evidence: Evidence {
+                path: path.into(),
+                line: node.start_position().row + 1,
+            },
+            confidence: Confidence::Exact,
+        });
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_python_imports(child, source, path, known_paths, imports);
     }
+}
+
+fn python_import_target(
+    source_path: &str,
+    module: &str,
+    known_paths: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    let relative_levels = module
+        .chars()
+        .take_while(|character| *character == '.')
+        .count();
+    let module = module.strip_prefix(&".".repeat(relative_levels))?;
+    if relative_levels == 0 || module.is_empty() {
+        return None;
+    }
+    let mut components = source_path
+        .rsplit_once('/')
+        .map_or_else(Vec::new, |(directory, _)| {
+            directory.split('/').map(str::to_owned).collect()
+        });
+    for _ in 1..relative_levels {
+        components.pop()?;
+    }
+    components.extend(module.split('.').map(str::to_owned));
+    let candidate = format!("{}.py", components.join("/"));
+    known_paths.contains(&candidate).then_some(candidate)
 }
 
 fn collect_java_imports(
@@ -683,6 +758,7 @@ fn visit_java(
                 name: name.into(),
                 kind: SymbolKind::Method,
                 line: node.start_position().row + 1,
+                container: enclosing_type_name(node, source),
             });
             next_function = Some(name);
         }
@@ -705,6 +781,7 @@ fn visit_java(
                 name: name.into(),
                 kind,
                 line: node.start_position().row + 1,
+                container: None,
             });
         }
     } else if node.kind() == "method_invocation"
@@ -757,6 +834,7 @@ fn visit_go(
                 name: name.into(),
                 kind,
                 line: node.start_position().row + 1,
+                container: None,
             });
             next_function = Some(name);
         }
@@ -795,16 +873,22 @@ fn visit_javascript(
     calls: &mut Vec<DirectCall>,
 ) {
     let mut next_function = current_function;
-    if node.kind() == "function_declaration" {
+    if matches!(node.kind(), "function_declaration" | "method_definition") {
         if let Some(name) = node
             .child_by_field_name("name")
             .and_then(|node| node.utf8_text(source).ok())
         {
+            let container = enclosing_type_name(node, source);
             symbols.push(Symbol {
                 path: path.into(),
                 name: name.into(),
-                kind: SymbolKind::Function,
+                kind: if node.kind() == "method_definition" {
+                    SymbolKind::Method
+                } else {
+                    SymbolKind::Function
+                },
                 line: node.start_position().row + 1,
+                container,
             });
             next_function = Some(name);
         }
@@ -827,6 +911,7 @@ fn visit_javascript(
                 name: name.into(),
                 kind,
                 line: node.start_position().row + 1,
+                container: None,
             });
         }
     } else if node.kind() == "call_expression"
@@ -869,11 +954,17 @@ fn visit_python(
             .child_by_field_name("name")
             .and_then(|node| node.utf8_text(source).ok())
         {
+            let container = enclosing_type_name(node, source);
             symbols.push(Symbol {
                 path: path.into(),
                 name: name.into(),
-                kind: SymbolKind::Function,
+                kind: if container.is_some() {
+                    SymbolKind::Method
+                } else {
+                    SymbolKind::Function
+                },
                 line: node.start_position().row + 1,
+                container,
             });
             next_function = Some(name);
         }
@@ -887,6 +978,7 @@ fn visit_python(
                 name: name.into(),
                 kind: SymbolKind::Class,
                 line: node.start_position().row + 1,
+                container: None,
             });
         }
     } else if node.kind() == "call"
@@ -939,6 +1031,7 @@ fn visit_rust(
                 name: name.into(),
                 kind,
                 line: node.start_position().row + 1,
+                container: rust_impl_type_name(node, source),
             });
             next_function = Some(name);
         }
@@ -952,6 +1045,7 @@ fn visit_rust(
                 name: name.into(),
                 kind: SymbolKind::Struct,
                 line: node.start_position().row + 1,
+                container: None,
             });
         }
     } else if matches!(node.kind(), "trait_item" | "enum_item" | "mod_item") {
@@ -970,6 +1064,7 @@ fn visit_rust(
                 name: name.into(),
                 kind,
                 line: node.start_position().row + 1,
+                container: None,
             });
         }
     } else if node.kind() == "call_expression"
@@ -1002,4 +1097,35 @@ fn is_method(node: Node<'_>) -> bool {
     node.parent()
         .and_then(|parent| parent.parent())
         .is_some_and(|parent| parent.kind() == "impl_item")
+}
+
+fn enclosing_type_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if matches!(
+            ancestor.kind(),
+            "class_declaration" | "interface_declaration" | "enum_declaration" | "class_definition"
+        ) {
+            return ancestor
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source).ok())
+                .map(str::to_owned);
+        }
+        current = ancestor.parent();
+    }
+    None
+}
+
+fn rust_impl_type_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if ancestor.kind() == "impl_item" {
+            return ancestor
+                .child_by_field_name("type")
+                .and_then(|type_node| type_node.utf8_text(source).ok())
+                .map(str::to_owned);
+        }
+        current = ancestor.parent();
+    }
+    None
 }

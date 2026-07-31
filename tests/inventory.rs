@@ -23,10 +23,15 @@ fn inventory_is_deterministic_and_excludes_ignored_unsafe_and_binary_files() {
         .expect("private directory should exist");
     std::fs::create_dir_all(repository.path().join("target"))
         .expect("build directory should exist");
+    std::fs::create_dir_all(repository.path().join("vendor"))
+        .expect("vendor directory should exist");
     std::fs::write(repository.path().join(".gitignore"), "ignored.rs\n")
         .expect("gitignore should be written");
-    std::fs::write(repository.path().join(".pmemcignore"), "private/**\n")
-        .expect("pmemcignore should be written");
+    std::fs::write(
+        repository.path().join(".pmemcignore"),
+        "private/**\n!vendor/README.md\n!key.pem\n",
+    )
+    .expect("pmemcignore should be written");
     std::fs::write(repository.path().join("src/lib.rs"), "pub fn run() {}\n")
         .expect("Rust fixture should be written");
     std::fs::write(repository.path().join("notes.md"), "# Notes\n")
@@ -52,8 +57,14 @@ fn inventory_is_deterministic_and_excludes_ignored_unsafe_and_binary_files() {
         .expect("secret fixture should be written");
     std::fs::write(repository.path().join("key.pem"), "private key\n")
         .expect("key fixture should be written");
+    std::fs::write(
+        repository.path().join("vendor/README.md"),
+        "safe vendored notes\n",
+    )
+    .expect("safe override fixture should be written");
     std::fs::write(repository.path().join("binary.dat"), [0_u8, 1, 2])
         .expect("binary fixture should be written");
+    git(repository.path(), &["add", "vendor/README.md"]);
 
     let inventory = inventory(repository.path()).expect("inventory should succeed");
     let paths = inventory
@@ -69,10 +80,12 @@ fn inventory_is_deterministic_and_excludes_ignored_unsafe_and_binary_files() {
             ".pmemcignore",
             "notes.md",
             "src/lib.rs",
-            "unknown.custom"
+            "unknown.custom",
+            "vendor/README.md"
         ]
     );
     assert_eq!(inventory.files[2].language, Language::GenericText);
     assert_eq!(inventory.files[3].language, Language::Rust);
     assert_eq!(inventory.files[4].language, Language::Unsupported);
+    assert_eq!(inventory.files[5].language, Language::GenericText);
 }

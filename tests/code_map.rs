@@ -57,12 +57,24 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         .expect("JavaScript nested directory should exist");
     std::fs::write(
         repository.path().join("scripts/page.js"),
-        "import { utility } from \"../util.js\";\n",
+        "import { utility } from \"../util.js\";\nimport { typedHelper } from \"../typed\";\n",
     )
     .expect("nested JavaScript fixture should be written");
+    std::fs::create_dir_all(repository.path().join("pkg"))
+        .expect("Python package directory should exist");
+    std::fs::write(
+        repository.path().join("pkg/service.py"),
+        "from .util import package_utility\n",
+    )
+    .expect("nested Python fixture should be written");
+    std::fs::write(
+        repository.path().join("pkg/util.py"),
+        "def package_utility():\n    pass\n",
+    )
+    .expect("nested Python utility fixture should be written");
     std::fs::write(
         repository.path().join("typed.ts"),
-        "class Typed {}\ninterface Shape {}\nenum Mode { Ready }\nfunction typedCaller(): void { typedHelper(); }\nfunction typedHelper(): void {}\n",
+        "class Typed { typedMethod(): void {} }\ninterface Shape {}\nenum Mode { Ready }\nfunction typedCaller(): void { typedHelper(); }\nfunction typedHelper(): void {}\n",
     )
     .expect("TypeScript fixture should be written");
     std::fs::write(
@@ -198,6 +210,11 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
     assert!(
         map.symbols
             .iter()
+            .any(|symbol| symbol.name == "typedMethod" && symbol.kind == SymbolKind::Method)
+    );
+    assert!(
+        map.symbols
+            .iter()
             .any(|symbol| symbol.name == "Shape" && symbol.kind == SymbolKind::Interface)
     );
     assert!(
@@ -231,11 +248,17 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
     assert!(map.imports.iter().any(|import| {
         import.source_path == "scripts/page.js" && import.target_path == "util.js"
     }));
+    assert!(map.imports.iter().any(|import| {
+        import.source_path == "scripts/page.js" && import.target_path == "typed.ts"
+    }));
     assert!(
         map.imports.iter().any(|import| {
             import.source_path == "good.py" && import.target_path == "py_util.py"
         })
     );
+    assert!(map.imports.iter().any(|import| {
+        import.source_path == "pkg/service.py" && import.target_path == "pkg/util.py"
+    }));
     assert!(map.imports.iter().any(|import| {
         import.source_path == "Demo.java" && import.target_path == "local/Helper.java"
     }));
@@ -269,4 +292,19 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
                 && relationship.source == "src/lib.rs"
                 && relationship.target.contains("run"))
     );
+    assert!(map.relationships.iter().any(|relationship| {
+        relationship.kind == RelationKind::Contains
+            && relationship.source.contains("Service")
+            && relationship.target.contains("start")
+    }));
+    assert!(map.relationships.iter().any(|relationship| {
+        relationship.kind == RelationKind::Contains
+            && relationship.source.contains("Demo")
+            && relationship.target.contains("javaCaller")
+    }));
+    assert!(map.relationships.iter().any(|relationship| {
+        relationship.kind == RelationKind::Contains
+            && relationship.source.contains("Typed")
+            && relationship.target.contains("typedMethod")
+    }));
 }

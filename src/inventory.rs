@@ -66,9 +66,7 @@ pub fn inventory(repository: &Path) -> Result<Inventory, InventoryError> {
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
         .map(|path| String::from_utf8_lossy(path).into_owned())
-        .filter(|path| {
-            !is_default_excluded(path) && !patterns.iter().any(|pattern| matches(pattern, path))
-        })
+        .filter(|path| !is_excluded(path, &patterns))
         .filter(|path| !is_binary(&root.join(path)))
         .map(|path| InventoryFile {
             language: language_for(&path),
@@ -119,17 +117,42 @@ fn pmemc_ignore_patterns(root: &Path) -> Result<Vec<String>, InventoryError> {
 }
 
 fn is_default_excluded(path: &str) -> bool {
+    is_credential_path(path)
+        || path.split('/').any(|component| {
+            matches!(
+                component,
+                ".git" | "node_modules" | "vendor" | "target" | "build" | "dist" | "out"
+            )
+        })
+}
+
+fn is_credential_path(path: &str) -> bool {
     let filename = path.rsplit('/').next().unwrap_or(path);
     filename == ".env"
         || filename.starts_with(".env.")
         || [".pem", ".key", ".p12", ".pfx"]
             .iter()
             .any(|extension| filename.ends_with(extension))
-        || path.split('/').any(|component| {
-            matches!(
-                component,
-                ".git" | "node_modules" | "vendor" | "target" | "build" | "dist" | "out"
-            )
+}
+
+fn is_excluded(path: &str, patterns: &[String]) -> bool {
+    if is_credential_path(path) {
+        return true;
+    }
+    patterns
+        .iter()
+        .fold(is_default_excluded(path), |excluded, pattern| {
+            if let Some(safe_override) = pattern.strip_prefix('!') {
+                if matches(safe_override, path) {
+                    false
+                } else {
+                    excluded
+                }
+            } else if matches(pattern, path) {
+                true
+            } else {
+                excluded
+            }
         })
 }
 
