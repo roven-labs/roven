@@ -578,7 +578,7 @@ pub fn pending_review_proposals(
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let mut statement = connection
         .prepare(
-            "SELECT p.id, p.inspection_attempt_id, p.statement, p.lifecycle_state, p.confidence, p.evidence_paths_json, i.bundle_json, v.provider_id, v.model_id FROM proposals p JOIN inspection_attempts i ON i.id = p.inspection_attempt_id JOIN provider_invocations v ON v.id = p.provider_invocation_id WHERE i.project_id = ?1 AND p.status = 'pending_review' ORDER BY p.id",
+            "SELECT p.id, p.inspection_attempt_id, p.statement, p.lifecycle_state, p.confidence, p.evidence_paths_json, i.bundle_json, v.provider_id, v.model_id FROM proposals p JOIN inspection_attempts i ON i.id = p.inspection_attempt_id JOIN provider_invocations v ON v.id = p.provider_invocation_id AND v.inspection_attempt_id = p.inspection_attempt_id WHERE i.project_id = ?1 AND i.status = 'pending_review' AND p.status = 'pending_review' AND v.status = 'succeeded' ORDER BY p.id",
         )
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let rows = statement
@@ -610,13 +610,20 @@ pub fn pending_review_proposals(
         ) = row.map_err(|source| StorageError::ProjectDatabase { source })?;
         let evidence_paths: Vec<String> = serde_json::from_str(&evidence_paths_json)
             .map_err(|_| StorageError::InvalidStoredEvidence)?;
+        let unique_evidence_paths = evidence_paths.iter().collect::<BTreeSet<_>>();
+        if evidence_paths.is_empty() || unique_evidence_paths.len() != evidence_paths.len() {
+            return Err(StorageError::InvalidStoredEvidence);
+        }
         let bundle: EvidenceBundle =
             serde_json::from_str(&bundle_json).map_err(|_| StorageError::InvalidStoredEvidence)?;
         let evidence = bundle
             .files
             .into_iter()
-            .filter(|file| evidence_paths.contains(&file.path))
-            .collect();
+            .filter(|file| unique_evidence_paths.contains(&file.path))
+            .collect::<Vec<_>>();
+        if evidence.len() != unique_evidence_paths.len() {
+            return Err(StorageError::InvalidStoredEvidence);
+        }
         Ok(PendingReviewProposal {
             id,
             inspection_attempt_id,

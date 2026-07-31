@@ -217,6 +217,18 @@ fn provider_results_are_pending_review_with_invocation_metadata() {
             .collect::<Vec<_>>(),
         ["src/lib.rs"]
     );
+
+    connection
+        .execute(
+            "UPDATE proposals SET evidence_paths_json = '[\"missing.rs\"]' WHERE id = 1",
+            [],
+        )
+        .expect("fixture proposal should be corruptible for a fail-closed check");
+    let malformed = storage::pending_review_proposals(&data_paths, project.id);
+    assert!(matches!(
+        malformed,
+        Err(storage::StorageError::InvalidStoredEvidence)
+    ));
 }
 
 #[test]
