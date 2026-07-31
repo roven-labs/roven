@@ -300,10 +300,10 @@ fn review_interactively_approves_corrects_rejects_and_skips_without_losing_propo
     .expect("attempt should stage");
     let response = parse_response(
         r#"{"schema_version":1,"proposals":[
-            {"statement":"approve me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
-            {"statement":"correct me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
-            {"statement":"reject me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
-            {"statement":"skip me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]}
+            {"fact_kind":"repository_observation","statement":"approve me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
+            {"fact_kind":"repository_observation","statement":"correct me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
+            {"fact_kind":"repository_observation","statement":"reject me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
+            {"fact_kind":"repository_observation","statement":"skip me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]}
         ],"questions":[]}"#,
         &bundle,
     )

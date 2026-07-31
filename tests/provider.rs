@@ -75,6 +75,7 @@ fn fake_provider_returns_a_schema_validated_response() {
         r#"{
             "schema_version": 1,
             "proposals": [{
+                "fact_kind": "repository_observation",
                 "statement": "The project exposes a run function.",
                 "lifecycle": "committed",
                 "confidence": "exact",
@@ -103,6 +104,7 @@ fn provider_response_rejects_unknown_fields_and_unselected_evidence() {
         r#"{
             "schema_version": 1,
             "proposals": [{
+                "fact_kind": "repository_observation",
                 "statement": "Unsupported claim.",
                 "lifecycle": "committed",
                 "confidence": "exact",
@@ -112,9 +114,14 @@ fn provider_response_rejects_unknown_fields_and_unselected_evidence() {
         }"#,
         &bundle(),
     );
+    let invalid_fact_kind = parse_response(
+        r#"{"schema_version":1,"proposals":[{"fact_kind":"Repository Fact","statement":"Bad kind.","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]}],"questions":[]}"#,
+        &bundle(),
+    );
 
     assert!(unknown_field.is_err());
     assert!(unknown_evidence.is_err());
+    assert!(invalid_fact_kind.is_err());
 }
 
 #[test]
@@ -143,6 +150,7 @@ fn provider_results_are_pending_review_with_invocation_metadata() {
         r#"{
             "schema_version": 1,
             "proposals": [{
+                "fact_kind": "repository_observation",
                 "statement": "The project exposes a run function.",
                 "lifecycle": "committed",
                 "confidence": "exact",
@@ -277,6 +285,7 @@ fn approved_bundle_submission_uses_the_fake_provider_without_network_access() {
         r#"{
             "schema_version": 1,
             "proposals": [{
+                "fact_kind": "repository_observation",
                 "statement": "The project exposes a run function.",
                 "lifecycle": "committed",
                 "confidence": "exact",
@@ -438,6 +447,7 @@ fn persistence_revalidates_untrusted_provider_response_against_staged_evidence()
     let invalid_response = ProviderResponse {
         schema_version: 1,
         proposals: vec![Proposal {
+            fact_kind: "repository_observation".into(),
             statement: "This cites evidence outside the approved bundle.".into(),
             lifecycle: ProposedLifecycle::Committed,
             confidence: ProposedConfidence::Exact,
@@ -512,6 +522,12 @@ fn openrouter_provider_sends_a_versioned_prompt_and_validates_chat_content() {
         .as_str()
         .expect("user prompt should be text");
     assert!(prompt.contains("PMEMC proposal schema version: 1"));
+    assert!(prompt.contains("fact_kind"));
+    assert_eq!(
+        request["response_format"]["json_schema"]["schema"]["properties"]["proposals"]["items"]["properties"]
+            ["fact_kind"]["pattern"],
+        "^[a-z0-9_]+$"
+    );
     assert!(prompt.contains("src/lib.rs"));
 }
 

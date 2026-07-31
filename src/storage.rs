@@ -170,6 +170,12 @@ const MIGRATIONS: &[Migration] = &[
         ALTER TABLE inspection_attempts ADD COLUMN repository_commit TEXT;
     ",
     },
+    Migration {
+        version: 8,
+        sql: "
+        ALTER TABLE proposals ADD COLUMN fact_kind TEXT NOT NULL DEFAULT 'repository_observation';
+    ",
+    },
 ];
 
 struct Migration {
@@ -255,6 +261,8 @@ pub struct PendingReviewProposal {
     pub id: i64,
     /// Persistent inspection attempt identifier.
     pub inspection_attempt_id: i64,
+    /// Stable provider-supplied category used for conflict comparison.
+    pub fact_kind: String,
     /// Untrusted provider statement awaiting an operator decision.
     pub statement: String,
     /// Provider-suggested lifecycle state.
@@ -639,7 +647,7 @@ pub fn pending_review_proposals(
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let mut statement = connection
         .prepare(
-            "SELECT p.id, p.inspection_attempt_id, p.statement, p.lifecycle_state, p.confidence, p.evidence_paths_json, i.bundle_json, i.repository_commit, c.serialized_json, v.provider_id, v.model_id FROM proposals p JOIN inspection_attempts i ON i.id = p.inspection_attempt_id LEFT JOIN code_map_snapshots c ON c.id = i.code_map_snapshot_id JOIN provider_invocations v ON v.id = p.provider_invocation_id AND v.inspection_attempt_id = p.inspection_attempt_id WHERE i.project_id = ?1 AND i.status = 'pending_review' AND p.status = 'pending_review' AND v.status = 'succeeded' ORDER BY p.id",
+            "SELECT p.id, p.inspection_attempt_id, p.fact_kind, p.statement, p.lifecycle_state, p.confidence, p.evidence_paths_json, i.bundle_json, i.repository_commit, c.serialized_json, v.provider_id, v.model_id FROM proposals p JOIN inspection_attempts i ON i.id = p.inspection_attempt_id LEFT JOIN code_map_snapshots c ON c.id = i.code_map_snapshot_id JOIN provider_invocations v ON v.id = p.provider_invocation_id AND v.inspection_attempt_id = p.inspection_attempt_id WHERE i.project_id = ?1 AND i.status = 'pending_review' AND p.status = 'pending_review' AND v.status = 'succeeded' ORDER BY p.id",
         )
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let rows = statement
@@ -652,10 +660,11 @@ pub fn pending_review_proposals(
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(7)?,
                 row.get::<_, Option<String>>(8)?,
-                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(9)?,
                 row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
             ))
         })
         .map_err(|source| StorageError::ProjectDatabase { source })?;
@@ -663,6 +672,7 @@ pub fn pending_review_proposals(
         let (
             id,
             inspection_attempt_id,
+            fact_kind,
             statement,
             lifecycle_state,
             confidence,
@@ -702,6 +712,7 @@ pub fn pending_review_proposals(
         Ok(PendingReviewProposal {
             id,
             inspection_attempt_id,
+            fact_kind,
             statement,
             lifecycle_state,
             confidence,
@@ -820,14 +831,15 @@ pub fn store_provider_response(
             .map_err(|source| StorageError::SerializeProviderResponse { source })?;
         transaction
             .execute(
-                "INSERT INTO proposals (inspection_attempt_id, provider_invocation_id, statement, lifecycle_state, confidence, evidence_paths_json, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending_review')",
+            "INSERT INTO proposals (inspection_attempt_id, provider_invocation_id, fact_kind, statement, lifecycle_state, confidence, evidence_paths_json, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending_review')",
                 params![
-                    attempt_id,
-                    invocation_id,
-                    proposal.statement,
-                    proposal.lifecycle.as_str(),
-                    proposal.confidence.as_str(),
-                    evidence_paths_json,
+                attempt_id,
+                invocation_id,
+                proposal.fact_kind,
+                proposal.statement,
+                proposal.lifecycle.as_str(),
+                proposal.confidence.as_str(),
+                evidence_paths_json,
                 ],
             )
             .map_err(|source| StorageError::ProjectDatabase { source })?;
@@ -1157,8 +1169,8 @@ mod tests {
     #[test]
     fn code_map_snapshot_migration_preserves_existing_provider_records() {
         let mut connection = Connection::open_in_memory().expect("in-memory SQLite should open");
-        apply_migrations(&mut connection, &MIGRATIONS[..6])
-            .expect("version six database should initialize");
+        apply_migrations(&mut connection, &MIGRATIONS[..7])
+            .expect("version seven database should initialize");
         connection
             .execute(
                 "INSERT INTO projects (id, display_name, canonical_path, lifecycle_state) VALUES (1, 'fixture', 'C:/fixture', 'registered_needs_inspection')",
@@ -1197,7 +1209,7 @@ mod tests {
             .expect("question fixture should insert");
 
         apply_migrations(&mut connection, MIGRATIONS)
-            .expect("inspection-provenance migration should upgrade version six data");
+            .expect("fact-kind migration should upgrade version seven data");
 
         let preserved_rows: (i64, i64, i64, i64, i64) = connection
             .query_row(
@@ -1220,6 +1232,11 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("preexisting attempt should gain a nullable commit reference");
+        let fact_kind: String = connection
+            .query_row("SELECT fact_kind FROM proposals WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("preexisting proposal should gain a default fact kind");
         let review_table_count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('verified_facts', 'fact_evidence', 'review_decisions', 'conflicts', 'inspection_baselines')",
@@ -1231,6 +1248,7 @@ mod tests {
         assert_eq!(preserved_rows, (1, 1, 1, 1, 1));
         assert_eq!(original_snapshot, Some(1));
         assert_eq!(repository_commit, None);
+        assert_eq!(fact_kind, "repository_observation");
         assert_eq!(review_table_count, 5);
     }
 

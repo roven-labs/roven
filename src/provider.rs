@@ -136,6 +136,7 @@ impl ProposedConfidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proposal {
+    pub fact_kind: String,
     pub statement: String,
     pub lifecycle: ProposedLifecycle,
     pub confidence: ProposedConfidence,
@@ -445,6 +446,9 @@ pub fn validate_response(
         .map(|file| file.path.as_str())
         .collect::<BTreeSet<_>>();
     for proposal in &response.proposals {
+        if !valid_fact_kind(&proposal.fact_kind) {
+            return Err(ProviderError::InvalidResponse);
+        }
         if proposal.statement.trim().is_empty() {
             return Err(ProviderError::InvalidResponse);
         }
@@ -467,13 +471,22 @@ pub fn validate_response(
     Ok(())
 }
 
+fn valid_fact_kind(fact_kind: &str) -> bool {
+    !fact_kind.is_empty()
+        && fact_kind.len() <= 64
+        && fact_kind
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 fn openrouter_request(model_id: &str, bundle: &EvidenceBundle) -> Result<Value, ProviderError> {
     let evidence_json =
         serde_json::to_string(bundle).map_err(|_| ProviderError::InvalidResponse)?;
     let prompt = format!(
         "PMEMC proposal schema version: {RESPONSE_SCHEMA_VERSION}\n\
          Return only one JSON object with exactly schema_version, proposals, and questions.\n\
-         Each proposal must have exactly statement, lifecycle, confidence, and evidence_paths.\n\
+         Each proposal must have exactly fact_kind, statement, lifecycle, confidence, and evidence_paths.\n\
+         fact_kind is a lowercase snake_case identifier of at most 64 characters.\n\
          lifecycle is committed or in_progress; confidence is exact, inferred, or user_confirmed.\n\
          Never infer metrics, ownership, rationale, or claims without selected evidence.\n\
          Put uncertainty in questions. Cite only evidence_paths supplied below.\n\
@@ -498,8 +511,9 @@ fn openrouter_request(model_id: &str, bundle: &EvidenceBundle) -> Result<Value, 
                             "items": {
                                 "type": "object",
                                 "additionalProperties": false,
-                                "required": ["statement", "lifecycle", "confidence", "evidence_paths"],
+                                "required": ["fact_kind", "statement", "lifecycle", "confidence", "evidence_paths"],
                                 "properties": {
+                                    "fact_kind": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9_]+$"},
                                     "statement": {"type": "string", "minLength": 1},
                                     "lifecycle": {"type": "string", "enum": ["committed", "in_progress"]},
                                     "confidence": {"type": "string", "enum": ["exact", "inferred", "user_confirmed"]},
