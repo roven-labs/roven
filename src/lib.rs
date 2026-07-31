@@ -1,5 +1,6 @@
 //! Testable application entry points for PMEMC.
 
+pub mod code_map;
 pub mod domain;
 pub mod git;
 pub mod inventory;
