@@ -30,16 +30,28 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 fn status_command(project_id: Option<String>) -> anyhow::Result<()> {
-    let project_id = project_id.ok_or_else(|| {
-        anyhow::anyhow!("a project ID is required until multi-project status is implemented")
-    })?;
-    let id = project_id
-        .strip_prefix("project-")
-        .ok_or_else(|| anyhow::anyhow!("project ID must use the form project-<number>"))?
-        .parse::<i64>()?;
     let data_paths = storage::default_data_paths()?;
-    let project = storage::project_by_id(&data_paths, id)?
-        .ok_or_else(|| anyhow::anyhow!("project {project_id} is not registered"))?;
+    let projects = match project_id {
+        Some(project_id) => {
+            let id = parse_project_id(&project_id)?;
+            let project = storage::project_by_id(&data_paths, id)?
+                .ok_or_else(|| anyhow::anyhow!("project {project_id} is not registered"))?;
+            vec![project]
+        }
+        None => storage::list_projects(&data_paths)?,
+    };
+
+    if projects.is_empty() {
+        anyhow::bail!("no projects are registered; run `pmemc project add <path>` first");
+    }
+
+    for project in projects {
+        print_project_status(&project)?;
+    }
+    Ok(())
+}
+
+fn print_project_status(project: &storage::Project) -> anyhow::Result<()> {
     println!(
         "project-{}\tinitial inspection required\t{}",
         project.id,
@@ -54,7 +66,14 @@ fn status_command(project_id: Option<String>) -> anyhow::Result<()> {
         "head\t{}",
         metadata.head_commit.as_deref().unwrap_or("unborn")
     );
+    println!("commits-since-baseline\tnot-applicable (initial inspection required)");
     let status = git::working_tree_status(&project.canonical_path)?;
+    for path in status.added_paths {
+        println!("added\t{path}");
+    }
+    for path in status.modified_paths {
+        println!("modified\t{path}");
+    }
     for path in status.untracked_paths {
         println!("untracked\t{path}");
     }
@@ -75,6 +94,14 @@ fn status_command(project_id: Option<String>) -> anyhow::Result<()> {
         println!("{label}\t{}\t{}", relationship.source, relationship.target);
     }
     Ok(())
+}
+
+fn parse_project_id(project_id: &str) -> anyhow::Result<i64> {
+    project_id
+        .strip_prefix("project-")
+        .ok_or_else(|| anyhow::anyhow!("project ID must use the form project-<number>"))?
+        .parse::<i64>()
+        .map_err(Into::into)
 }
 
 fn project_command(command: cli::ProjectCommand) -> anyhow::Result<()> {
@@ -103,29 +130,30 @@ fn project_command(command: cli::ProjectCommand) -> anyhow::Result<()> {
         }
         cli::ProjectCommand::List => {
             for project in storage::list_projects(&data_paths)? {
+                let metadata = git::metadata(&project.canonical_path)?;
                 println!(
-                    "project-{}\t{}\t{}\t{}",
+                    "project-{}\t{}\t{}\t{}\tbranch={}\tlast-approved-inspection=none\tchanges-detected=initial-inspection-required",
                     project.id,
                     project.display_name,
                     project.canonical_path.display(),
-                    project.lifecycle_state
+                    project.lifecycle_state,
+                    metadata.branch.as_deref().unwrap_or("detached")
                 );
             }
             Ok(())
         }
         cli::ProjectCommand::Show { project_id } => {
-            let id = project_id
-                .strip_prefix("project-")
-                .ok_or_else(|| anyhow::anyhow!("project ID must use the form project-<number>"))?
-                .parse::<i64>()?;
+            let id = parse_project_id(&project_id)?;
             let project = storage::project_by_id(&data_paths, id)?
                 .ok_or_else(|| anyhow::anyhow!("project {project_id} is not registered"))?;
             println!(
-                "project-{}\t{}\t{}\t{}",
+                "project-{}\t{}\t{}\t{}\tbranch={}\thead={}",
                 project.id,
                 project.display_name,
                 project.canonical_path.display(),
-                project.lifecycle_state
+                project.lifecycle_state,
+                project.current_branch.as_deref().unwrap_or("detached"),
+                project.head_commit.as_deref().unwrap_or("unborn")
             );
             Ok(())
         }

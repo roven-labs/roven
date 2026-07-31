@@ -1,6 +1,7 @@
 //! Read-only Git metadata adapter.
 
 use std::{
+    fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -33,6 +34,8 @@ pub enum PathRelationshipKind {
 /// A single read-only snapshot of a repository working tree.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkingTreeStatus {
+    pub added_paths: Vec<String>,
+    pub modified_paths: Vec<String>,
     pub untracked_paths: Vec<String>,
     pub staged_paths: Vec<String>,
     pub unstaged_paths: Vec<String>,
@@ -45,12 +48,20 @@ pub struct WorkingTreeStatus {
 pub enum GitError {
     #[error("Git could not inspect {path}: {message}")]
     Command { path: PathBuf, message: String },
+    #[error("Git reported repository root {path}, but PMEMC could not canonicalize it: {source}")]
+    Canonicalize {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Read Git repository metadata without reading source files.
 pub fn metadata(path: &Path) -> Result<RepositoryMetadata, GitError> {
     let root = run(path, &["rev-parse", "--show-toplevel"])?;
     let root = PathBuf::from(root.trim());
+    let root =
+        fs::canonicalize(&root).map_err(|source| GitError::Canonicalize { path: root, source })?;
     let branch = optional(&root, &["branch", "--show-current"])?;
     let head_commit = optional(&root, &["rev-parse", "HEAD"])?;
     Ok(RepositoryMetadata {
@@ -126,6 +137,12 @@ fn relationship_record<'a>(
 }
 
 fn collect_path_states(status: &mut WorkingTreeStatus, xy: &[u8], path: String) {
+    if xy.contains(&b'A') {
+        status.added_paths.push(path.clone());
+    }
+    if xy.contains(&b'M') {
+        status.modified_paths.push(path.clone());
+    }
     if xy.first().is_some_and(|state| *state != b'.') {
         status.staged_paths.push(path.clone());
     }
