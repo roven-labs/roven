@@ -58,12 +58,28 @@ fn review_command(project_id: Option<String>) -> anyhow::Result<()> {
             println!("lifecycle\t{}", proposal.lifecycle_state);
             println!("confidence\t{}", proposal.confidence);
             println!("provider\t{}\t{}", proposal.provider_id, proposal.model_id);
+            println!(
+                "commit\t{}",
+                proposal
+                    .repository_commit
+                    .as_deref()
+                    .unwrap_or("working-tree-only")
+            );
             for evidence in &proposal.evidence {
                 let state = match evidence.state {
                     inspection::EvidenceState::Committed => "committed",
-                    inspection::EvidenceState::InProgress => "working-tree",
+                    inspection::EvidenceState::Staged => "staged",
+                    inspection::EvidenceState::Unstaged => "unstaged",
+                    inspection::EvidenceState::StagedAndUnstaged => "staged-and-unstaged",
+                    inspection::EvidenceState::Untracked => "untracked",
                 };
                 println!("evidence\t{}\t{}", evidence.path, state);
+            }
+            for locator in &proposal.evidence_locators {
+                println!(
+                    "locator\t{}\t{}\t{}",
+                    locator.path, locator.line, locator.symbol_id
+                );
             }
             print!("[a]pprove, [c]orrect, [r]eject, or [s]kip? ");
             io::stdout().flush()?;
@@ -139,6 +155,7 @@ fn inspect_command(project_id: &str) -> anyhow::Result<()> {
     let id = parse_project_id(project_id)?;
     let project = storage::project_by_id(&data_paths, id)?
         .ok_or_else(|| anyhow::anyhow!("project {project_id} is not registered"))?;
+    let inspected_metadata = git::metadata(&project.canonical_path)?;
     let status = git::working_tree_status(&project.canonical_path)?;
     let retryable_attempt = storage::failed_provider_attempt_for_project(&data_paths, id)?;
     let initial_inspection = project.lifecycle_state == "registered_needs_inspection";
@@ -188,13 +205,23 @@ fn inspect_command(project_id: &str) -> anyhow::Result<()> {
         } else {
             inspection::build_incremental_package(&project.canonical_path, project_id, &status)?
         };
+        let post_inspection_metadata = git::metadata(&project.canonical_path)?;
+        let post_inspection_status = git::working_tree_status(&project.canonical_path)?;
+        if post_inspection_metadata.head_commit != inspected_metadata.head_commit
+            || post_inspection_status != status
+        {
+            anyhow::bail!(
+                "repository changed during inspection; no evidence was staged, retry the inspection"
+            );
+        }
         let bundle_json = serde_json::to_string(&package.bundle)?;
-        let attempt_id = storage::stage_inspection_attempt_with_code_map(
+        let attempt_id = storage::stage_inspection_attempt_with_provenance(
             &data_paths,
             id,
             package.bundle.schema_version,
             &bundle_json,
             Some(&package.code_map_json),
+            inspected_metadata.head_commit.as_deref(),
         )?;
         (package.bundle, attempt_id)
     };

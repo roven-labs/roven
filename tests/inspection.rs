@@ -289,8 +289,15 @@ fn review_interactively_approves_corrects_rejects_and_skips_without_losing_propo
         }],
     };
     let bundle_json = serde_json::to_string(&bundle).expect("bundle should serialize");
-    let attempt_id = storage::stage_inspection_attempt(&data_paths, project.id, 1, &bundle_json)
-        .expect("attempt should stage");
+    let attempt_id = storage::stage_inspection_attempt_with_provenance(
+        &data_paths,
+        project.id,
+        1,
+        &bundle_json,
+        Some(r#"{"symbols":[{"path":"src/lib.rs","line":1,"name":"run"}]}"#),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    )
+    .expect("attempt should stage");
     let response = parse_response(
         r#"{"schema_version":1,"proposals":[
             {"statement":"approve me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
@@ -315,7 +322,9 @@ fn review_interactively_approves_corrects_rejects_and_skips_without_losing_propo
     assert!(review.status.success());
     let output = String::from_utf8_lossy(&review.stdout);
     assert!(output.contains("provider\tfake\toffline-test-model"));
+    assert!(output.contains("commit\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
     assert!(output.contains("evidence\tsrc/lib.rs\tcommitted"));
+    assert!(output.contains("locator\tsrc/lib.rs\t1\tsrc/lib.rs:1:run"));
     let connection = rusqlite::Connection::open(data_paths.database_path())
         .expect("database should be readable");
     let proposal_statuses = connection
@@ -392,6 +401,34 @@ fn review_interactively_approves_corrects_rejects_and_skips_without_losing_propo
         )
         .expect("duplicate decision must not create a second record");
     assert_eq!(decision_count, 1);
+    connection
+        .execute(
+            "UPDATE code_map_snapshots SET serialized_json = '{\"symbols\":[{\"path\":\"src/lib.rs\",\"line\":\"not-a-line\",\"name\":\"run\"}]}'",
+            [],
+        )
+        .expect("snapshot fixture should be corruptible for a fail-closed check");
+    let corrupted_snapshot = storage::pending_review_proposals(&data_paths, project.id);
+    assert!(matches!(
+        corrupted_snapshot,
+        Err(storage::StorageError::InvalidStoredEvidence)
+    ));
+    connection
+        .execute(
+            "UPDATE code_map_snapshots SET serialized_json = '{\"symbols\":[{\"path\":\"src/lib.rs\",\"line\":1,\"name\":\"run\"}]}'",
+            [],
+        )
+        .expect("snapshot fixture should be restorable");
+    connection
+        .execute(
+            "UPDATE inspection_attempts SET repository_commit = 'not-a-git-object' WHERE id = 1",
+            [],
+        )
+        .expect("commit fixture should be corruptible for a fail-closed check");
+    let corrupted_commit = storage::pending_review_proposals(&data_paths, project.id);
+    assert!(matches!(
+        corrupted_commit,
+        Err(storage::StorageError::InvalidStoredEvidence)
+    ));
 }
 
 #[test]
@@ -447,6 +484,13 @@ fn incremental_bundle_selects_changed_code_neighbours_tests_and_manifests() {
         paths,
         ["Cargo.toml", "src/helper.rs", "src/lib.rs", "tests/lib.rs"]
     );
+    let changed_state = bundle
+        .files
+        .iter()
+        .find(|file| file.path == "src/lib.rs")
+        .expect("changed source should be bundled")
+        .state;
+    assert_eq!(changed_state, EvidenceState::Unstaged);
 }
 
 #[test]

@@ -7,6 +7,7 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
@@ -163,6 +164,12 @@ const MIGRATIONS: &[Migration] = &[
         );
     ",
     },
+    Migration {
+        version: 7,
+        sql: "
+        ALTER TABLE inspection_attempts ADD COLUMN repository_commit TEXT;
+    ",
+    },
 ];
 
 struct Migration {
@@ -256,10 +263,25 @@ pub struct PendingReviewProposal {
     pub confidence: String,
     /// Evidence files selected by the provider from the approved bundle.
     pub evidence: Vec<EvidenceFile>,
+    /// Commit captured at inspection time, when the repository had a HEAD.
+    pub repository_commit: Option<String>,
+    /// Structural locations from the immutable code-map snapshot.
+    pub evidence_locators: Vec<EvidenceLocator>,
     /// Non-secret provider adapter identifier.
     pub provider_id: String,
     /// Non-secret provider model identifier.
     pub model_id: String,
+}
+
+/// A structural location available for a selected evidence path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceLocator {
+    /// Evidence-relative path.
+    pub path: String,
+    /// One-based source line from the code-map snapshot.
+    pub line: usize,
+    /// Stable code-map symbol identifier.
+    pub symbol_id: String,
 }
 
 /// An operator's durable decision for one pending proposal.
@@ -340,6 +362,9 @@ pub enum StorageError {
     /// A requested review action cannot be applied to a pending proposal.
     #[error("review decision is invalid or the proposal is no longer pending")]
     InvalidReviewDecision,
+    /// Inspection provenance did not contain a Git object identifier.
+    #[error("inspection commit provenance is invalid")]
+    InvalidCommitProvenance,
 }
 
 /// Resolve the default Windows local-data location used by `pmemc init`.
@@ -503,6 +528,28 @@ pub fn stage_inspection_attempt_with_code_map(
     bundle_json: &str,
     code_map_json: Option<&str>,
 ) -> Result<i64, StorageError> {
+    stage_inspection_attempt_with_provenance(
+        data_paths,
+        project_id,
+        bundle_schema_version,
+        bundle_json,
+        code_map_json,
+        None,
+    )
+}
+
+/// Persist an approved bundle with its immutable map and inspected commit.
+pub fn stage_inspection_attempt_with_provenance(
+    data_paths: &DataPaths,
+    project_id: i64,
+    bundle_schema_version: u8,
+    bundle_json: &str,
+    code_map_json: Option<&str>,
+    repository_commit: Option<&str>,
+) -> Result<i64, StorageError> {
+    if repository_commit.is_some_and(|commit| !valid_repository_commit(commit)) {
+        return Err(StorageError::InvalidCommitProvenance);
+    }
     initialize(data_paths)?;
     let mut connection = open_connection(&data_paths.database_path())
         .map_err(|source| StorageError::ProjectDatabase { source })?;
@@ -537,8 +584,8 @@ pub fn stage_inspection_attempt_with_code_map(
     };
     transaction
         .execute(
-            "INSERT INTO inspection_attempts (project_id, status, previous_lifecycle_state, bundle_schema_version, bundle_json, code_map_snapshot_id) VALUES (?1, 'staged_pending_provider', ?2, ?3, ?4, ?5)",
-            params![project_id, previous_lifecycle_state, bundle_schema_version, bundle_json, code_map_snapshot_id],
+            "INSERT INTO inspection_attempts (project_id, status, previous_lifecycle_state, bundle_schema_version, bundle_json, code_map_snapshot_id, repository_commit) VALUES (?1, 'staged_pending_provider', ?2, ?3, ?4, ?5, ?6)",
+            params![project_id, previous_lifecycle_state, bundle_schema_version, bundle_json, code_map_snapshot_id, repository_commit],
         )
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let attempt_id = transaction.last_insert_rowid();
@@ -592,7 +639,7 @@ pub fn pending_review_proposals(
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let mut statement = connection
         .prepare(
-            "SELECT p.id, p.inspection_attempt_id, p.statement, p.lifecycle_state, p.confidence, p.evidence_paths_json, i.bundle_json, v.provider_id, v.model_id FROM proposals p JOIN inspection_attempts i ON i.id = p.inspection_attempt_id JOIN provider_invocations v ON v.id = p.provider_invocation_id AND v.inspection_attempt_id = p.inspection_attempt_id WHERE i.project_id = ?1 AND i.status = 'pending_review' AND p.status = 'pending_review' AND v.status = 'succeeded' ORDER BY p.id",
+            "SELECT p.id, p.inspection_attempt_id, p.statement, p.lifecycle_state, p.confidence, p.evidence_paths_json, i.bundle_json, i.repository_commit, c.serialized_json, v.provider_id, v.model_id FROM proposals p JOIN inspection_attempts i ON i.id = p.inspection_attempt_id LEFT JOIN code_map_snapshots c ON c.id = i.code_map_snapshot_id JOIN provider_invocations v ON v.id = p.provider_invocation_id AND v.inspection_attempt_id = p.inspection_attempt_id WHERE i.project_id = ?1 AND i.status = 'pending_review' AND p.status = 'pending_review' AND v.status = 'succeeded' ORDER BY p.id",
         )
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let rows = statement
@@ -605,8 +652,10 @@ pub fn pending_review_proposals(
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
             ))
         })
         .map_err(|source| StorageError::ProjectDatabase { source })?;
@@ -619,6 +668,8 @@ pub fn pending_review_proposals(
             confidence,
             evidence_paths_json,
             bundle_json,
+            repository_commit,
+            code_map_json,
             provider_id,
             model_id,
         ) = row.map_err(|source| StorageError::ProjectDatabase { source })?;
@@ -638,6 +689,16 @@ pub fn pending_review_proposals(
         if evidence.len() != unique_evidence_paths.len() {
             return Err(StorageError::InvalidStoredEvidence);
         }
+        let evidence_locators = code_map_json
+            .as_deref()
+            .map(|json| evidence_locators(json, &unique_evidence_paths))
+            .transpose()?;
+        if repository_commit
+            .as_deref()
+            .is_some_and(|commit| !valid_repository_commit(commit))
+        {
+            return Err(StorageError::InvalidStoredEvidence);
+        }
         Ok(PendingReviewProposal {
             id,
             inspection_attempt_id,
@@ -645,6 +706,8 @@ pub fn pending_review_proposals(
             lifecycle_state,
             confidence,
             evidence,
+            repository_commit,
+            evidence_locators: evidence_locators.unwrap_or_default(),
             provider_id,
             model_id,
         })
@@ -898,6 +961,60 @@ fn create_directory(path: &Path) -> Result<(), StorageError> {
     })
 }
 
+fn evidence_locators(
+    code_map_json: &str,
+    evidence_paths: &BTreeSet<&String>,
+) -> Result<Vec<EvidenceLocator>, StorageError> {
+    let code_map: Value =
+        serde_json::from_str(code_map_json).map_err(|_| StorageError::InvalidStoredEvidence)?;
+    let symbols = code_map
+        .get("symbols")
+        .and_then(Value::as_array)
+        .ok_or(StorageError::InvalidStoredEvidence)?;
+    let mut locators = symbols
+        .iter()
+        .map(|symbol| {
+            let path = symbol
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or(StorageError::InvalidStoredEvidence)?;
+            let selected = evidence_paths
+                .iter()
+                .any(|selected| selected.as_str() == path);
+            if !selected {
+                return Ok(None);
+            }
+            let line = symbol
+                .get("line")
+                .and_then(Value::as_u64)
+                .and_then(|line| usize::try_from(line).ok())
+                .filter(|line| *line > 0)
+                .ok_or(StorageError::InvalidStoredEvidence)?;
+            let name = symbol
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or(StorageError::InvalidStoredEvidence)?;
+            Ok(Some(EvidenceLocator {
+                path: path.into(),
+                line,
+                symbol_id: format!("{path}:{line}:{name}"),
+            }))
+        })
+        .collect::<Result<Vec<_>, StorageError>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    locators.sort_by(|left, right| {
+        (&left.path, left.line, &left.symbol_id).cmp(&(&right.path, right.line, &right.symbol_id))
+    });
+    Ok(locators)
+}
+
+fn valid_repository_commit(commit: &str) -> bool {
+    matches!(commit.len(), 40 | 64) && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn open_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
     let connection = Connection::open(path)?;
     enable_foreign_keys(&connection)?;
@@ -1040,8 +1157,8 @@ mod tests {
     #[test]
     fn code_map_snapshot_migration_preserves_existing_provider_records() {
         let mut connection = Connection::open_in_memory().expect("in-memory SQLite should open");
-        apply_migrations(&mut connection, &MIGRATIONS[..5])
-            .expect("version five database should initialize");
+        apply_migrations(&mut connection, &MIGRATIONS[..6])
+            .expect("version six database should initialize");
         connection
             .execute(
                 "INSERT INTO projects (id, display_name, canonical_path, lifecycle_state) VALUES (1, 'fixture', 'C:/fixture', 'registered_needs_inspection')",
@@ -1080,7 +1197,7 @@ mod tests {
             .expect("question fixture should insert");
 
         apply_migrations(&mut connection, MIGRATIONS)
-            .expect("review-record migration should upgrade version five data");
+            .expect("inspection-provenance migration should upgrade version six data");
 
         let preserved_rows: (i64, i64, i64, i64, i64) = connection
             .query_row(
@@ -1096,6 +1213,13 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("preexisting attempt should gain a nullable snapshot reference");
+        let repository_commit: Option<String> = connection
+            .query_row(
+                "SELECT repository_commit FROM inspection_attempts WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preexisting attempt should gain a nullable commit reference");
         let review_table_count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('verified_facts', 'fact_evidence', 'review_decisions', 'conflicts', 'inspection_baselines')",
@@ -1106,6 +1230,7 @@ mod tests {
 
         assert_eq!(preserved_rows, (1, 1, 1, 1, 1));
         assert_eq!(original_snapshot, Some(1));
+        assert_eq!(repository_commit, None);
         assert_eq!(review_table_count, 5);
     }
 

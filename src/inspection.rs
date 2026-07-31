@@ -19,7 +19,11 @@ const MAX_FILE_BYTES: usize = 8 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvidenceState {
     Committed,
-    InProgress,
+    Staged,
+    #[serde(alias = "InProgress")]
+    Unstaged,
+    StagedAndUnstaged,
+    Untracked,
 }
 
 /// One minimized source or text excerpt suitable for a future provider request.
@@ -157,7 +161,6 @@ fn build_bundle(
     code_map: CodeMap,
     selected_paths: &BTreeSet<String>,
 ) -> Result<EvidenceBundle, InspectionError> {
-    let changed_paths = changed_paths(status);
     let mut remaining_bytes = MAX_BUNDLE_BYTES;
     let mut files = Vec::new();
 
@@ -174,11 +177,7 @@ fn build_bundle(
         remaining_bytes = remaining_bytes.saturating_sub(content.len());
         files.push(EvidenceFile {
             path: file.path.clone(),
-            state: if changed_paths.contains(file.path.as_str()) {
-                EvidenceState::InProgress
-            } else {
-                EvidenceState::Committed
-            },
+            state: evidence_state(status, &file.path),
             content,
             redacted,
         });
@@ -257,6 +256,25 @@ fn changed_paths(status: &WorkingTreeStatus) -> BTreeSet<&str> {
         .chain(&status.deleted_paths)
         .map(String::as_str)
         .collect()
+}
+
+fn evidence_state(status: &WorkingTreeStatus, path: &str) -> EvidenceState {
+    let staged = status.staged_paths.iter().any(|changed| changed == path);
+    let unstaged = status.unstaged_paths.iter().any(|changed| changed == path);
+    if status.untracked_paths.iter().any(|changed| changed == path) {
+        EvidenceState::Untracked
+    } else if staged && unstaged {
+        EvidenceState::StagedAndUnstaged
+    } else if staged {
+        EvidenceState::Staged
+    } else if unstaged
+        || status.added_paths.iter().any(|changed| changed == path)
+        || status.modified_paths.iter().any(|changed| changed == path)
+    {
+        EvidenceState::Unstaged
+    } else {
+        EvidenceState::Committed
+    }
 }
 
 fn is_manifest(path: &str) -> bool {
