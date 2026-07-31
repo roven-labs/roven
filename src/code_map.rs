@@ -52,12 +52,31 @@ pub struct Import {
     pub confidence: Confidence,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum RelationKind {
+    Contains,
+    Defines,
+    Imports,
+    Calls,
+    DependsOn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Relationship {
+    pub kind: RelationKind,
+    pub source: String,
+    pub target: String,
+    pub evidence: Evidence,
+    pub confidence: Confidence,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct CodeMap {
     pub files: Vec<crate::inventory::InventoryFile>,
     pub symbols: Vec<Symbol>,
     pub calls: Vec<DirectCall>,
     pub imports: Vec<Import>,
+    pub relationships: Vec<Relationship>,
     pub unsupported_paths: Vec<String>,
 }
 
@@ -211,7 +230,56 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
             right.evidence.line,
         ))
     });
+    map.relationships = map
+        .files
+        .iter()
+        .map(|file| Relationship {
+            kind: RelationKind::Contains,
+            source: "repository".into(),
+            target: file.path.clone(),
+            evidence: Evidence {
+                path: file.path.clone(),
+                line: 1,
+            },
+            confidence: Confidence::Exact,
+        })
+        .chain(map.symbols.iter().map(|symbol| Relationship {
+            kind: RelationKind::Defines,
+            source: symbol.path.clone(),
+            target: symbol_id(symbol),
+            evidence: Evidence {
+                path: symbol.path.clone(),
+                line: symbol.line,
+            },
+            confidence: Confidence::Exact,
+        }))
+        .chain(map.imports.iter().map(|import| Relationship {
+            kind: RelationKind::Imports,
+            source: import.source_path.clone(),
+            target: import.target_path.clone(),
+            evidence: import.evidence.clone(),
+            confidence: import.confidence,
+        }))
+        .chain(map.calls.iter().map(|call| Relationship {
+            kind: RelationKind::Calls,
+            source: call.caller.clone(),
+            target: call.callee.clone(),
+            evidence: call.evidence.clone(),
+            confidence: call.confidence,
+        }))
+        .collect();
+    map.relationships.sort_by(|left, right| {
+        (&left.source, &left.target, left.kind as u8).cmp(&(
+            &right.source,
+            &right.target,
+            right.kind as u8,
+        ))
+    });
     Ok(map)
+}
+
+fn symbol_id(symbol: &Symbol) -> String {
+    format!("{}:{}:{}", symbol.path, symbol.line, symbol.name)
 }
 
 /// Serialize the already-sorted compact map deterministically as JSON.

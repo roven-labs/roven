@@ -2,7 +2,9 @@ mod support;
 
 use std::process::Command;
 
-use pmemc::code_map::{SymbolKind, build_code_map, serialize_code_map, structural_neighbors};
+use pmemc::code_map::{
+    RelationKind, SymbolKind, build_code_map, serialize_code_map, structural_neighbors,
+};
 use support::TemporaryDirectory;
 
 fn git(repository: &std::path::Path, arguments: &[&str]) {
@@ -145,4 +147,18 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         serialize_code_map(&repeat).expect("repeat map should serialize")
     );
     assert!(map.files.iter().any(|file| file.path == "src/lib.rs"));
+    assert!(
+        map.relationships
+            .iter()
+            .any(|relationship| relationship.kind == RelationKind::Contains
+                && relationship.source == "repository"
+                && relationship.target == "src/lib.rs")
+    );
+    assert!(
+        map.relationships
+            .iter()
+            .any(|relationship| relationship.kind == RelationKind::Defines
+                && relationship.source == "src/lib.rs"
+                && relationship.target.contains("run"))
+    );
 }
