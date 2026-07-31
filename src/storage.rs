@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 use crate::{
-    inspection::EvidenceBundle,
+    inspection::{EvidenceBundle, EvidenceFile},
     provider::{
         ProviderFailureCategory, ProviderInvocationMetadata, ProviderResponse, validate_response,
     },
@@ -238,6 +238,28 @@ pub struct FailedProviderAttempt {
     pub id: i64,
     /// The exact operator-approved bundle that failed to reach a provider.
     pub bundle: EvidenceBundle,
+}
+
+/// A provider proposal together with the immutable evidence and invocation that
+/// an operator must see before making a review decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingReviewProposal {
+    /// Persistent proposal identifier.
+    pub id: i64,
+    /// Persistent inspection attempt identifier.
+    pub inspection_attempt_id: i64,
+    /// Untrusted provider statement awaiting an operator decision.
+    pub statement: String,
+    /// Provider-suggested lifecycle state.
+    pub lifecycle_state: String,
+    /// Provider-suggested confidence.
+    pub confidence: String,
+    /// Evidence files selected by the provider from the approved bundle.
+    pub evidence: Vec<EvidenceFile>,
+    /// Non-secret provider adapter identifier.
+    pub provider_id: String,
+    /// Non-secret provider model identifier.
+    pub model_id: String,
 }
 
 impl Initialization {
@@ -539,6 +561,74 @@ pub fn failed_provider_attempt_for_project(
             .map_err(|_| StorageError::InvalidStoredEvidence)
     })
     .transpose()
+}
+
+/// Return pending proposals with exactly the provider-selected approved evidence.
+///
+/// # Errors
+///
+/// Returns an error when stored evidence JSON is invalid or the database cannot
+/// be read.
+pub fn pending_review_proposals(
+    data_paths: &DataPaths,
+    project_id: i64,
+) -> Result<Vec<PendingReviewProposal>, StorageError> {
+    initialize(data_paths)?;
+    let connection = open_connection(&data_paths.database_path())
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let mut statement = connection
+        .prepare(
+            "SELECT p.id, p.inspection_attempt_id, p.statement, p.lifecycle_state, p.confidence, p.evidence_paths_json, i.bundle_json, v.provider_id, v.model_id FROM proposals p JOIN inspection_attempts i ON i.id = p.inspection_attempt_id JOIN provider_invocations v ON v.id = p.provider_invocation_id WHERE i.project_id = ?1 AND p.status = 'pending_review' ORDER BY p.id",
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let rows = statement
+        .query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    rows.map(|row| {
+        let (
+            id,
+            inspection_attempt_id,
+            statement,
+            lifecycle_state,
+            confidence,
+            evidence_paths_json,
+            bundle_json,
+            provider_id,
+            model_id,
+        ) = row.map_err(|source| StorageError::ProjectDatabase { source })?;
+        let evidence_paths: Vec<String> = serde_json::from_str(&evidence_paths_json)
+            .map_err(|_| StorageError::InvalidStoredEvidence)?;
+        let bundle: EvidenceBundle =
+            serde_json::from_str(&bundle_json).map_err(|_| StorageError::InvalidStoredEvidence)?;
+        let evidence = bundle
+            .files
+            .into_iter()
+            .filter(|file| evidence_paths.contains(&file.path))
+            .collect();
+        Ok(PendingReviewProposal {
+            id,
+            inspection_attempt_id,
+            statement,
+            lifecycle_state,
+            confidence,
+            evidence,
+            provider_id,
+            model_id,
+        })
+    })
+    .collect()
 }
 
 /// Persist a schema-validated provider response as pending review records.

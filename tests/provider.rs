@@ -200,6 +200,23 @@ fn provider_results_are_pending_review_with_invocation_metadata() {
         )
         .expect("question should be pending review");
     assert_eq!((proposal_count, question_count), (1, 1));
+
+    let pending = storage::pending_review_proposals(&data_paths, project.id)
+        .expect("pending review proposals should include immutable evidence and metadata");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, 1);
+    assert_eq!(pending[0].inspection_attempt_id, attempt_id);
+    assert_eq!(pending[0].statement, "The project exposes a run function.");
+    assert_eq!(pending[0].provider_id, "fake");
+    assert_eq!(pending[0].model_id, "offline-test-model");
+    assert_eq!(
+        pending[0]
+            .evidence
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        ["src/lib.rs"]
+    );
 }
 
 #[test]
