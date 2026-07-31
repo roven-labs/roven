@@ -2,6 +2,7 @@
 
 pub mod domain;
 pub mod git;
+pub mod inventory;
 pub mod storage;
 
 mod cli;
