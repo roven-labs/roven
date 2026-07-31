@@ -176,6 +176,17 @@ const MIGRATIONS: &[Migration] = &[
         ALTER TABLE proposals ADD COLUMN fact_kind TEXT NOT NULL DEFAULT 'repository_observation';
     ",
     },
+    Migration {
+        version: 9,
+        sql: "
+        ALTER TABLE inspection_attempts ADD COLUMN repository_branch TEXT;
+        ALTER TABLE inspection_attempts ADD COLUMN working_tree_status_json TEXT NOT NULL DEFAULT '{}';
+        ALTER TABLE inspection_attempts ADD COLUMN uncommitted_fingerprints_json TEXT NOT NULL DEFAULT '{}';
+        ALTER TABLE inspection_baselines ADD COLUMN repository_branch TEXT;
+        ALTER TABLE inspection_baselines ADD COLUMN working_tree_status_json TEXT NOT NULL DEFAULT '{}';
+        ALTER TABLE inspection_baselines ADD COLUMN uncommitted_fingerprints_json TEXT NOT NULL DEFAULT '{}';
+    ",
+    },
 ];
 
 struct Migration {
@@ -374,8 +385,23 @@ pub struct InspectionBaseline {
     pub inspection_attempt_id: i64,
     /// Git commit recorded when the inspection was staged, if any.
     pub repository_commit: Option<String>,
+    /// Branch recorded when the inspection was staged, if attached.
+    pub repository_branch: Option<String>,
+    /// Relevant staged, unstaged, and untracked state captured at inspection time.
+    pub working_tree_status_json: String,
+    /// Content fingerprints for inspected in-progress evidence.
+    pub uncommitted_fingerprints_json: String,
     /// SQLite timestamp when the baseline was recorded.
     pub created_at: String,
+}
+
+/// Git state captured at approval time for a future inspection baseline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineProvenance {
+    pub repository_commit: Option<String>,
+    pub repository_branch: Option<String>,
+    pub working_tree_status_json: String,
+    pub uncommitted_fingerprints_json: String,
 }
 
 /// A retained verified fact suitable for project retrieval.
@@ -613,13 +639,16 @@ pub fn latest_baseline(
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     connection
         .query_row(
-            "SELECT inspection_attempt_id, repository_commit, created_at FROM inspection_baselines WHERE project_id = ?1 ORDER BY id DESC LIMIT 1",
+            "SELECT inspection_attempt_id, repository_commit, repository_branch, working_tree_status_json, uncommitted_fingerprints_json, created_at FROM inspection_baselines WHERE project_id = ?1 ORDER BY id DESC LIMIT 1",
             params![project_id],
             |row| {
                 Ok(InspectionBaseline {
                     inspection_attempt_id: row.get(0)?,
                     repository_commit: row.get(1)?,
-                    created_at: row.get(2)?,
+                    repository_branch: row.get(2)?,
+                    working_tree_status_json: row.get(3)?,
+                    uncommitted_fingerprints_json: row.get(4)?,
+                    created_at: row.get(5)?,
                 })
             },
         )
@@ -761,8 +790,44 @@ pub fn stage_inspection_attempt_with_provenance(
     code_map_json: Option<&str>,
     repository_commit: Option<&str>,
 ) -> Result<i64, StorageError> {
-    if repository_commit.is_some_and(|commit| !valid_repository_commit(commit)) {
+    stage_inspection_attempt_with_baseline_provenance(
+        data_paths,
+        project_id,
+        bundle_schema_version,
+        bundle_json,
+        code_map_json,
+        &BaselineProvenance {
+            repository_commit: repository_commit.map(str::to_owned),
+            repository_branch: None,
+            working_tree_status_json: "{}".into(),
+            uncommitted_fingerprints_json: "{}".into(),
+        },
+    )
+}
+
+/// Persist approved evidence with the Git state required to establish a baseline.
+pub fn stage_inspection_attempt_with_baseline_provenance(
+    data_paths: &DataPaths,
+    project_id: i64,
+    bundle_schema_version: u8,
+    bundle_json: &str,
+    code_map_json: Option<&str>,
+    provenance: &BaselineProvenance,
+) -> Result<i64, StorageError> {
+    if provenance
+        .repository_commit
+        .as_deref()
+        .is_some_and(|commit| !valid_repository_commit(commit))
+    {
         return Err(StorageError::InvalidCommitProvenance);
+    }
+    for json in [
+        &provenance.working_tree_status_json,
+        &provenance.uncommitted_fingerprints_json,
+    ] {
+        if serde_json::from_str::<Value>(json).is_err() {
+            return Err(StorageError::InvalidStoredEvidence);
+        }
     }
     let code_map_json = code_map_json.ok_or(StorageError::InvalidStoredEvidence)?;
     initialize(data_paths)?;
@@ -801,8 +866,8 @@ pub fn stage_inspection_attempt_with_provenance(
     let code_map_snapshot_id = transaction.last_insert_rowid();
     transaction
         .execute(
-            "INSERT INTO inspection_attempts (project_id, status, previous_lifecycle_state, bundle_schema_version, bundle_json, code_map_snapshot_id, repository_commit) VALUES (?1, 'staged_pending_provider', ?2, ?3, ?4, ?5, ?6)",
-            params![project_id, previous_lifecycle_state, bundle_schema_version, bundle_json, code_map_snapshot_id, repository_commit],
+            "INSERT INTO inspection_attempts (project_id, status, previous_lifecycle_state, bundle_schema_version, bundle_json, code_map_snapshot_id, repository_commit, repository_branch, working_tree_status_json, uncommitted_fingerprints_json) VALUES (?1, 'staged_pending_provider', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![project_id, previous_lifecycle_state, bundle_schema_version, bundle_json, code_map_snapshot_id, provenance.repository_commit, provenance.repository_branch, provenance.working_tree_status_json, provenance.uncommitted_fingerprints_json],
         )
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let attempt_id = transaction.last_insert_rowid();
@@ -1149,11 +1214,11 @@ pub fn finalize_review(
     let transaction = connection
         .transaction()
         .map_err(|source| StorageError::ProjectDatabase { source })?;
-    let (attempt_id, bundle_json, code_map_json, code_map_snapshot_id, repository_commit) = transaction
+    let (attempt_id, bundle_json, code_map_json, code_map_snapshot_id, repository_commit, repository_branch, working_tree_status_json, uncommitted_fingerprints_json) = transaction
         .query_row(
-            "SELECT attempts.id, attempts.bundle_json, snapshots.serialized_json, snapshots.id, attempts.repository_commit FROM inspection_attempts attempts JOIN code_map_snapshots snapshots ON snapshots.id = attempts.code_map_snapshot_id WHERE attempts.project_id = ?1 AND attempts.status = 'pending_review' ORDER BY attempts.id DESC LIMIT 1",
+            "SELECT attempts.id, attempts.bundle_json, snapshots.serialized_json, snapshots.id, attempts.repository_commit, attempts.repository_branch, attempts.working_tree_status_json, attempts.uncommitted_fingerprints_json FROM inspection_attempts attempts JOIN code_map_snapshots snapshots ON snapshots.id = attempts.code_map_snapshot_id WHERE attempts.project_id = ?1 AND attempts.status = 'pending_review' ORDER BY attempts.id DESC LIMIT 1",
             params![project_id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, Option<String>>(4)?)),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?)),
         )
         .optional()
         .map_err(|source| StorageError::ProjectDatabase { source })?
@@ -1163,6 +1228,11 @@ pub fn finalize_review(
         .is_some_and(|commit| !valid_repository_commit(commit))
     {
         return Err(StorageError::InvalidStoredEvidence);
+    }
+    for json in [&working_tree_status_json, &uncommitted_fingerprints_json] {
+        if serde_json::from_str::<Value>(json).is_err() {
+            return Err(StorageError::InvalidStoredEvidence);
+        }
     }
     let bundle: EvidenceBundle =
         serde_json::from_str(&bundle_json).map_err(|_| StorageError::InvalidStoredEvidence)?;
@@ -1290,8 +1360,8 @@ pub fn finalize_review(
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     transaction
         .execute(
-            "INSERT INTO inspection_baselines (project_id, inspection_attempt_id, code_map_snapshot_id, repository_commit) VALUES (?1, ?2, ?3, ?4)",
-            params![project_id, attempt_id, code_map_snapshot_id, repository_commit],
+            "INSERT INTO inspection_baselines (project_id, inspection_attempt_id, code_map_snapshot_id, repository_commit, repository_branch, working_tree_status_json, uncommitted_fingerprints_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![project_id, attempt_id, code_map_snapshot_id, repository_commit, repository_branch, working_tree_status_json, uncommitted_fingerprints_json],
         )
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     transaction

@@ -522,13 +522,18 @@ fn finalization_is_atomic_and_defers_conflict_supersession_until_commit() {
         .expect("repository metadata should be available")
         .head_commit
         .expect("fixture repository should have a commit");
-    let attempt_id = storage::stage_inspection_attempt_with_provenance(
+    let attempt_id = storage::stage_inspection_attempt_with_baseline_provenance(
         &data_paths,
         project.id,
         1,
         &bundle_json,
         Some(r#"{"symbols":[{"path":"src/lib.rs","line":1,"name":"run"}]}"#),
-        Some(&commit),
+        &storage::BaselineProvenance {
+            repository_commit: Some(commit),
+            repository_branch: Some("main".into()),
+            working_tree_status_json: r#"{"staged_paths":["src/lib.rs"]}"#.into(),
+            uncommitted_fingerprints_json: r#"{"src/lib.rs":"cbf29ce484222325"}"#.into(),
+        },
     )
     .expect("attempt should stage");
     let connection = rusqlite::Connection::open(data_paths.database_path())
@@ -643,11 +648,11 @@ fn finalization_is_atomic_and_defers_conflict_supersession_until_commit() {
     );
     assert!(changed_status.status.success());
     assert!(String::from_utf8_lossy(&changed_status.stdout).contains("commits-since-baseline\t1"));
-    let finalized_state: (String, String, i64, i64, i64, String) = connection
+    let finalized_state: (String, String, i64, i64, i64, String, String, String) = connection
         .query_row(
-            "SELECT (SELECT lifecycle_state FROM projects WHERE id = 1), (SELECT status FROM inspection_attempts WHERE id = 1), (SELECT COUNT(*) FROM inspection_baselines), (SELECT COUNT(*) FROM verified_facts), (SELECT COUNT(*) FROM review_decisions WHERE finalized_at IS NOT NULL), (SELECT verification_status FROM verified_facts WHERE id = 1)",
+            "SELECT (SELECT lifecycle_state FROM projects WHERE id = 1), (SELECT status FROM inspection_attempts WHERE id = 1), (SELECT COUNT(*) FROM inspection_baselines), (SELECT COUNT(*) FROM verified_facts), (SELECT COUNT(*) FROM review_decisions WHERE finalized_at IS NOT NULL), (SELECT verification_status FROM verified_facts WHERE id = 1), (SELECT repository_branch FROM inspection_baselines WHERE project_id = 1), (SELECT uncommitted_fingerprints_json FROM inspection_baselines WHERE project_id = 1)",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
         )
         .expect("finalized state should be readable");
     assert_eq!(
@@ -659,6 +664,8 @@ fn finalization_is_atomic_and_defers_conflict_supersession_until_commit() {
             4,
             3,
             "superseded".into(),
+            "main".into(),
+            r#"{"src/lib.rs":"cbf29ce484222325"}"#.into(),
         )
     );
     let corrected_fact: String = connection

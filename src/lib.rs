@@ -1,7 +1,7 @@
 //! Testable application entry points for PMEMC.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::{self, Write},
 };
 
@@ -293,13 +293,20 @@ fn inspect_command(project_id: &str) -> anyhow::Result<()> {
             );
         }
         let bundle_json = serde_json::to_string(&package.bundle)?;
-        let attempt_id = storage::stage_inspection_attempt_with_provenance(
+        let working_tree_status_json = baseline_working_tree_status(&status)?;
+        let uncommitted_fingerprints_json = uncommitted_evidence_fingerprints(&package.bundle)?;
+        let attempt_id = storage::stage_inspection_attempt_with_baseline_provenance(
             &data_paths,
             id,
             package.bundle.schema_version,
             &bundle_json,
             Some(&package.code_map_json),
-            inspected_metadata.head_commit.as_deref(),
+            &storage::BaselineProvenance {
+                repository_commit: inspected_metadata.head_commit.clone(),
+                repository_branch: inspected_metadata.branch.clone(),
+                working_tree_status_json,
+                uncommitted_fingerprints_json,
+            },
         )?;
         (package.bundle, attempt_id)
     };
@@ -374,6 +381,46 @@ fn inspection_scope_paths(status: &git::WorkingTreeStatus) -> BTreeSet<&str> {
             }),
         )
         .collect()
+}
+
+fn baseline_working_tree_status(status: &git::WorkingTreeStatus) -> anyhow::Result<String> {
+    Ok(serde_json::json!({
+        "added_paths": status.added_paths,
+        "modified_paths": status.modified_paths,
+        "untracked_paths": status.untracked_paths,
+        "staged_paths": status.staged_paths,
+        "unstaged_paths": status.unstaged_paths,
+        "deleted_paths": status.deleted_paths,
+        "relationships": status.relationships.iter().map(|relationship| serde_json::json!({
+            "kind": match relationship.kind { git::PathRelationshipKind::Renamed => "renamed", git::PathRelationshipKind::Copied => "copied" },
+            "source": relationship.source,
+            "target": relationship.target,
+        })).collect::<Vec<_>>(),
+    })
+    .to_string())
+}
+
+fn uncommitted_evidence_fingerprints(
+    bundle: &inspection::EvidenceBundle,
+) -> anyhow::Result<String> {
+    let fingerprints = bundle
+        .files
+        .iter()
+        .filter(|file| !matches!(file.state, inspection::EvidenceState::Committed))
+        .map(|file| {
+            (
+                file.path.clone(),
+                format!("{:016x}", fnv1a64(file.content.as_bytes())),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    Ok(serde_json::to_string(&fingerprints)?)
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 fn status_command(project_id: Option<String>) -> anyhow::Result<()> {
@@ -554,9 +601,12 @@ fn project_command(command: cli::ProjectCommand) -> anyhow::Result<()> {
             let memory = storage::project_memory(&data_paths, id)?;
             match memory.baseline {
                 Some(baseline) => println!(
-                    "baseline\tattempt={}\tcommit={}\tat={}",
+                    "baseline\tattempt={}\tcommit={}\tbranch={}\tworking-tree={}\tfingerprints={}\tat={}",
                     baseline.inspection_attempt_id,
                     baseline.repository_commit.as_deref().unwrap_or("unborn"),
+                    baseline.repository_branch.as_deref().unwrap_or("detached"),
+                    baseline.working_tree_status_json,
+                    baseline.uncommitted_fingerprints_json,
                     baseline.created_at
                 ),
                 None => println!("baseline\tnone"),
