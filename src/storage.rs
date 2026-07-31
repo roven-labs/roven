@@ -107,6 +107,62 @@ const MIGRATIONS: &[Migration] = &[
         ALTER TABLE inspection_attempts ADD COLUMN code_map_snapshot_id INTEGER REFERENCES code_map_snapshots(id);
     ",
     },
+    Migration {
+        version: 6,
+        sql: "
+        CREATE TABLE verified_facts (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES projects(id),
+            fact_kind TEXT NOT NULL,
+            statement TEXT NOT NULL,
+            lifecycle_state TEXT NOT NULL,
+            verification_status TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE fact_evidence (
+            id INTEGER PRIMARY KEY,
+            fact_id INTEGER NOT NULL REFERENCES verified_facts(id),
+            project_id INTEGER NOT NULL REFERENCES projects(id),
+            relative_path TEXT NOT NULL,
+            repository_commit TEXT,
+            working_tree_state TEXT NOT NULL,
+            line_start INTEGER,
+            line_end INTEGER,
+            symbol_id TEXT,
+            excerpt TEXT NOT NULL,
+            evidence_type TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE review_decisions (
+            id INTEGER PRIMARY KEY,
+            proposal_id INTEGER NOT NULL UNIQUE REFERENCES proposals(id),
+            action TEXT NOT NULL,
+            corrected_statement TEXT,
+            reason TEXT,
+            finalized_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE conflicts (
+            id INTEGER PRIMARY KEY,
+            proposal_id INTEGER NOT NULL REFERENCES proposals(id),
+            existing_fact_id INTEGER NOT NULL REFERENCES verified_facts(id),
+            rationale TEXT NOT NULL,
+            status TEXT NOT NULL,
+            resolution_decision_id INTEGER REFERENCES review_decisions(id),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE inspection_baselines (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES projects(id),
+            inspection_attempt_id INTEGER NOT NULL UNIQUE REFERENCES inspection_attempts(id),
+            code_map_snapshot_id INTEGER NOT NULL REFERENCES code_map_snapshots(id),
+            repository_commit TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+    ",
+    },
 ];
 
 struct Migration {
@@ -291,7 +347,7 @@ pub fn initialize(data_paths: &DataPaths) -> Result<Initialization, StorageError
 
     let database_path = data_paths.database_path();
     let mut connection =
-        Connection::open(&database_path).map_err(|source| StorageError::OpenDatabase {
+        open_connection(&database_path).map_err(|source| StorageError::OpenDatabase {
             path: database_path.clone(),
             source,
         })?;
@@ -314,7 +370,7 @@ pub fn add_project(
 ) -> Result<Project, StorageError> {
     initialize(data_paths)?;
     let database_path = data_paths.database_path();
-    let connection = Connection::open(database_path)
+    let connection = open_connection(&database_path)
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let result = connection.execute(
         "INSERT INTO projects (display_name, canonical_path, lifecycle_state, current_branch, head_commit) VALUES (?1, ?2, 'registered_needs_inspection', ?3, ?4)",
@@ -347,7 +403,7 @@ pub fn add_project(
 /// Returns an error if SQLite cannot read the project records.
 pub fn list_projects(data_paths: &DataPaths) -> Result<Vec<Project>, StorageError> {
     initialize(data_paths)?;
-    let connection = Connection::open(data_paths.database_path())
+    let connection = open_connection(&data_paths.database_path())
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let mut statement = connection.prepare("SELECT id, display_name, canonical_path, lifecycle_state, current_branch, head_commit FROM projects ORDER BY id").map_err(|source| StorageError::ProjectDatabase { source })?;
     statement
@@ -369,7 +425,7 @@ pub fn list_projects(data_paths: &DataPaths) -> Result<Vec<Project>, StorageErro
 /// Look up a project by its numeric ID.
 pub fn project_by_id(data_paths: &DataPaths, id: i64) -> Result<Option<Project>, StorageError> {
     initialize(data_paths)?;
-    let connection = Connection::open(data_paths.database_path())
+    let connection = open_connection(&data_paths.database_path())
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     connection.query_row("SELECT id, display_name, canonical_path, lifecycle_state, current_branch, head_commit FROM projects WHERE id = ?1", params![id], |row| Ok(Project { id: row.get(0)?, display_name: row.get(1)?, canonical_path: PathBuf::from(row.get::<_, String>(2)?), lifecycle_state: row.get(3)?, current_branch: row.get(4)?, head_commit: row.get(5)? })).optional().map_err(|source| StorageError::ProjectDatabase { source })
 }
@@ -412,7 +468,7 @@ pub fn stage_inspection_attempt_with_code_map(
     code_map_json: Option<&str>,
 ) -> Result<i64, StorageError> {
     initialize(data_paths)?;
-    let mut connection = Connection::open(data_paths.database_path())
+    let mut connection = open_connection(&data_paths.database_path())
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let transaction = connection
         .transaction()
@@ -467,7 +523,7 @@ pub fn failed_provider_attempt_for_project(
     project_id: i64,
 ) -> Result<Option<FailedProviderAttempt>, StorageError> {
     initialize(data_paths)?;
-    let connection = Connection::open(data_paths.database_path())
+    let connection = open_connection(&data_paths.database_path())
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let row = connection
         .query_row(
@@ -501,7 +557,7 @@ pub fn store_provider_response(
     response: &ProviderResponse,
 ) -> Result<(), StorageError> {
     initialize(data_paths)?;
-    let mut connection = Connection::open(data_paths.database_path())
+    let mut connection = open_connection(&data_paths.database_path())
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let transaction = connection
         .transaction()
@@ -581,7 +637,7 @@ pub fn record_provider_failure(
     failure_category: ProviderFailureCategory,
 ) -> Result<(), StorageError> {
     initialize(data_paths)?;
-    let mut connection = Connection::open(data_paths.database_path())
+    let mut connection = open_connection(&data_paths.database_path())
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let transaction = connection
         .transaction()
@@ -636,7 +692,7 @@ pub fn record_provider_failure(
 /// Returns an error when the failed attempt cannot be restored transactionally.
 pub fn retry_provider_attempt(data_paths: &DataPaths, attempt_id: i64) -> Result<(), StorageError> {
     initialize(data_paths)?;
-    let mut connection = Connection::open(data_paths.database_path())
+    let mut connection = open_connection(&data_paths.database_path())
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let transaction = connection
         .transaction()
@@ -671,6 +727,16 @@ fn create_directory(path: &Path) -> Result<(), StorageError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+fn open_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let connection = Connection::open(path)?;
+    enable_foreign_keys(&connection)?;
+    Ok(connection)
+}
+
+fn enable_foreign_keys(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch("PRAGMA foreign_keys = ON;")
 }
 
 fn apply_migrations(
@@ -805,8 +871,8 @@ mod tests {
     #[test]
     fn code_map_snapshot_migration_preserves_existing_provider_records() {
         let mut connection = Connection::open_in_memory().expect("in-memory SQLite should open");
-        apply_migrations(&mut connection, &MIGRATIONS[..4])
-            .expect("version four database should initialize");
+        apply_migrations(&mut connection, &MIGRATIONS[..5])
+            .expect("version five database should initialize");
         connection
             .execute(
                 "INSERT INTO projects (id, display_name, canonical_path, lifecycle_state) VALUES (1, 'fixture', 'C:/fixture', 'registered_needs_inspection')",
@@ -815,7 +881,13 @@ mod tests {
             .expect("project fixture should insert");
         connection
             .execute(
-                "INSERT INTO inspection_attempts (id, project_id, status, previous_lifecycle_state, bundle_schema_version, bundle_json) VALUES (1, 1, 'provider_failed', 'registered_needs_inspection', 1, '{}')",
+                "INSERT INTO code_map_snapshots (id, project_id, schema_version, serialized_json) VALUES (1, 1, 1, '{}')",
+                [],
+            )
+            .expect("snapshot fixture should insert");
+        connection
+            .execute(
+                "INSERT INTO inspection_attempts (id, project_id, status, previous_lifecycle_state, bundle_schema_version, bundle_json, code_map_snapshot_id) VALUES (1, 1, 'provider_failed', 'registered_needs_inspection', 1, '{}', 1)",
                 [],
             )
             .expect("attempt fixture should insert");
@@ -825,15 +897,27 @@ mod tests {
                 [],
             )
             .expect("provider fixture should insert");
+        connection
+            .execute(
+                "INSERT INTO proposals (inspection_attempt_id, provider_invocation_id, statement, lifecycle_state, confidence, evidence_paths_json, status) VALUES (1, 1, 'fixture statement', 'committed', 'exact', '[\"src/lib.rs\"]', 'pending_review')",
+                [],
+            )
+            .expect("proposal fixture should insert");
+        connection
+            .execute(
+                "INSERT INTO questions (inspection_attempt_id, provider_invocation_id, question, status) VALUES (1, 1, 'fixture question', 'pending_review')",
+                [],
+            )
+            .expect("question fixture should insert");
 
         apply_migrations(&mut connection, MIGRATIONS)
-            .expect("code-map snapshot migration should upgrade version four data");
+            .expect("review-record migration should upgrade version five data");
 
-        let preserved_rows: (i64, i64) = connection
+        let preserved_rows: (i64, i64, i64, i64, i64) = connection
             .query_row(
-                "SELECT (SELECT COUNT(*) FROM inspection_attempts), (SELECT COUNT(*) FROM provider_invocations)",
+                "SELECT (SELECT COUNT(*) FROM inspection_attempts), (SELECT COUNT(*) FROM provider_invocations), (SELECT COUNT(*) FROM proposals), (SELECT COUNT(*) FROM questions), (SELECT COUNT(*) FROM code_map_snapshots)",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .expect("existing records should remain readable");
         let original_snapshot: Option<i64> = connection
@@ -843,16 +927,38 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("preexisting attempt should gain a nullable snapshot reference");
-        let snapshot_table_count: i64 = connection
+        let review_table_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'code_map_snapshots'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('verified_facts', 'fact_evidence', 'review_decisions', 'conflicts', 'inspection_baselines')",
                 [],
                 |row| row.get(0),
             )
-            .expect("snapshot table should exist after migration");
+            .expect("review tables should exist after migration");
 
-        assert_eq!(preserved_rows, (1, 1));
-        assert_eq!(original_snapshot, None);
-        assert_eq!(snapshot_table_count, 1);
+        assert_eq!(preserved_rows, (1, 1, 1, 1, 1));
+        assert_eq!(original_snapshot, Some(1));
+        assert_eq!(review_table_count, 5);
+    }
+
+    #[test]
+    fn storage_connections_enforce_declared_foreign_keys() {
+        let connection = Connection::open_in_memory().expect("in-memory SQLite should open");
+        enable_foreign_keys(&connection).expect("foreign keys should be enabled");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE parents (id INTEGER PRIMARY KEY);
+                CREATE TABLE children (parent_id INTEGER NOT NULL REFERENCES parents(id));
+                ",
+            )
+            .expect("fixture tables should be created");
+
+        let result = connection.execute("INSERT INTO children (parent_id) VALUES (99)", []);
+
+        assert!(matches!(
+            result,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
+        ));
     }
 }
