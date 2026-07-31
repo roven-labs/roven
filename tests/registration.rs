@@ -159,3 +159,79 @@ fn project_add_registers_a_git_working_tree_without_reading_source_content() {
     assert!(all_status_output.contains("project-1\tinitial inspection required"));
     assert!(all_status_output.contains("project-2\tinitial inspection required"));
 }
+
+#[test]
+fn status_reports_commits_made_after_registration_without_creating_a_baseline() {
+    let data_directory = TemporaryDirectory::new();
+    let repository = TemporaryDirectory::new();
+    git(repository.path(), &["init"]);
+    git(
+        repository.path(),
+        &["config", "user.email", "pmemc-test@example.invalid"],
+    );
+    git(repository.path(), &["config", "user.name", "PMEMC Test"]);
+    std::fs::write(repository.path().join("initial.txt"), "initial")
+        .expect("fixture file should be written");
+    git(repository.path(), &["add", "initial.txt"]);
+    git(repository.path(), &["commit", "-m", "initial commit"]);
+
+    let add = pmemc(
+        &data_directory,
+        &[
+            "project",
+            "add",
+            repository.path().to_str().expect("UTF-8 test path"),
+        ],
+    );
+    assert!(add.status.success());
+    git(
+        repository.path(),
+        &["commit", "--allow-empty", "-m", "later commit"],
+    );
+
+    let status = pmemc(&data_directory, &["status", "project-1"]);
+    assert!(status.status.success());
+    let status_output = String::from_utf8_lossy(&status.stdout);
+    assert!(status_output.contains("committed-since-registration\t1"));
+    assert!(status_output.contains("commits-since-baseline\tnot-applicable"));
+}
+
+#[test]
+fn status_detects_a_staged_copy_without_relying_on_git_configuration() {
+    let data_directory = TemporaryDirectory::new();
+    let repository = TemporaryDirectory::new();
+    git(repository.path(), &["init"]);
+    git(
+        repository.path(),
+        &["config", "user.email", "pmemc-test@example.invalid"],
+    );
+    git(repository.path(), &["config", "user.name", "PMEMC Test"]);
+    std::fs::write(repository.path().join("source.txt"), "copy fixture content")
+        .expect("fixture file should be written");
+    git(repository.path(), &["add", "source.txt"]);
+    git(repository.path(), &["commit", "-m", "add copy source"]);
+
+    let add = pmemc(
+        &data_directory,
+        &[
+            "project",
+            "add",
+            repository.path().to_str().expect("UTF-8 test path"),
+        ],
+    );
+    assert!(add.status.success());
+    std::fs::copy(
+        repository.path().join("source.txt"),
+        repository.path().join("copy.txt"),
+    )
+    .expect("fixture file should be copied");
+    git(repository.path(), &["add", "copy.txt"]);
+
+    let status = pmemc(&data_directory, &["status", "project-1"]);
+    assert!(status.status.success());
+    let status_output = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status_output.contains("copied\tsource.txt\tcopy.txt"),
+        "expected copy relationship, got:\n{status_output}"
+    );
+}

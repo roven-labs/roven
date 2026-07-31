@@ -66,6 +66,15 @@ fn print_project_status(project: &storage::Project) -> anyhow::Result<()> {
         "head\t{}",
         metadata.head_commit.as_deref().unwrap_or("unborn")
     );
+    match project.head_commit.as_deref() {
+        Some(head_commit) => println!(
+            "committed-since-registration\t{}",
+            git::commit_count_since(&project.canonical_path, head_commit)?
+        ),
+        None => println!(
+            "committed-since-registration\tnot-applicable (repository was unborn at registration)"
+        ),
+    }
     println!("commits-since-baseline\tnot-applicable (initial inspection required)");
     let status = git::working_tree_status(&project.canonical_path)?;
     for path in status.added_paths {

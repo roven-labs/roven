@@ -1,6 +1,7 @@
 //! Read-only Git metadata adapter.
 
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -54,6 +55,8 @@ pub enum GitError {
         #[source]
         source: std::io::Error,
     },
+    #[error("Git returned an invalid commit count for {path}: {value}")]
+    InvalidCommitCount { path: PathBuf, value: String },
 }
 
 /// Read Git repository metadata without reading source files.
@@ -77,9 +80,90 @@ pub fn metadata(path: &Path) -> Result<RepositoryMetadata, GitError> {
 pub fn working_tree_status(path: &Path) -> Result<WorkingTreeStatus, GitError> {
     let output = run_bytes(
         path,
-        &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+        &[
+            "-c",
+            "status.renames=true",
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+        ],
     )?;
-    Ok(parse_working_tree_status(&output))
+    let mut status = parse_working_tree_status(&output);
+    status
+        .relationships
+        .extend(staged_exact_copy_relationships(path, &status.added_paths)?);
+    Ok(status)
+}
+
+fn staged_exact_copy_relationships(
+    path: &Path,
+    added_paths: &[String],
+) -> Result<Vec<PathRelationship>, GitError> {
+    if added_paths.is_empty() || optional(path, &["rev-parse", "--verify", "HEAD"])?.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let head_paths_by_blob =
+        paths_by_blob(&run_bytes(path, &["ls-tree", "-r", "-z", "HEAD"])?, true);
+    let index_paths_by_blob =
+        paths_by_blob(&run_bytes(path, &["ls-files", "--stage", "-z"])?, false);
+
+    Ok(added_paths
+        .iter()
+        .filter_map(|target| {
+            let blob = index_paths_by_blob
+                .iter()
+                .find_map(|(blob, paths)| paths.contains(target).then_some(blob))?;
+            let source = head_paths_by_blob
+                .get(blob)?
+                .iter()
+                .find(|path| *path != target)?;
+            Some(PathRelationship {
+                kind: PathRelationshipKind::Copied,
+                source: source.clone(),
+                target: target.clone(),
+            })
+        })
+        .collect())
+}
+
+fn paths_by_blob(output: &[u8], from_head: bool) -> BTreeMap<String, Vec<String>> {
+    output
+        .split(|byte| *byte == 0)
+        .filter_map(|record| {
+            let separator = record.iter().position(|byte| *byte == b'\t')?;
+            let metadata = &record[..separator];
+            let path = &record[separator + 1..];
+            let mut fields = metadata.split(|byte| *byte == b' ');
+            let _mode = fields.next()?;
+            let blob = if from_head {
+                (fields.next()? == b"blob").then_some(fields.next()?)?
+            } else {
+                fields.next()?
+            };
+            Some((
+                String::from_utf8_lossy(blob).into_owned(),
+                String::from_utf8_lossy(path).into_owned(),
+            ))
+        })
+        .fold(BTreeMap::new(), |mut paths_by_blob, (blob, path)| {
+            paths_by_blob.entry(blob).or_default().push(path);
+            paths_by_blob
+        })
+}
+
+/// Count commits made since a previously observed commit without changing Git state.
+pub fn commit_count_since(path: &Path, observed_commit: &str) -> Result<u64, GitError> {
+    let revision_range = format!("{observed_commit}..HEAD");
+    let count = run(path, &["rev-list", "--count", &revision_range])?;
+    count
+        .trim()
+        .parse()
+        .map_err(|_| GitError::InvalidCommitCount {
+            path: path.into(),
+            value: count,
+        })
 }
 
 fn parse_working_tree_status(output: &[u8]) -> WorkingTreeStatus {
