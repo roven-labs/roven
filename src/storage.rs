@@ -367,6 +367,38 @@ pub struct HistoryEntry {
     pub detail: String,
 }
 
+/// One approved inspection baseline for a project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectionBaseline {
+    /// Finalized inspection attempt that established the baseline.
+    pub inspection_attempt_id: i64,
+    /// Git commit recorded when the inspection was staged, if any.
+    pub repository_commit: Option<String>,
+    /// SQLite timestamp when the baseline was recorded.
+    pub created_at: String,
+}
+
+/// A retained verified fact suitable for project retrieval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedFact {
+    pub id: i64,
+    pub fact_kind: String,
+    pub statement: String,
+    pub lifecycle_state: String,
+    pub verification_status: String,
+}
+
+/// Read-only project-memory details used by `project show`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectMemory {
+    pub baseline: Option<InspectionBaseline>,
+    pub verified_facts: Vec<VerifiedFact>,
+    pub unresolved_questions: Vec<String>,
+    pub evidence_count: i64,
+    pub proposal_count: i64,
+    pub decision_count: i64,
+}
+
 impl Initialization {
     /// Return the initialized SQLite database file path.
     #[must_use]
@@ -569,6 +601,108 @@ pub fn project_by_id(data_paths: &DataPaths, id: i64) -> Result<Option<Project>,
     let connection = open_connection(&data_paths.database_path())
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     connection.query_row("SELECT id, display_name, canonical_path, lifecycle_state, current_branch, head_commit FROM projects WHERE id = ?1", params![id], |row| Ok(Project { id: row.get(0)?, display_name: row.get(1)?, canonical_path: PathBuf::from(row.get::<_, String>(2)?), lifecycle_state: row.get(3)?, current_branch: row.get(4)?, head_commit: row.get(5)? })).optional().map_err(|source| StorageError::ProjectDatabase { source })
+}
+
+/// Return the latest approved baseline for a project.
+pub fn latest_baseline(
+    data_paths: &DataPaths,
+    project_id: i64,
+) -> Result<Option<InspectionBaseline>, StorageError> {
+    initialize(data_paths)?;
+    let connection = open_connection(&data_paths.database_path())
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    connection
+        .query_row(
+            "SELECT inspection_attempt_id, repository_commit, created_at FROM inspection_baselines WHERE project_id = ?1 ORDER BY id DESC LIMIT 1",
+            params![project_id],
+            |row| {
+                Ok(InspectionBaseline {
+                    inspection_attempt_id: row.get(0)?,
+                    repository_commit: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|source| StorageError::ProjectDatabase { source })
+}
+
+/// Return a project's verified memory and durable record counts without provider work.
+pub fn project_memory(
+    data_paths: &DataPaths,
+    project_id: i64,
+) -> Result<ProjectMemory, StorageError> {
+    initialize(data_paths)?;
+    let connection = open_connection(&data_paths.database_path())
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let project_exists = connection
+        .query_row(
+            "SELECT 1 FROM projects WHERE id = ?1",
+            params![project_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|source| StorageError::ProjectDatabase { source })?
+        .is_some();
+    if !project_exists {
+        return Err(StorageError::ProjectDatabase {
+            source: rusqlite::Error::QueryReturnedNoRows,
+        });
+    }
+    let baseline = latest_baseline(data_paths, project_id)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, fact_kind, statement, lifecycle_state, verification_status FROM verified_facts WHERE project_id = ?1 ORDER BY id",
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let verified_facts = statement
+        .query_map(params![project_id], |row| {
+            Ok(VerifiedFact {
+                id: row.get(0)?,
+                fact_kind: row.get(1)?,
+                statement: row.get(2)?,
+                lifecycle_state: row.get(3)?,
+                verification_status: row.get(4)?,
+            })
+        })
+        .map_err(|source| StorageError::ProjectDatabase { source })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let unresolved_questions = query_project_strings(
+        &connection,
+        "SELECT questions.question FROM questions JOIN inspection_attempts attempts ON attempts.id = questions.inspection_attempt_id WHERE attempts.project_id = ?1 AND questions.status = 'pending_review' ORDER BY questions.id",
+        project_id,
+    )?;
+    let (evidence_count, proposal_count, decision_count): (i64, i64, i64) = connection
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM fact_evidence WHERE project_id = ?1), (SELECT COUNT(*) FROM proposals JOIN inspection_attempts attempts ON attempts.id = proposals.inspection_attempt_id WHERE attempts.project_id = ?1), (SELECT COUNT(*) FROM review_decisions decisions JOIN proposals ON proposals.id = decisions.proposal_id JOIN inspection_attempts attempts ON attempts.id = proposals.inspection_attempt_id WHERE attempts.project_id = ?1)",
+            params![project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    Ok(ProjectMemory {
+        baseline,
+        verified_facts,
+        unresolved_questions,
+        evidence_count,
+        proposal_count,
+        decision_count,
+    })
+}
+
+fn query_project_strings(
+    connection: &Connection,
+    query: &str,
+    project_id: i64,
+) -> Result<Vec<String>, StorageError> {
+    let mut statement = connection
+        .prepare(query)
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    statement
+        .query_map(params![project_id], |row| row.get(0))
+        .map_err(|source| StorageError::ProjectDatabase { source })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| StorageError::ProjectDatabase { source })
 }
 
 /// Persist an approval-gated evidence bundle for a later provider invocation.

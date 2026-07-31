@@ -491,15 +491,21 @@ fn review_interactively_applies_all_normal_and_conflict_decisions() {
 #[test]
 fn finalization_is_atomic_and_defers_conflict_supersession_until_commit() {
     let data_directory = TemporaryDirectory::new();
+    let repository = TemporaryDirectory::new();
+    git_command(repository.path(), &["init"]);
+    git_command(
+        repository.path(),
+        &["config", "user.email", "pmemc-test@example.invalid"],
+    );
+    git_command(repository.path(), &["config", "user.name", "PMEMC Test"]);
+    std::fs::create_dir_all(repository.path().join("src")).expect("src directory should exist");
+    std::fs::write(repository.path().join("src/lib.rs"), "pub fn run() {}\n")
+        .expect("fixture source should be written");
+    git_command(repository.path(), &["add", "."]);
+    git_command(repository.path(), &["commit", "-m", "initial fixture"]);
     let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
-    let project = storage::add_project(
-        &data_paths,
-        "fixture",
-        data_directory.path().join("repository").as_path(),
-        None,
-        None,
-    )
-    .expect("project should be stored");
+    let project = storage::add_project(&data_paths, "fixture", repository.path(), None, None)
+        .expect("project should be stored");
     let bundle = EvidenceBundle {
         schema_version: 1,
         project_id: format!("project-{}", project.id),
@@ -512,13 +518,17 @@ fn finalization_is_atomic_and_defers_conflict_supersession_until_commit() {
         }],
     };
     let bundle_json = serde_json::to_string(&bundle).expect("bundle should serialize");
+    let commit = git::metadata(repository.path())
+        .expect("repository metadata should be available")
+        .head_commit
+        .expect("fixture repository should have a commit");
     let attempt_id = storage::stage_inspection_attempt_with_provenance(
         &data_paths,
         project.id,
         1,
         &bundle_json,
         Some(r#"{"symbols":[{"path":"src/lib.rs","line":1,"name":"run"}]}"#),
-        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        Some(&commit),
     )
     .expect("attempt should stage");
     let connection = rusqlite::Connection::open(data_paths.database_path())
@@ -613,6 +623,26 @@ fn finalization_is_atomic_and_defers_conflict_supersession_until_commit() {
     assert!(finalization_output.contains(&format!(
         "finalized inspection {attempt_id} with 3 verified facts"
     )));
+    let baseline_status = pmemc_with_input(
+        &data_directory,
+        &["status", &format!("project-{}", project.id)],
+        b"",
+    );
+    assert!(baseline_status.status.success());
+    let baseline_status_output = String::from_utf8_lossy(&baseline_status.stdout);
+    assert!(baseline_status_output.contains("baseline established"));
+    assert!(baseline_status_output.contains("commits-since-baseline\t0"));
+    git_command(
+        repository.path(),
+        &["commit", "--allow-empty", "-m", "later fixture"],
+    );
+    let changed_status = pmemc_with_input(
+        &data_directory,
+        &["status", &format!("project-{}", project.id)],
+        b"",
+    );
+    assert!(changed_status.status.success());
+    assert!(String::from_utf8_lossy(&changed_status.stdout).contains("commits-since-baseline\t1"));
     let finalized_state: (String, String, i64, i64, i64, String) = connection
         .query_row(
             "SELECT (SELECT lifecycle_state FROM projects WHERE id = 1), (SELECT status FROM inspection_attempts WHERE id = 1), (SELECT COUNT(*) FROM inspection_baselines), (SELECT COUNT(*) FROM verified_facts), (SELECT COUNT(*) FROM review_decisions WHERE finalized_at IS NOT NULL), (SELECT verification_status FROM verified_facts WHERE id = 1)",

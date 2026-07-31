@@ -399,8 +399,15 @@ fn status_command(project_id: Option<String>) -> anyhow::Result<()> {
 }
 
 fn print_project_status(project: &storage::Project) -> anyhow::Result<()> {
+    let data_paths = storage::default_data_paths()?;
+    let baseline = storage::latest_baseline(&data_paths, project.id)?;
+    let label = if baseline.is_some() {
+        "baseline established"
+    } else {
+        "initial inspection required"
+    };
     println!(
-        "project-{}\tinitial inspection required\t{}",
+        "project-{}\t{label}\t{}",
         project.id,
         project.canonical_path.display()
     );
@@ -422,7 +429,18 @@ fn print_project_status(project: &storage::Project) -> anyhow::Result<()> {
             "committed-since-registration\tnot-applicable (repository was unborn at registration)"
         ),
     }
-    println!("commits-since-baseline\tnot-applicable (initial inspection required)");
+    match baseline.and_then(|baseline| baseline.repository_commit) {
+        Some(commit) => println!(
+            "commits-since-baseline\t{}",
+            git::commit_count_since(&project.canonical_path, &commit)?
+        ),
+        None if project.lifecycle_state == "registered_needs_inspection" => {
+            println!("commits-since-baseline\tnot-applicable (initial inspection required)");
+        }
+        None => {
+            println!("commits-since-baseline\tnot-applicable (baseline was an unborn repository)")
+        }
+    }
     let status = git::working_tree_status(&project.canonical_path)?;
     for path in status.added_paths {
         println!("added\t{path}");
@@ -487,13 +505,35 @@ fn project_command(command: cli::ProjectCommand) -> anyhow::Result<()> {
         cli::ProjectCommand::List => {
             for project in storage::list_projects(&data_paths)? {
                 let metadata = git::metadata(&project.canonical_path)?;
+                let baseline = storage::latest_baseline(&data_paths, project.id)?;
+                let status = git::working_tree_status(&project.canonical_path)?;
+                let commits_since_baseline = match baseline
+                    .as_ref()
+                    .and_then(|baseline| baseline.repository_commit.as_deref())
+                {
+                    Some(commit) => git::commit_count_since(&project.canonical_path, commit)?,
+                    None => 0,
+                };
+                let changes_detected =
+                    commits_since_baseline != 0 || changed_path_count(&status) != 0;
                 println!(
-                    "project-{}\t{}\t{}\t{}\tbranch={}\tlast-approved-inspection=none\tchanges-detected=initial-inspection-required",
+                    "project-{}\t{}\t{}\t{}\tbranch={}\tlast-approved-inspection={}\tchanges-detected={}",
                     project.id,
                     project.display_name,
                     project.canonical_path.display(),
                     project.lifecycle_state,
-                    metadata.branch.as_deref().unwrap_or("detached")
+                    metadata.branch.as_deref().unwrap_or("detached"),
+                    baseline
+                        .as_ref()
+                        .map(|baseline| baseline.created_at.as_str())
+                        .unwrap_or("none"),
+                    if baseline.is_none() {
+                        "initial-inspection-required"
+                    } else if changes_detected {
+                        "yes"
+                    } else {
+                        "no"
+                    },
                 );
             }
             Ok(())
@@ -511,6 +551,32 @@ fn project_command(command: cli::ProjectCommand) -> anyhow::Result<()> {
                 project.current_branch.as_deref().unwrap_or("detached"),
                 project.head_commit.as_deref().unwrap_or("unborn")
             );
+            let memory = storage::project_memory(&data_paths, id)?;
+            match memory.baseline {
+                Some(baseline) => println!(
+                    "baseline\tattempt={}\tcommit={}\tat={}",
+                    baseline.inspection_attempt_id,
+                    baseline.repository_commit.as_deref().unwrap_or("unborn"),
+                    baseline.created_at
+                ),
+                None => println!("baseline\tnone"),
+            }
+            for fact in memory.verified_facts {
+                println!(
+                    "fact-{}\t{}\t{}\t{}\t{}",
+                    fact.id,
+                    fact.fact_kind,
+                    fact.lifecycle_state,
+                    fact.verification_status,
+                    fact.statement
+                );
+            }
+            for question in memory.unresolved_questions {
+                println!("unresolved-question\t{question}");
+            }
+            println!("evidence-count\t{}", memory.evidence_count);
+            println!("proposal-count\t{}", memory.proposal_count);
+            println!("decision-count\t{}", memory.decision_count);
             Ok(())
         }
     }
