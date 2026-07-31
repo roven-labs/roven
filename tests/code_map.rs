@@ -45,7 +45,7 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
     .expect("JavaScript fixture should be written");
     std::fs::write(
         repository.path().join("typed.ts"),
-        "function typedCaller(): void { typedHelper(); }\nfunction typedHelper(): void {}\n",
+        "class Typed {}\ninterface Shape {}\nenum Mode { Ready }\nfunction typedCaller(): void { typedHelper(); }\nfunction typedHelper(): void {}\n",
     )
     .expect("TypeScript fixture should be written");
     std::fs::write(
@@ -60,7 +60,7 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
     .expect("JSX fixture should be written");
     std::fs::write(
         repository.path().join("Demo.java"),
-        "class Demo { void javaCaller() { javaHelper(); } void javaHelper() {} }\n",
+        "class Demo { void javaCaller() { javaHelper(); } void javaHelper() {} } interface Contract {} enum Color { RED }\n",
     )
     .expect("Java fixture should be written");
     std::fs::write(
@@ -146,6 +146,36 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         map.calls
             .iter()
             .any(|call| call.caller == "goCaller" && call.callee == "goHelper")
+    );
+    assert!(
+        map.symbols
+            .iter()
+            .any(|symbol| symbol.name == "Typed" && symbol.kind == SymbolKind::Class)
+    );
+    assert!(
+        map.symbols
+            .iter()
+            .any(|symbol| symbol.name == "Shape" && symbol.kind == SymbolKind::Interface)
+    );
+    assert!(
+        map.symbols
+            .iter()
+            .any(|symbol| symbol.name == "Mode" && symbol.kind == SymbolKind::Enum)
+    );
+    assert!(
+        map.symbols
+            .iter()
+            .any(|symbol| symbol.name == "Demo" && symbol.kind == SymbolKind::Class)
+    );
+    assert!(
+        map.symbols
+            .iter()
+            .any(|symbol| symbol.name == "Contract" && symbol.kind == SymbolKind::Interface)
+    );
+    assert!(
+        map.symbols
+            .iter()
+            .any(|symbol| symbol.name == "Color" && symbol.kind == SymbolKind::Enum)
     );
     assert!(map.imports.iter().any(|import| {
         import.source_path == "src/lib.rs" && import.target_path == "src/helper.rs"

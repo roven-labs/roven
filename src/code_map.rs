@@ -442,6 +442,27 @@ fn visit_java(
             });
             next_function = Some(name);
         }
+    } else if matches!(
+        node.kind(),
+        "class_declaration" | "interface_declaration" | "enum_declaration"
+    ) {
+        if let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|node| node.utf8_text(source).ok())
+        {
+            let kind = match node.kind() {
+                "class_declaration" => SymbolKind::Class,
+                "interface_declaration" => SymbolKind::Interface,
+                "enum_declaration" => SymbolKind::Enum,
+                _ => unreachable!("Java symbol kind was filtered above"),
+            };
+            symbols.push(Symbol {
+                path: path.into(),
+                name: name.into(),
+                kind,
+                line: node.start_position().row + 1,
+            });
+        }
     } else if node.kind() == "method_invocation"
         && let (Some(caller), Some(callee)) = (
             current_function,
@@ -542,6 +563,27 @@ fn visit_javascript(
                 line: node.start_position().row + 1,
             });
             next_function = Some(name);
+        }
+    } else if matches!(
+        node.kind(),
+        "class_declaration" | "interface_declaration" | "enum_declaration"
+    ) {
+        if let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|node| node.utf8_text(source).ok())
+        {
+            let kind = match node.kind() {
+                "class_declaration" => SymbolKind::Class,
+                "interface_declaration" => SymbolKind::Interface,
+                "enum_declaration" => SymbolKind::Enum,
+                _ => unreachable!("JavaScript-family symbol kind was filtered above"),
+            };
+            symbols.push(Symbol {
+                path: path.into(),
+                name: name.into(),
+                kind,
+                line: node.start_position().row + 1,
+            });
         }
     } else if node.kind() == "call_expression"
         && let (Some(caller), Some(callee)) = (
