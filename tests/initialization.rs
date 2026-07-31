@@ -25,7 +25,7 @@ fn initialization_creates_an_idempotent_local_store_at_an_injected_path() {
             row.get(0)
         })
         .expect("the migration ledger should exist");
-    assert_eq!(migration_count, 2);
+    assert_eq!(migration_count, 3);
 
     let metadata_table_count: i64 = connection
         .query_row(

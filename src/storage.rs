@@ -38,6 +38,20 @@ const MIGRATIONS: &[Migration] = &[
         );
     ",
     },
+    Migration {
+        version: 3,
+        sql: "
+        CREATE TABLE inspection_attempts (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES projects(id),
+            status TEXT NOT NULL,
+            previous_lifecycle_state TEXT NOT NULL,
+            bundle_schema_version INTEGER NOT NULL,
+            bundle_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+    ",
+    },
 ];
 
 struct Migration {
@@ -280,6 +294,57 @@ pub fn project_by_id(data_paths: &DataPaths, id: i64) -> Result<Option<Project>,
     let connection = Connection::open(data_paths.database_path())
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     connection.query_row("SELECT id, display_name, canonical_path, lifecycle_state, current_branch, head_commit FROM projects WHERE id = ?1", params![id], |row| Ok(Project { id: row.get(0)?, display_name: row.get(1)?, canonical_path: PathBuf::from(row.get::<_, String>(2)?), lifecycle_state: row.get(3)?, current_branch: row.get(4)?, head_commit: row.get(5)? })).optional().map_err(|source| StorageError::ProjectDatabase { source })
+}
+
+/// Persist an approval-gated evidence bundle for a later provider invocation.
+///
+/// The project state changes only in the same transaction that creates the
+/// pending attempt, so a failed write leaves the durable lifecycle untouched.
+///
+/// # Errors
+///
+/// Returns an error when the project is missing or SQLite cannot commit the
+/// attempt and lifecycle transition.
+pub fn stage_inspection_attempt(
+    data_paths: &DataPaths,
+    project_id: i64,
+    bundle_schema_version: u8,
+    bundle_json: &str,
+) -> Result<i64, StorageError> {
+    initialize(data_paths)?;
+    let mut connection = Connection::open(data_paths.database_path())
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let transaction = connection
+        .transaction()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let previous_lifecycle_state = transaction
+        .query_row(
+            "SELECT lifecycle_state FROM projects WHERE id = ?1",
+            params![project_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|source| StorageError::ProjectDatabase { source })?
+        .ok_or_else(|| StorageError::ProjectDatabase {
+            source: rusqlite::Error::QueryReturnedNoRows,
+        })?;
+    transaction
+        .execute(
+            "INSERT INTO inspection_attempts (project_id, status, previous_lifecycle_state, bundle_schema_version, bundle_json) VALUES (?1, 'staged_pending_provider', ?2, ?3, ?4)",
+            params![project_id, previous_lifecycle_state, bundle_schema_version, bundle_json],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let attempt_id = transaction.last_insert_rowid();
+    transaction
+        .execute(
+            "UPDATE projects SET lifecycle_state = 'inspection_pending_review' WHERE id = ?1",
+            params![project_id],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    transaction
+        .commit()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    Ok(attempt_id)
 }
 
 fn create_directory(path: &Path) -> Result<(), StorageError> {

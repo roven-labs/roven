@@ -1,5 +1,7 @@
 //! Testable application entry points for PMEMC.
 
+use std::io::{self, Write};
+
 pub mod code_map;
 pub mod domain;
 pub mod git;
@@ -28,8 +30,43 @@ pub fn run() -> anyhow::Result<()> {
         }
         cli::Command::Project { command } => project_command(command),
         cli::Command::Status { project_id } => status_command(project_id),
+        cli::Command::Inspect { project_id } => inspect_command(&project_id),
         _ => anyhow::bail!("this command is not available until a later Version 1 phase"),
     }
+}
+
+fn inspect_command(project_id: &str) -> anyhow::Result<()> {
+    let data_paths = storage::default_data_paths()?;
+    let id = parse_project_id(project_id)?;
+    let project = storage::project_by_id(&data_paths, id)?
+        .ok_or_else(|| anyhow::anyhow!("project {project_id} is not registered"))?;
+    let status = git::working_tree_status(&project.canonical_path)?;
+    println!("inspection scope for project-{id}: initial repository context");
+    println!("changed paths detected: {}", changed_path_count(&status));
+    print!("Inspect the reported repository files? [y/N] ");
+    io::stdout().flush()?;
+    let mut response = String::new();
+    io::stdin().read_line(&mut response)?;
+    if !matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        println!("inspection cancelled; no repository content was read");
+        return Ok(());
+    }
+
+    let bundle = inspection::build_initial_bundle(&project.canonical_path, project_id, &status)?;
+    let bundle_json = serde_json::to_string(&bundle)?;
+    let attempt_id =
+        storage::stage_inspection_attempt(&data_paths, id, bundle.schema_version, &bundle_json)?;
+    println!("inspection attempt {attempt_id} staged for provider processing");
+    Ok(())
+}
+
+fn changed_path_count(status: &git::WorkingTreeStatus) -> usize {
+    status.added_paths.len()
+        + status.modified_paths.len()
+        + status.untracked_paths.len()
+        + status.staged_paths.len()
+        + status.unstaged_paths.len()
+        + status.deleted_paths.len()
 }
 
 fn status_command(project_id: Option<String>) -> anyhow::Result<()> {
