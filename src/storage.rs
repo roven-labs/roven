@@ -9,6 +9,13 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
+use crate::{
+    inspection::EvidenceBundle,
+    provider::{
+        ProviderFailureCategory, ProviderInvocationMetadata, ProviderResponse, validate_response,
+    },
+};
+
 const APPLICATION_DIRECTORY: &str = "PMEMC";
 const DATABASE_FILE: &str = "pmemc.sqlite3";
 const CACHE_DIRECTORY: &str = "cache";
@@ -48,6 +55,40 @@ const MIGRATIONS: &[Migration] = &[
             previous_lifecycle_state TEXT NOT NULL,
             bundle_schema_version INTEGER NOT NULL,
             bundle_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+    ",
+    },
+    Migration {
+        version: 4,
+        sql: "
+        CREATE TABLE provider_invocations (
+            id INTEGER PRIMARY KEY,
+            inspection_attempt_id INTEGER NOT NULL REFERENCES inspection_attempts(id),
+            provider_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            prompt_schema_version INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            failure_category TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE proposals (
+            id INTEGER PRIMARY KEY,
+            inspection_attempt_id INTEGER NOT NULL REFERENCES inspection_attempts(id),
+            provider_invocation_id INTEGER NOT NULL REFERENCES provider_invocations(id),
+            statement TEXT NOT NULL,
+            lifecycle_state TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            evidence_paths_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE questions (
+            id INTEGER PRIMARY KEY,
+            inspection_attempt_id INTEGER NOT NULL REFERENCES inspection_attempts(id),
+            provider_invocation_id INTEGER NOT NULL REFERENCES provider_invocations(id),
+            question TEXT NOT NULL,
+            status TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
     ",
@@ -170,6 +211,15 @@ pub enum StorageError {
         #[source]
         source: rusqlite::Error,
     },
+    /// A validated provider response could not be encoded for local storage.
+    #[error("cannot serialize the validated provider response")]
+    SerializeProviderResponse {
+        #[source]
+        source: serde_json::Error,
+    },
+    /// A provider response was not valid for the approved evidence bundle.
+    #[error("provider response does not match the approved inspection evidence")]
+    InvalidProviderResponse,
 }
 
 /// Resolve the default Windows local-data location used by `pmemc init`.
@@ -345,6 +395,184 @@ pub fn stage_inspection_attempt(
         .commit()
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     Ok(attempt_id)
+}
+
+/// Persist a schema-validated provider response as pending review records.
+///
+/// This single transaction records non-secret invocation metadata, proposals,
+/// and questions without changing verified facts or a baseline.
+///
+/// # Errors
+///
+/// Returns an error if the staged attempt is unavailable or SQLite cannot
+/// commit every pending-review record.
+pub fn store_provider_response(
+    data_paths: &DataPaths,
+    attempt_id: i64,
+    metadata: &ProviderInvocationMetadata,
+    response: &ProviderResponse,
+) -> Result<(), StorageError> {
+    initialize(data_paths)?;
+    let mut connection = Connection::open(data_paths.database_path())
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let transaction = connection
+        .transaction()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let bundle_json = transaction
+        .query_row(
+            "SELECT bundle_json FROM inspection_attempts WHERE id = ?1 AND status = 'staged_pending_provider'",
+            params![attempt_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|source| StorageError::ProjectDatabase { source })?
+        .ok_or_else(|| StorageError::ProjectDatabase {
+            source: rusqlite::Error::QueryReturnedNoRows,
+        })?;
+    let bundle: EvidenceBundle = serde_json::from_str(&bundle_json)
+        .map_err(|source| StorageError::SerializeProviderResponse { source })?;
+    validate_response(response, &bundle).map_err(|_| StorageError::InvalidProviderResponse)?;
+    transaction
+        .execute(
+            "INSERT INTO provider_invocations (inspection_attempt_id, provider_id, model_id, prompt_schema_version, status) VALUES (?1, ?2, ?3, ?4, 'succeeded')",
+            params![attempt_id, metadata.provider_id, metadata.model_id, metadata.prompt_schema_version],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let invocation_id = transaction.last_insert_rowid();
+    for proposal in &response.proposals {
+        let evidence_paths_json = serde_json::to_string(&proposal.evidence_paths)
+            .map_err(|source| StorageError::SerializeProviderResponse { source })?;
+        transaction
+            .execute(
+                "INSERT INTO proposals (inspection_attempt_id, provider_invocation_id, statement, lifecycle_state, confidence, evidence_paths_json, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending_review')",
+                params![
+                    attempt_id,
+                    invocation_id,
+                    proposal.statement,
+                    proposal.lifecycle.as_str(),
+                    proposal.confidence.as_str(),
+                    evidence_paths_json,
+                ],
+            )
+            .map_err(|source| StorageError::ProjectDatabase { source })?;
+    }
+    for question in &response.questions {
+        transaction
+            .execute(
+                "INSERT INTO questions (inspection_attempt_id, provider_invocation_id, question, status) VALUES (?1, ?2, ?3, 'pending_review')",
+                params![attempt_id, invocation_id, question],
+            )
+            .map_err(|source| StorageError::ProjectDatabase { source })?;
+    }
+    transaction
+        .execute(
+            "UPDATE inspection_attempts SET status = 'pending_review' WHERE id = ?1",
+            params![attempt_id],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    transaction
+        .commit()
+        .map_err(|source| StorageError::ProjectDatabase { source })
+}
+
+/// Mark a provider attempt as failed and restore its prior durable lifecycle.
+///
+/// # Errors
+///
+/// Returns an error if the staged attempt cannot be recovered atomically.
+pub fn record_provider_failure(
+    data_paths: &DataPaths,
+    attempt_id: i64,
+    metadata: &ProviderInvocationMetadata,
+    failure_category: ProviderFailureCategory,
+) -> Result<(), StorageError> {
+    initialize(data_paths)?;
+    let mut connection = Connection::open(data_paths.database_path())
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let transaction = connection
+        .transaction()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let (project_id, previous_lifecycle_state) = transaction
+        .query_row(
+            "SELECT project_id, previous_lifecycle_state FROM inspection_attempts WHERE id = ?1 AND status = 'staged_pending_provider'",
+            params![attempt_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|source| StorageError::ProjectDatabase { source })?
+        .ok_or_else(|| StorageError::ProjectDatabase {
+            source: rusqlite::Error::QueryReturnedNoRows,
+        })?;
+    transaction
+        .execute(
+            "INSERT INTO provider_invocations (inspection_attempt_id, provider_id, model_id, prompt_schema_version, status, failure_category) VALUES (?1, ?2, ?3, ?4, 'failed', ?5)",
+            params![
+                attempt_id,
+                metadata.provider_id,
+                metadata.model_id,
+                metadata.prompt_schema_version,
+                failure_category.as_str(),
+            ],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    transaction
+        .execute(
+            "UPDATE inspection_attempts SET status = 'provider_failed' WHERE id = ?1",
+            params![attempt_id],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    transaction
+        .execute(
+            "UPDATE projects SET lifecycle_state = ?1 WHERE id = ?2",
+            params![previous_lifecycle_state, project_id],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    transaction
+        .commit()
+        .map_err(|source| StorageError::ProjectDatabase { source })
+}
+
+/// Make a retained failed provider attempt ready for another bounded call.
+///
+/// Prior invocation rows remain in the audit trail. The project returns to
+/// pending review only while this same approved evidence bundle is retried.
+///
+/// # Errors
+///
+/// Returns an error when the failed attempt cannot be restored transactionally.
+pub fn retry_provider_attempt(data_paths: &DataPaths, attempt_id: i64) -> Result<(), StorageError> {
+    initialize(data_paths)?;
+    let mut connection = Connection::open(data_paths.database_path())
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let transaction = connection
+        .transaction()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let project_id = transaction
+        .query_row(
+            "SELECT project_id FROM inspection_attempts WHERE id = ?1 AND status = 'provider_failed'",
+            params![attempt_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|source| StorageError::ProjectDatabase { source })?
+        .ok_or_else(|| StorageError::ProjectDatabase {
+            source: rusqlite::Error::QueryReturnedNoRows,
+        })?;
+    transaction
+        .execute(
+            "UPDATE inspection_attempts SET status = 'staged_pending_provider' WHERE id = ?1",
+            params![attempt_id],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    transaction
+        .execute(
+            "UPDATE projects SET lifecycle_state = 'inspection_pending_review' WHERE id = ?1",
+            params![project_id],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    transaction
+        .commit()
+        .map_err(|source| StorageError::ProjectDatabase { source })
 }
 
 fn create_directory(path: &Path) -> Result<(), StorageError> {

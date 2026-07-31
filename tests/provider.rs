@@ -1,7 +1,13 @@
 use pmemc::{
     inspection::{EvidenceBundle, EvidenceFile, EvidenceState},
-    provider::{FakeProvider, ModelProvider, parse_response},
+    provider::{
+        FakeProvider, ModelProvider, Proposal, ProposedConfidence, ProposedLifecycle,
+        ProviderFailureCategory, ProviderInvocationMetadata, ProviderResponse, parse_response,
+    },
+    storage,
 };
+
+mod support;
 
 fn bundle() -> EvidenceBundle {
     EvidenceBundle {
@@ -63,4 +69,229 @@ fn provider_response_rejects_unknown_fields_and_unselected_evidence() {
 
     assert!(unknown_field.is_err());
     assert!(unknown_evidence.is_err());
+}
+
+#[test]
+fn provider_results_are_pending_review_with_invocation_metadata() {
+    let data_directory = support::TemporaryDirectory::new();
+    let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
+    let project = storage::add_project(
+        &data_paths,
+        "fixture",
+        data_directory.path().join("repository").as_path(),
+        None,
+        None,
+    )
+    .expect("project should be stored");
+    let bundle_json = serde_json::to_string(&bundle()).expect("bundle should serialize");
+    let attempt_id = storage::stage_inspection_attempt(&data_paths, project.id, 1, &bundle_json)
+        .expect("attempt should be staged");
+    let response = parse_response(
+        r#"{
+            "schema_version": 1,
+            "proposals": [{
+                "statement": "The project exposes a run function.",
+                "lifecycle": "committed",
+                "confidence": "exact",
+                "evidence_paths": ["src/lib.rs"]
+            }],
+            "questions": ["What is the intended command-line audience?"]
+        }"#,
+        &bundle(),
+    )
+    .expect("response should validate");
+    let metadata = ProviderInvocationMetadata::new("fake", "offline-test-model", 1)
+        .expect("metadata should be valid");
+
+    storage::store_provider_response(&data_paths, attempt_id, &metadata, &response)
+        .expect("response should be persisted");
+
+    let connection = rusqlite::Connection::open(data_paths.database_path())
+        .expect("database should be readable");
+    let invocation: (String, String, i64, String) = connection
+        .query_row(
+            "SELECT provider_id, model_id, prompt_schema_version, status FROM provider_invocations",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("invocation metadata should be present");
+    assert_eq!(
+        invocation,
+        (
+            "fake".into(),
+            "offline-test-model".into(),
+            1,
+            "succeeded".into()
+        )
+    );
+    let proposal_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM proposals WHERE status = 'pending_review'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("proposal should be pending review");
+    let question_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM questions WHERE status = 'pending_review'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("question should be pending review");
+    assert_eq!((proposal_count, question_count), (1, 1));
+}
+
+#[test]
+fn provider_failure_restores_the_previous_project_lifecycle() {
+    let data_directory = support::TemporaryDirectory::new();
+    let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
+    let project = storage::add_project(
+        &data_paths,
+        "fixture",
+        data_directory.path().join("repository").as_path(),
+        None,
+        None,
+    )
+    .expect("project should be stored");
+    let bundle_json = serde_json::to_string(&bundle()).expect("bundle should serialize");
+    let attempt_id = storage::stage_inspection_attempt(&data_paths, project.id, 1, &bundle_json)
+        .expect("attempt should be staged");
+
+    let metadata = ProviderInvocationMetadata::new("fake", "offline-test-model", 1)
+        .expect("metadata should be valid");
+    storage::record_provider_failure(
+        &data_paths,
+        attempt_id,
+        &metadata,
+        ProviderFailureCategory::TimedOut,
+    )
+    .expect("failure should be recoverable");
+
+    let restored = storage::project_by_id(&data_paths, project.id)
+        .expect("project should be readable")
+        .expect("project should still exist");
+    assert_eq!(restored.lifecycle_state, "registered_needs_inspection");
+    let connection = rusqlite::Connection::open(data_paths.database_path())
+        .expect("database should be readable");
+    let status: String = connection
+        .query_row(
+            "SELECT status FROM inspection_attempts WHERE id = ?1",
+            [attempt_id],
+            |row| row.get(0),
+        )
+        .expect("attempt should exist");
+    assert_eq!(status, "provider_failed");
+    let failure_metadata: (String, String, i64, String) = connection
+        .query_row(
+            "SELECT provider_id, model_id, prompt_schema_version, failure_category FROM provider_invocations",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("failure invocation should be present");
+    assert_eq!(
+        failure_metadata,
+        (
+            "fake".into(),
+            "offline-test-model".into(),
+            1,
+            "timed_out".into(),
+        )
+    );
+}
+
+#[test]
+fn failed_provider_attempt_can_retry_without_losing_invocation_history() {
+    let data_directory = support::TemporaryDirectory::new();
+    let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
+    let project = storage::add_project(
+        &data_paths,
+        "fixture",
+        data_directory.path().join("repository").as_path(),
+        None,
+        None,
+    )
+    .expect("project should be stored");
+    let bundle_json = serde_json::to_string(&bundle()).expect("bundle should serialize");
+    let attempt_id = storage::stage_inspection_attempt(&data_paths, project.id, 1, &bundle_json)
+        .expect("attempt should be staged");
+    let metadata = ProviderInvocationMetadata::new("fake", "offline-test-model", 1)
+        .expect("metadata should be valid");
+    storage::record_provider_failure(
+        &data_paths,
+        attempt_id,
+        &metadata,
+        ProviderFailureCategory::RateLimited,
+    )
+    .expect("failure should be recoverable");
+
+    storage::retry_provider_attempt(&data_paths, attempt_id).expect("attempt should be retryable");
+    let response = parse_response(
+        r#"{"schema_version":1,"proposals":[],"questions":[]}"#,
+        &bundle(),
+    )
+    .expect("response should validate");
+    storage::store_provider_response(&data_paths, attempt_id, &metadata, &response)
+        .expect("retry response should be stored");
+
+    let connection = rusqlite::Connection::open(data_paths.database_path())
+        .expect("database should be readable");
+    let invocation_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM provider_invocations", [], |row| {
+            row.get(0)
+        })
+        .expect("both invocations should be retained");
+    let attempt_status: String = connection
+        .query_row(
+            "SELECT status FROM inspection_attempts WHERE id = ?1",
+            [attempt_id],
+            |row| row.get(0),
+        )
+        .expect("attempt should exist");
+    assert_eq!(invocation_count, 2);
+    assert_eq!(attempt_status, "pending_review");
+}
+
+#[test]
+fn persistence_revalidates_untrusted_provider_response_against_staged_evidence() {
+    let data_directory = support::TemporaryDirectory::new();
+    let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
+    let project = storage::add_project(
+        &data_paths,
+        "fixture",
+        data_directory.path().join("repository").as_path(),
+        None,
+        None,
+    )
+    .expect("project should be stored");
+    let bundle_json = serde_json::to_string(&bundle()).expect("bundle should serialize");
+    let attempt_id = storage::stage_inspection_attempt(&data_paths, project.id, 1, &bundle_json)
+        .expect("attempt should be staged");
+    let metadata = ProviderInvocationMetadata::new("fake", "offline-test-model", 1)
+        .expect("metadata should be valid");
+    let invalid_response = ProviderResponse {
+        schema_version: 1,
+        proposals: vec![Proposal {
+            statement: "This cites evidence outside the approved bundle.".into(),
+            lifecycle: ProposedLifecycle::Committed,
+            confidence: ProposedConfidence::Exact,
+            evidence_paths: vec!["secret.env".into()],
+        }],
+        questions: Vec::new(),
+    };
+
+    let result =
+        storage::store_provider_response(&data_paths, attempt_id, &metadata, &invalid_response);
+
+    assert!(result.is_err());
+    let connection = rusqlite::Connection::open(data_paths.database_path())
+        .expect("database should be readable");
+    let invocation_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM provider_invocations", [], |row| {
+            row.get(0)
+        })
+        .expect("database should be readable");
+    let proposal_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM proposals", [], |row| row.get(0))
+        .expect("database should be readable");
+    assert_eq!((invocation_count, proposal_count), (0, 0));
 }

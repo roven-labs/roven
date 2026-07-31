@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeSet, fs, path::Path};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -16,14 +16,14 @@ const MAX_BUNDLE_BYTES: usize = 64 * 1024;
 const MAX_FILE_BYTES: usize = 8 * 1024;
 
 /// The repository state represented by an evidence excerpt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvidenceState {
     Committed,
     InProgress,
 }
 
 /// One minimized source or text excerpt suitable for a future provider request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceFile {
     pub path: String,
     pub state: EvidenceState,
@@ -32,7 +32,7 @@ pub struct EvidenceFile {
 }
 
 /// A deterministic, size-bounded payload staged after operator approval.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceBundle {
     pub schema_version: u8,
     pub project_id: String,
