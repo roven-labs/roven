@@ -454,15 +454,24 @@ fn relative_import_target(
     module: &str,
     known_paths: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
-    let module = module.strip_prefix("./")?;
-    let directory = source_path
+    if !(module.starts_with("./") || module.starts_with("../")) {
+        return None;
+    }
+    let mut components = source_path
         .rsplit_once('/')
-        .map_or("", |(directory, _)| directory);
-    let candidate = if directory.is_empty() {
-        module.into()
-    } else {
-        format!("{directory}/{module}")
-    };
+        .map_or_else(Vec::new, |(directory, _)| {
+            directory.split('/').map(str::to_owned).collect()
+        });
+    for component in module.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop()?;
+            }
+            component => components.push(component.into()),
+        }
+    }
+    let candidate = components.join("/");
     known_paths.contains(&candidate).then_some(candidate)
 }
 

@@ -53,6 +53,13 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         "export function utility() {}\n",
     )
     .expect("JavaScript utility fixture should be written");
+    std::fs::create_dir_all(repository.path().join("scripts"))
+        .expect("JavaScript nested directory should exist");
+    std::fs::write(
+        repository.path().join("scripts/page.js"),
+        "import { utility } from \"../util.js\";\n",
+    )
+    .expect("nested JavaScript fixture should be written");
     std::fs::write(
         repository.path().join("typed.ts"),
         "class Typed {}\ninterface Shape {}\nenum Mode { Ready }\nfunction typedCaller(): void { typedHelper(); }\nfunction typedHelper(): void {}\n",
@@ -221,6 +228,9 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
             .iter()
             .any(|import| { import.source_path == "web.js" && import.target_path == "util.js" })
     );
+    assert!(map.imports.iter().any(|import| {
+        import.source_path == "scripts/page.js" && import.target_path == "util.js"
+    }));
     assert!(
         map.imports.iter().any(|import| {
             import.source_path == "good.py" && import.target_path == "py_util.py"
