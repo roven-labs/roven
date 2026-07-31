@@ -10,6 +10,7 @@ pub mod domain;
 pub mod git;
 pub mod inspection;
 pub mod inventory;
+pub mod provider;
 pub mod storage;
 
 mod cli;
