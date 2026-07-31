@@ -45,17 +45,34 @@ fn status_command(project_id: Option<String>) -> anyhow::Result<()> {
         project.id,
         project.canonical_path.display()
     );
-    for path in git::untracked_paths(&project.canonical_path)? {
+    let metadata = git::metadata(&project.canonical_path)?;
+    println!(
+        "branch\t{}",
+        metadata.branch.as_deref().unwrap_or("detached")
+    );
+    println!(
+        "head\t{}",
+        metadata.head_commit.as_deref().unwrap_or("unborn")
+    );
+    let status = git::working_tree_status(&project.canonical_path)?;
+    for path in status.untracked_paths {
         println!("untracked\t{path}");
     }
-    for path in git::staged_paths(&project.canonical_path)? {
+    for path in status.staged_paths {
         println!("staged\t{path}");
     }
-    for path in git::unstaged_paths(&project.canonical_path)? {
+    for path in status.unstaged_paths {
         println!("unstaged\t{path}");
     }
-    for path in git::deleted_paths(&project.canonical_path)? {
+    for path in status.deleted_paths {
         println!("deleted\t{path}");
+    }
+    for relationship in status.relationships {
+        let label = match relationship.kind {
+            git::PathRelationshipKind::Renamed => "renamed",
+            git::PathRelationshipKind::Copied => "copied",
+        };
+        println!("{label}\t{}\t{}", relationship.source, relationship.target);
     }
     Ok(())
 }

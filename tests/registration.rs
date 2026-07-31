@@ -52,7 +52,10 @@ fn project_add_registers_a_git_working_tree_without_reading_source_content() {
 
     let status = pmemc(&data_directory, &["status", "project-1"]);
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("initial inspection required"));
+    let status_output = String::from_utf8_lossy(&status.stdout);
+    assert!(status_output.contains("initial inspection required"));
+    assert!(status_output.contains("branch\t"));
+    assert!(status_output.contains("head\tunborn"));
 
     std::fs::write(repository.path().join("untracked.txt"), "not committed")
         .expect("fixture file should be written");
@@ -95,4 +98,16 @@ fn project_add_registers_a_git_working_tree_without_reading_source_content() {
     let deleted_status = pmemc(&data_directory, &["status", "project-1"]);
     assert!(deleted_status.status.success());
     assert!(String::from_utf8_lossy(&deleted_status.stdout).contains("deleted\ttracked.txt"));
+
+    std::fs::write(repository.path().join("old-name.txt"), "rename me")
+        .expect("fixture file should be written");
+    git(repository.path(), &["add", "old-name.txt"]);
+    git(repository.path(), &["commit", "-m", "add rename fixture"]);
+    git(repository.path(), &["mv", "old-name.txt", "new-name.txt"]);
+    let renamed_status = pmemc(&data_directory, &["status", "project-1"]);
+    assert!(renamed_status.status.success());
+    assert!(
+        String::from_utf8_lossy(&renamed_status.stdout)
+            .contains("renamed\told-name.txt\tnew-name.txt")
+    );
 }
