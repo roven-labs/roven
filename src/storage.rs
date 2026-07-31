@@ -161,6 +161,15 @@ pub struct Project {
     pub head_commit: Option<String>,
 }
 
+/// A failed inspection retained with its approved evidence for a provider retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedProviderAttempt {
+    /// Persistent inspection-attempt identifier.
+    pub id: i64,
+    /// The exact operator-approved bundle that failed to reach a provider.
+    pub bundle: EvidenceBundle,
+}
+
 impl Initialization {
     /// Return the initialized SQLite database file path.
     #[must_use]
@@ -220,6 +229,11 @@ pub enum StorageError {
     /// A provider response was not valid for the approved evidence bundle.
     #[error("provider response does not match the approved inspection evidence")]
     InvalidProviderResponse,
+    /// An inspection attempt contains invalid locally persisted evidence.
+    #[error(
+        "stored inspection evidence is invalid; run a new inspection after resolving the local store"
+    )]
+    InvalidStoredEvidence,
 }
 
 /// Resolve the default Windows local-data location used by `pmemc init`.
@@ -348,13 +362,13 @@ pub fn project_by_id(data_paths: &DataPaths, id: i64) -> Result<Option<Project>,
 
 /// Persist an approval-gated evidence bundle for a later provider invocation.
 ///
-/// The project state changes only in the same transaction that creates the
-/// pending attempt, so a failed write leaves the durable lifecycle untouched.
+/// Staging never changes the project lifecycle. It remains authoritative until
+/// a valid provider result is atomically persisted for review.
 ///
 /// # Errors
 ///
 /// Returns an error when the project is missing or SQLite cannot commit the
-/// attempt and lifecycle transition.
+/// retained provider attempt.
 pub fn stage_inspection_attempt(
     data_paths: &DataPaths,
     project_id: i64,
@@ -386,15 +400,38 @@ pub fn stage_inspection_attempt(
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let attempt_id = transaction.last_insert_rowid();
     transaction
-        .execute(
-            "UPDATE projects SET lifecycle_state = 'inspection_pending_review' WHERE id = ?1",
-            params![project_id],
-        )
-        .map_err(|source| StorageError::ProjectDatabase { source })?;
-    transaction
         .commit()
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     Ok(attempt_id)
+}
+
+/// Return the latest failed provider attempt for a project, if it can be retried.
+///
+/// # Errors
+///
+/// Returns an error when the local store cannot be read or retained evidence is
+/// not valid PMEMC evidence-bundle JSON.
+pub fn failed_provider_attempt_for_project(
+    data_paths: &DataPaths,
+    project_id: i64,
+) -> Result<Option<FailedProviderAttempt>, StorageError> {
+    initialize(data_paths)?;
+    let connection = Connection::open(data_paths.database_path())
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let row = connection
+        .query_row(
+            "SELECT id, bundle_json FROM inspection_attempts WHERE project_id = ?1 AND status = 'provider_failed' ORDER BY id DESC LIMIT 1",
+            params![project_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    row.map(|(id, bundle_json)| {
+        serde_json::from_str(&bundle_json)
+            .map(|bundle| FailedProviderAttempt { id, bundle })
+            .map_err(|_| StorageError::InvalidStoredEvidence)
+    })
+    .transpose()
 }
 
 /// Persist a schema-validated provider response as pending review records.
@@ -418,11 +455,11 @@ pub fn store_provider_response(
     let transaction = connection
         .transaction()
         .map_err(|source| StorageError::ProjectDatabase { source })?;
-    let bundle_json = transaction
+    let (project_id, bundle_json) = transaction
         .query_row(
-            "SELECT bundle_json FROM inspection_attempts WHERE id = ?1 AND status = 'staged_pending_provider'",
+            "SELECT project_id, bundle_json FROM inspection_attempts WHERE id = ?1 AND status = 'staged_pending_provider'",
             params![attempt_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
         .map_err(|source| StorageError::ProjectDatabase { source })?
@@ -468,6 +505,12 @@ pub fn store_provider_response(
         .execute(
             "UPDATE inspection_attempts SET status = 'pending_review' WHERE id = ?1",
             params![attempt_id],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    transaction
+        .execute(
+            "UPDATE projects SET lifecycle_state = 'inspection_pending_review' WHERE id = ?1",
+            params![project_id],
         )
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     transaction
@@ -534,8 +577,8 @@ pub fn record_provider_failure(
 
 /// Make a retained failed provider attempt ready for another bounded call.
 ///
-/// Prior invocation rows remain in the audit trail. The project returns to
-/// pending review only while this same approved evidence bundle is retried.
+/// Prior invocation rows remain in the audit trail. The project lifecycle stays
+/// at its previous durable state until a retry produces valid review records.
 ///
 /// # Errors
 ///
@@ -547,27 +590,24 @@ pub fn retry_provider_attempt(data_paths: &DataPaths, attempt_id: i64) -> Result
     let transaction = connection
         .transaction()
         .map_err(|source| StorageError::ProjectDatabase { source })?;
-    let project_id = transaction
+    let exists = transaction
         .query_row(
-            "SELECT project_id FROM inspection_attempts WHERE id = ?1 AND status = 'provider_failed'",
+            "SELECT 1 FROM inspection_attempts WHERE id = ?1 AND status = 'provider_failed'",
             params![attempt_id],
-            |row| row.get::<_, i64>(0),
+            |_| Ok(()),
         )
         .optional()
         .map_err(|source| StorageError::ProjectDatabase { source })?
-        .ok_or_else(|| StorageError::ProjectDatabase {
+        .is_some();
+    if !exists {
+        return Err(StorageError::ProjectDatabase {
             source: rusqlite::Error::QueryReturnedNoRows,
-        })?;
+        });
+    }
     transaction
         .execute(
             "UPDATE inspection_attempts SET status = 'staged_pending_provider' WHERE id = ?1",
             params![attempt_id],
-        )
-        .map_err(|source| StorageError::ProjectDatabase { source })?;
-    transaction
-        .execute(
-            "UPDATE projects SET lifecycle_state = 'inspection_pending_review' WHERE id = ?1",
-            params![project_id],
         )
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     transaction

@@ -39,24 +39,68 @@ pub fn run() -> anyhow::Result<()> {
     }
 }
 
+/// Stage an approved bundle, invoke a supplied provider, and retain only
+/// pending-review output. Tests supply [`provider::FakeProvider`] here so this
+/// full path never needs network access.
+///
+/// # Errors
+///
+/// Returns an error after retaining a retryable attempt when provider work
+/// fails, or when local persistence cannot complete atomically.
+pub fn submit_approved_bundle(
+    data_paths: &storage::DataPaths,
+    project_id: i64,
+    bundle: &inspection::EvidenceBundle,
+    provider: &dyn provider::ModelProvider,
+) -> anyhow::Result<i64> {
+    let bundle_json = serde_json::to_string(bundle)?;
+    let attempt_id = storage::stage_inspection_attempt(
+        data_paths,
+        project_id,
+        bundle.schema_version,
+        &bundle_json,
+    )?;
+    submit_staged_bundle(data_paths, attempt_id, bundle, provider)?;
+    Ok(attempt_id)
+}
+
 fn inspect_command(project_id: &str) -> anyhow::Result<()> {
     let data_paths = storage::default_data_paths()?;
     let id = parse_project_id(project_id)?;
     let project = storage::project_by_id(&data_paths, id)?
         .ok_or_else(|| anyhow::anyhow!("project {project_id} is not registered"))?;
     let status = git::working_tree_status(&project.canonical_path)?;
+    let retryable_attempt = storage::failed_provider_attempt_for_project(&data_paths, id)?;
     let initial_inspection = project.lifecycle_state == "registered_needs_inspection";
-    let scope_description = if initial_inspection {
-        "initial repository context"
-    } else {
-        "changed files and direct structural context"
-    };
-    println!("inspection scope for project-{id}: {scope_description}");
-    println!("changed paths detected: {}", changed_path_count(&status));
-    for path in inspection_scope_paths(&status) {
-        println!("scope\t{path}");
+    match &retryable_attempt {
+        Some(attempt) => {
+            println!(
+                "inspection scope for project-{id}: retained approved evidence from attempt {}",
+                attempt.id
+            );
+            println!(
+                "current changed paths detected: {}",
+                changed_path_count(&status)
+            );
+            for file in &attempt.bundle.files {
+                println!("scope\t{}", file.path);
+            }
+            print!("Retry the retained approved evidence bundle? [y/N] ");
+        }
+        None => {
+            let scope_description = if initial_inspection {
+                "initial repository context"
+            } else {
+                "changed files and direct structural context"
+            };
+            println!("inspection scope for project-{id}: {scope_description}");
+            println!("changed paths detected: {}", changed_path_count(&status));
+            for path in inspection_scope_paths(&status) {
+                println!("scope\t{path}");
+            }
+            print!("Inspect the reported repository files? [y/N] ");
+        }
     }
-    print!("Inspect the reported repository files? [y/N] ");
     io::stdout().flush()?;
     let mut response = String::new();
     io::stdin().read_line(&mut response)?;
@@ -65,15 +109,67 @@ fn inspect_command(project_id: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let bundle = if initial_inspection {
-        inspection::build_initial_bundle(&project.canonical_path, project_id, &status)?
+    let (bundle, attempt_id) = if let Some(attempt) = retryable_attempt {
+        storage::retry_provider_attempt(&data_paths, attempt.id)?;
+        (attempt.bundle, attempt.id)
     } else {
-        inspection::build_incremental_bundle(&project.canonical_path, project_id, &status)?
+        let bundle = if initial_inspection {
+            inspection::build_initial_bundle(&project.canonical_path, project_id, &status)?
+        } else {
+            inspection::build_incremental_bundle(&project.canonical_path, project_id, &status)?
+        };
+        let bundle_json = serde_json::to_string(&bundle)?;
+        let attempt_id = storage::stage_inspection_attempt(
+            &data_paths,
+            id,
+            bundle.schema_version,
+            &bundle_json,
+        )?;
+        (bundle, attempt_id)
     };
-    let bundle_json = serde_json::to_string(&bundle)?;
-    let attempt_id =
-        storage::stage_inspection_attempt(&data_paths, id, bundle.schema_version, &bundle_json)?;
-    println!("inspection attempt {attempt_id} staged for provider processing");
+    let provider = match provider::OpenRouterProvider::from_environment() {
+        Ok(provider) => provider,
+        Err(error) => {
+            let metadata =
+                provider::ProviderInvocationMetadata::new("openrouter", "unconfigured", 1)?;
+            storage::record_provider_failure(
+                &data_paths,
+                attempt_id,
+                &metadata,
+                error
+                    .failure_category()
+                    .unwrap_or(provider::ProviderFailureCategory::Configuration),
+            )?;
+            return Err(error.into());
+        }
+    };
+    submit_staged_bundle(&data_paths, attempt_id, &bundle, &provider)?;
+    println!("inspection attempt {attempt_id} stored provider proposals for review");
+    Ok(())
+}
+
+fn submit_staged_bundle(
+    data_paths: &storage::DataPaths,
+    attempt_id: i64,
+    bundle: &inspection::EvidenceBundle,
+    provider: &dyn provider::ModelProvider,
+) -> anyhow::Result<()> {
+    let metadata = provider.metadata();
+    let response = match provider.propose(bundle) {
+        Ok(response) => response,
+        Err(error) => {
+            storage::record_provider_failure(
+                data_paths,
+                attempt_id,
+                &metadata,
+                error
+                    .failure_category()
+                    .unwrap_or(provider::ProviderFailureCategory::RequestFailed),
+            )?;
+            return Err(error.into());
+        }
+    };
+    storage::store_provider_response(data_paths, attempt_id, &metadata, &response)?;
     Ok(())
 }
 

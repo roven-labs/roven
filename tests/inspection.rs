@@ -28,6 +28,10 @@ fn pmemc_with_input(
     let mut process = Command::new(env!("CARGO_BIN_EXE_pmemc"))
         .args(arguments)
         .env("LOCALAPPDATA", data_directory.path())
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("PMEMC_OPENROUTER_MODEL")
+        .env_remove("PMEMC_OPENROUTER_TIMEOUT_SECS")
+        .env_remove("PMEMC_OPENROUTER_MAX_ATTEMPTS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -126,7 +130,8 @@ fn denied_inspection_does_not_read_source_or_create_a_pending_attempt() {
 }
 
 #[test]
-fn approved_inspection_stages_a_redacted_bundle_and_marks_the_project_pending_review() {
+fn approved_inspection_with_missing_provider_configuration_preserves_a_redacted_retryable_attempt()
+{
     let data_directory = TemporaryDirectory::new();
     let repository = TemporaryDirectory::new();
     git_command(repository.path(), &["init"]);
@@ -147,8 +152,9 @@ fn approved_inspection_stages_a_redacted_bundle_and_marks_the_project_pending_re
     assert!(add.status.success());
 
     let inspection = pmemc_with_input(&data_directory, &["inspect", "project-1"], b"yes\n");
-    assert!(inspection.status.success());
-    assert!(String::from_utf8_lossy(&inspection.stdout).contains("staged for provider processing"));
+    assert!(!inspection.status.success());
+    let stderr = String::from_utf8_lossy(&inspection.stderr);
+    assert!(stderr.contains("OPENROUTER_API_KEY"));
 
     let connection =
         rusqlite::Connection::open(data_directory.path().join("PMEMC").join("pmemc.sqlite3"))
@@ -167,7 +173,58 @@ fn approved_inspection_stages_a_redacted_bundle_and_marks_the_project_pending_re
             |row| row.get(0),
         )
         .expect("project should exist");
-    assert_eq!(lifecycle_state, "inspection_pending_review");
+    assert_eq!(lifecycle_state, "registered_needs_inspection");
+    let attempt_status: String = connection
+        .query_row("SELECT status FROM inspection_attempts", [], |row| {
+            row.get(0)
+        })
+        .expect("attempt should be retained for retry");
+    assert_eq!(attempt_status, "provider_failed");
+}
+
+#[test]
+fn a_later_inspect_retries_the_retained_provider_attempt() {
+    let data_directory = TemporaryDirectory::new();
+    let repository = TemporaryDirectory::new();
+    git_command(repository.path(), &["init"]);
+    std::fs::write(repository.path().join("main.rs"), "pub fn run() {}\n")
+        .expect("source fixture should be written");
+    let add = Command::new(env!("CARGO_BIN_EXE_pmemc"))
+        .args([
+            "project",
+            "add",
+            repository.path().to_str().expect("UTF-8 test path"),
+        ])
+        .env("LOCALAPPDATA", data_directory.path())
+        .output()
+        .expect("project should be registered");
+    assert!(add.status.success());
+
+    let first = pmemc_with_input(&data_directory, &["inspect", "project-1"], b"y\n");
+    std::fs::write(repository.path().join("later.rs"), "pub fn later() {}\n")
+        .expect("later source fixture should be written");
+    let second = pmemc_with_input(&data_directory, &["inspect", "project-1"], b"y\n");
+
+    assert!(!first.status.success());
+    assert!(!second.status.success());
+    let retry_output = String::from_utf8_lossy(&second.stdout);
+    assert!(retry_output.contains("retained approved evidence"));
+    assert!(retry_output.contains("scope\tmain.rs"));
+    assert!(!retry_output.contains("scope\tlater.rs"));
+    let connection =
+        rusqlite::Connection::open(data_directory.path().join("PMEMC").join("pmemc.sqlite3"))
+            .expect("database should open");
+    let attempt_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM inspection_attempts", [], |row| {
+            row.get(0)
+        })
+        .expect("attempt count should be readable");
+    let invocation_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM provider_invocations", [], |row| {
+            row.get(0)
+        })
+        .expect("invocation count should be readable");
+    assert_eq!((attempt_count, invocation_count), (1, 2));
 }
 
 #[test]
@@ -264,7 +321,7 @@ fn inspect_uses_incremental_selection_after_a_baseline_exists() {
     .expect("source fixture should change");
 
     let inspection = pmemc_with_input(&data_directory, &["inspect", "project-1"], b"y\n");
-    assert!(inspection.status.success());
+    assert!(!inspection.status.success());
     let stored_bundle: String = connection
         .query_row(
             "SELECT bundle_json FROM inspection_attempts ORDER BY id DESC LIMIT 1",

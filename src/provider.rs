@@ -1,13 +1,19 @@
 //! Narrow, validated model-provider boundary for inspection proposals.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, env, fmt, thread, time::Duration};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::inspection::EvidenceBundle;
 
 const RESPONSE_SCHEMA_VERSION: u8 = 1;
+const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_MAX_ATTEMPTS: u8 = 3;
+const MAX_ATTEMPTS: u8 = 3;
+const RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Non-secret metadata recorded for each provider invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,9 +41,7 @@ impl ProviderInvocationMetadata {
         let model_id = model_id.into();
         if provider_id.trim().is_empty() || model_id.trim().is_empty() || prompt_schema_version == 0
         {
-            return Err(ProviderError::InvalidResponse {
-                message: "provider invocation metadata is incomplete".into(),
-            });
+            return Err(ProviderError::InvalidConfiguration);
         }
         Ok(Self {
             provider_id,
@@ -50,6 +54,8 @@ impl ProviderInvocationMetadata {
 /// Safe, non-secret classification recorded when a provider call fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderFailureCategory {
+    /// Required provider configuration was unavailable or invalid.
+    Configuration,
     /// The provider rejected authentication.
     Unauthorized,
     /// The provider rate limited the request after bounded retries.
@@ -60,6 +66,8 @@ pub enum ProviderFailureCategory {
     InvalidResponse,
     /// A transport or other provider request failed.
     RequestFailed,
+    /// The provider had a retryable service failure.
+    TemporarilyUnavailable,
 }
 
 impl ProviderFailureCategory {
@@ -67,12 +75,20 @@ impl ProviderFailureCategory {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Configuration => "configuration",
             Self::Unauthorized => "unauthorized",
             Self::RateLimited => "rate_limited",
             Self::TimedOut => "timed_out",
             Self::InvalidResponse => "invalid_response",
             Self::RequestFailed => "request_failed",
+            Self::TemporarilyUnavailable => "temporarily_unavailable",
         }
+    }
+}
+
+impl fmt::Display for ProviderFailureCategory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -138,10 +154,30 @@ pub struct ProviderResponse {
 /// Errors from an untrusted provider response or provider invocation.
 #[derive(Debug, Error)]
 pub enum ProviderError {
-    #[error("provider response is invalid: {message}")]
-    InvalidResponse { message: String },
-    #[error("provider request failed: {message}")]
-    RequestFailed { message: String },
+    #[error("provider response is invalid; no proposals were stored")]
+    InvalidResponse,
+    #[error("OPENROUTER_API_KEY is required to inspect a project")]
+    MissingApiKey,
+    #[error(
+        "OpenRouter configuration is invalid; set PMEMC_OPENROUTER_MODEL and valid bounded settings"
+    )]
+    InvalidConfiguration,
+    #[error("OpenRouter request failed ({category})")]
+    RequestFailed { category: ProviderFailureCategory },
+}
+
+impl ProviderError {
+    /// Return a safe category suitable for durable failure metadata.
+    #[must_use]
+    pub const fn failure_category(&self) -> Option<ProviderFailureCategory> {
+        match self {
+            Self::InvalidResponse => Some(ProviderFailureCategory::InvalidResponse),
+            Self::RequestFailed { category } => Some(*category),
+            Self::MissingApiKey | Self::InvalidConfiguration => {
+                Some(ProviderFailureCategory::Configuration)
+            }
+        }
+    }
 }
 
 /// The replaceable boundary between PMEMC and a model provider.
@@ -151,6 +187,194 @@ pub trait ModelProvider {
 
     /// Return untrusted, schema-validated proposals for an approved bundle.
     fn propose(&self, bundle: &EvidenceBundle) -> Result<ProviderResponse, ProviderError>;
+}
+
+/// Configuration for the synchronous OpenRouter adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenRouterConfig {
+    model_id: String,
+    timeout: Duration,
+    max_attempts: u8,
+}
+
+impl OpenRouterConfig {
+    /// Build a bounded OpenRouter configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a blank model, a zero timeout, or unbounded retry
+    /// count.
+    pub fn new(
+        model_id: impl Into<String>,
+        timeout: Duration,
+        max_attempts: u8,
+    ) -> Result<Self, ProviderError> {
+        let model_id = model_id.into();
+        if model_id.trim().is_empty()
+            || timeout.is_zero()
+            || max_attempts == 0
+            || max_attempts > MAX_ATTEMPTS
+        {
+            return Err(ProviderError::InvalidConfiguration);
+        }
+        Ok(Self {
+            model_id,
+            timeout,
+            max_attempts,
+        })
+    }
+
+    /// Read non-secret provider configuration from the process environment.
+    ///
+    /// `PMEMC_OPENROUTER_MODEL` is required. `PMEMC_OPENROUTER_TIMEOUT_SECS`
+    /// and `PMEMC_OPENROUTER_MAX_ATTEMPTS` default to bounded values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a value is missing or invalid.
+    pub fn from_environment() -> Result<Self, ProviderError> {
+        Self::from_environment_with(|name| env::var(name).ok())
+    }
+
+    /// Read configuration from an injected environment source for tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a value is missing or invalid.
+    pub fn from_environment_with(
+        value: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, ProviderError> {
+        let model_id =
+            value("PMEMC_OPENROUTER_MODEL").ok_or(ProviderError::InvalidConfiguration)?;
+        let timeout_seconds = value("PMEMC_OPENROUTER_TIMEOUT_SECS")
+            .map_or(Ok(DEFAULT_TIMEOUT_SECONDS), |value| value.parse::<u64>())
+            .map_err(|_| ProviderError::InvalidConfiguration)?;
+        let max_attempts = value("PMEMC_OPENROUTER_MAX_ATTEMPTS")
+            .map_or(Ok(DEFAULT_MAX_ATTEMPTS), |value| value.parse::<u8>())
+            .map_err(|_| ProviderError::InvalidConfiguration)?;
+        Self::new(model_id, Duration::from_secs(timeout_seconds), max_attempts)
+    }
+
+    /// Return metadata that is safe to persist with proposals.
+    #[must_use]
+    pub fn metadata(&self) -> ProviderInvocationMetadata {
+        ProviderInvocationMetadata {
+            provider_id: "openrouter".into(),
+            model_id: self.model_id.clone(),
+            prompt_schema_version: RESPONSE_SCHEMA_VERSION,
+        }
+    }
+}
+
+/// Synchronous transport boundary allowing provider tests to run without a network.
+pub trait OpenRouterTransport {
+    /// Send one OpenRouter completion request and return the raw response body.
+    fn complete(&self, api_key: &str, request: &Value) -> Result<String, ProviderFailureCategory>;
+}
+
+/// Production HTTPS transport for OpenRouter.
+pub struct UreqOpenRouterTransport {
+    agent: ureq::Agent,
+}
+
+impl UreqOpenRouterTransport {
+    fn new(timeout: Duration) -> Self {
+        let agent = ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .https_only(true)
+            .build()
+            .new_agent();
+        Self { agent }
+    }
+}
+
+impl OpenRouterTransport for UreqOpenRouterTransport {
+    fn complete(&self, api_key: &str, request: &Value) -> Result<String, ProviderFailureCategory> {
+        let authorization = format!("Bearer {api_key}");
+        let mut response = self
+            .agent
+            .post(OPENROUTER_CHAT_COMPLETIONS_URL)
+            .header("Authorization", &authorization)
+            .header("Content-Type", "application/json")
+            .send_json(request)
+            .map_err(classify_ureq_error)?;
+        response
+            .body_mut()
+            .read_to_string()
+            .map_err(|_| ProviderFailureCategory::RequestFailed)
+    }
+}
+
+/// Production OpenRouter provider, deliberately opaque to avoid key exposure.
+pub struct OpenRouterProvider<T = UreqOpenRouterTransport> {
+    config: OpenRouterConfig,
+    api_key: String,
+    transport: T,
+}
+
+impl OpenRouterProvider<UreqOpenRouterTransport> {
+    /// Construct the production adapter from its documented environment values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the key or non-secret configuration is unavailable.
+    pub fn from_environment() -> Result<Self, ProviderError> {
+        let api_key = env::var("OPENROUTER_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ProviderError::MissingApiKey)?;
+        let config = OpenRouterConfig::from_environment()?;
+        let transport = UreqOpenRouterTransport::new(config.timeout);
+        Ok(Self {
+            config,
+            api_key,
+            transport,
+        })
+    }
+}
+
+impl<T> OpenRouterProvider<T> {
+    /// Construct an adapter with an injected transport for deterministic tests.
+    #[must_use]
+    pub fn with_transport(
+        config: OpenRouterConfig,
+        api_key: impl Into<String>,
+        transport: T,
+    ) -> Self {
+        Self {
+            config,
+            api_key: api_key.into(),
+            transport,
+        }
+    }
+}
+
+impl<T: OpenRouterTransport> ModelProvider for OpenRouterProvider<T> {
+    fn metadata(&self) -> ProviderInvocationMetadata {
+        self.config.metadata()
+    }
+
+    fn propose(&self, bundle: &EvidenceBundle) -> Result<ProviderResponse, ProviderError> {
+        let request = openrouter_request(&self.config.model_id, bundle)?;
+        for attempt in 0..self.config.max_attempts {
+            match self.transport.complete(&self.api_key, &request) {
+                Ok(body) => return parse_openrouter_response(&body, bundle),
+                Err(category)
+                    if matches!(
+                        category,
+                        ProviderFailureCategory::RateLimited
+                            | ProviderFailureCategory::TemporarilyUnavailable
+                    ) && attempt + 1 < self.config.max_attempts =>
+                {
+                    thread::sleep(RETRY_DELAY);
+                }
+                Err(category) => return Err(ProviderError::RequestFailed { category }),
+            }
+        }
+        Err(ProviderError::RequestFailed {
+            category: ProviderFailureCategory::RequestFailed,
+        })
+    }
 }
 
 /// A deterministic adapter for offline core tests.
@@ -197,9 +421,7 @@ pub fn parse_response(
     bundle: &EvidenceBundle,
 ) -> Result<ProviderResponse, ProviderError> {
     let response =
-        serde_json::from_str(response_json).map_err(|error| ProviderError::InvalidResponse {
-            message: error.to_string(),
-        })?;
+        serde_json::from_str(response_json).map_err(|_| ProviderError::InvalidResponse)?;
     validate_response(&response, bundle)?;
     Ok(response)
 }
@@ -215,9 +437,7 @@ pub fn validate_response(
     bundle: &EvidenceBundle,
 ) -> Result<(), ProviderError> {
     if response.schema_version != RESPONSE_SCHEMA_VERSION {
-        return Err(ProviderError::InvalidResponse {
-            message: format!("unsupported schema version {}", response.schema_version),
-        });
+        return Err(ProviderError::InvalidResponse);
     }
     let selected_paths = bundle
         .files
@@ -226,9 +446,7 @@ pub fn validate_response(
         .collect::<BTreeSet<_>>();
     for proposal in &response.proposals {
         if proposal.statement.trim().is_empty() {
-            return Err(ProviderError::InvalidResponse {
-                message: "proposal statement is empty".into(),
-            });
+            return Err(ProviderError::InvalidResponse);
         }
         if proposal.evidence_paths.is_empty()
             || proposal
@@ -236,9 +454,7 @@ pub fn validate_response(
                 .iter()
                 .any(|path| !selected_paths.contains(path.as_str()))
         {
-            return Err(ProviderError::InvalidResponse {
-                message: "proposal references unselected evidence".into(),
-            });
+            return Err(ProviderError::InvalidResponse);
         }
     }
     if response
@@ -246,9 +462,89 @@ pub fn validate_response(
         .iter()
         .any(|question| question.trim().is_empty())
     {
-        return Err(ProviderError::InvalidResponse {
-            message: "question is empty".into(),
-        });
+        return Err(ProviderError::InvalidResponse);
     }
     Ok(())
+}
+
+fn openrouter_request(model_id: &str, bundle: &EvidenceBundle) -> Result<Value, ProviderError> {
+    let evidence_json =
+        serde_json::to_string(bundle).map_err(|_| ProviderError::InvalidResponse)?;
+    let prompt = format!(
+        "PMEMC proposal schema version: {RESPONSE_SCHEMA_VERSION}\n\
+         Return only one JSON object with exactly schema_version, proposals, and questions.\n\
+         Each proposal must have exactly statement, lifecycle, confidence, and evidence_paths.\n\
+         lifecycle is committed or in_progress; confidence is exact, inferred, or user_confirmed.\n\
+         Never infer metrics, ownership, rationale, or claims without selected evidence.\n\
+         Put uncertainty in questions. Cite only evidence_paths supplied below.\n\
+         Approved evidence bundle:\n{evidence_json}"
+    );
+    Ok(json!({
+        "model": model_id,
+        "temperature": 0,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "pmemc_provider_response_v1",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["schema_version", "proposals", "questions"],
+                    "properties": {
+                        "schema_version": {"type": "integer", "const": RESPONSE_SCHEMA_VERSION},
+                        "proposals": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["statement", "lifecycle", "confidence", "evidence_paths"],
+                                "properties": {
+                                    "statement": {"type": "string", "minLength": 1},
+                                    "lifecycle": {"type": "string", "enum": ["committed", "in_progress"]},
+                                    "confidence": {"type": "string", "enum": ["exact", "inferred", "user_confirmed"]},
+                                    "evidence_paths": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "items": {"type": "string", "minLength": 1}
+                                    }
+                                }
+                            }
+                        },
+                        "questions": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1}
+                        }
+                    }
+                }
+            }
+        },
+        "messages": [
+            {"role": "system", "content": "You produce evidence-backed PMEMC project-memory proposals."},
+            {"role": "user", "content": prompt}
+        ]
+    }))
+}
+
+fn parse_openrouter_response(
+    response_body: &str,
+    bundle: &EvidenceBundle,
+) -> Result<ProviderResponse, ProviderError> {
+    let response: Value =
+        serde_json::from_str(response_body).map_err(|_| ProviderError::InvalidResponse)?;
+    let content = response
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .ok_or(ProviderError::InvalidResponse)?;
+    parse_response(content, bundle)
+}
+
+fn classify_ureq_error(error: ureq::Error) -> ProviderFailureCategory {
+    match error {
+        ureq::Error::StatusCode(401 | 403) => ProviderFailureCategory::Unauthorized,
+        ureq::Error::StatusCode(429) => ProviderFailureCategory::RateLimited,
+        ureq::Error::StatusCode(500..=599) => ProviderFailureCategory::TemporarilyUnavailable,
+        ureq::Error::Timeout(_) => ProviderFailureCategory::TimedOut,
+        _ => ProviderFailureCategory::RequestFailed,
+    }
 }
