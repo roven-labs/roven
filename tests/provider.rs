@@ -229,6 +229,36 @@ fn provider_results_are_pending_review_with_invocation_metadata() {
         malformed,
         Err(storage::StorageError::InvalidStoredEvidence)
     ));
+    connection
+        .execute(
+            "UPDATE proposals SET evidence_paths_json = '[\"src/lib.rs\"]' WHERE id = 1",
+            [],
+        )
+        .expect("fixture proposal should be restored");
+    storage::record_review_decision(
+        &data_paths,
+        1,
+        &storage::ReviewDecision::CorrectAndApprove {
+            statement: "The project provides the corrected run entry point.".into(),
+        },
+    )
+    .expect("correct-and-approve should retain an immutable decision");
+    let proposal_and_decision: (String, String, String, Option<String>) = connection
+        .query_row(
+            "SELECT p.statement, p.status, d.action, d.corrected_statement FROM proposals p JOIN review_decisions d ON d.proposal_id = p.id WHERE p.id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("original proposal and correction should be retained together");
+    assert_eq!(
+        proposal_and_decision,
+        (
+            "The project exposes a run function.".into(),
+            "approved".into(),
+            "corrected_and_approved".into(),
+            Some("The project provides the corrected run entry point.".into()),
+        )
+    );
 }
 
 #[test]

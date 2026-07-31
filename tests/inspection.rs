@@ -7,7 +7,11 @@ use std::{
 
 use pmemc::{
     git,
-    inspection::{build_incremental_bundle, build_initial_bundle},
+    inspection::{
+        EvidenceBundle, EvidenceFile, EvidenceState, build_incremental_bundle, build_initial_bundle,
+    },
+    provider::{ProviderInvocationMetadata, parse_response},
+    storage,
 };
 use support::TemporaryDirectory;
 
@@ -259,6 +263,135 @@ fn a_later_inspect_retries_the_retained_provider_attempt() {
         .expect("retry should not create another snapshot");
     assert_eq!((attempt_count, invocation_count, snapshot_count), (1, 2, 1));
     assert_eq!(retained_snapshot_id, original_snapshot_id);
+}
+
+#[test]
+fn review_interactively_approves_corrects_rejects_and_skips_without_losing_proposals() {
+    let data_directory = TemporaryDirectory::new();
+    let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
+    let project = storage::add_project(
+        &data_paths,
+        "fixture",
+        data_directory.path().join("repository").as_path(),
+        None,
+        None,
+    )
+    .expect("project should be stored");
+    let bundle = EvidenceBundle {
+        schema_version: 1,
+        project_id: format!("project-{}", project.id),
+        initial_inspection: true,
+        files: vec![EvidenceFile {
+            path: "src/lib.rs".into(),
+            state: EvidenceState::Committed,
+            content: "pub fn run() {}".into(),
+            redacted: false,
+        }],
+    };
+    let bundle_json = serde_json::to_string(&bundle).expect("bundle should serialize");
+    let attempt_id = storage::stage_inspection_attempt(&data_paths, project.id, 1, &bundle_json)
+        .expect("attempt should stage");
+    let response = parse_response(
+        r#"{"schema_version":1,"proposals":[
+            {"statement":"approve me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
+            {"statement":"correct me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
+            {"statement":"reject me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]},
+            {"statement":"skip me","lifecycle":"committed","confidence":"exact","evidence_paths":["src/lib.rs"]}
+        ],"questions":[]}"#,
+        &bundle,
+    )
+    .expect("fixture response should validate");
+    let metadata = ProviderInvocationMetadata::new("fake", "offline-test-model", 1)
+        .expect("metadata should validate");
+    storage::store_provider_response(&data_paths, attempt_id, &metadata, &response)
+        .expect("pending proposals should be stored");
+
+    let review = pmemc_with_input(
+        &data_directory,
+        &["review", &format!("project-{}", project.id)],
+        b"a\nc\ncorrected statement\nr\nnot supported by the evidence\ns\n",
+    );
+
+    assert!(review.status.success());
+    let output = String::from_utf8_lossy(&review.stdout);
+    assert!(output.contains("provider\tfake\toffline-test-model"));
+    assert!(output.contains("evidence\tsrc/lib.rs\tcommitted"));
+    let connection = rusqlite::Connection::open(data_paths.database_path())
+        .expect("database should be readable");
+    let proposal_statuses = connection
+        .prepare("SELECT status FROM proposals ORDER BY id")
+        .expect("status query should prepare")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("statuses should query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("statuses should decode");
+    assert_eq!(
+        proposal_statuses,
+        ["approved", "approved", "rejected", "pending_review"]
+    );
+    let correction: (String, String) = connection
+        .query_row(
+            "SELECT action, corrected_statement FROM review_decisions WHERE proposal_id = 2",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("correction should preserve an action and replacement");
+    assert_eq!(
+        correction,
+        (
+            "corrected_and_approved".into(),
+            "corrected statement".into()
+        )
+    );
+    let rejection_reason: String = connection
+        .query_row(
+            "SELECT reason FROM review_decisions WHERE proposal_id = 3",
+            [],
+            |row| row.get(0),
+        )
+        .expect("rejection reason should persist");
+    assert_eq!(rejection_reason, "not supported by the evidence");
+    let blank_correction = storage::record_review_decision(
+        &data_paths,
+        4,
+        &storage::ReviewDecision::CorrectAndApprove {
+            statement: "   ".into(),
+        },
+    );
+    assert!(matches!(
+        blank_correction,
+        Err(storage::StorageError::InvalidReviewDecision)
+    ));
+    let skipped_state: String = connection
+        .query_row("SELECT status FROM proposals WHERE id = 4", [], |row| {
+            row.get(0)
+        })
+        .expect("invalid correction must leave the skipped proposal pending");
+    let skipped_decision_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM review_decisions WHERE proposal_id = 4",
+            [],
+            |row| row.get(0),
+        )
+        .expect("invalid correction must not create a decision");
+    assert_eq!(
+        (skipped_state, skipped_decision_count),
+        ("pending_review".into(), 0)
+    );
+    let duplicate_decision =
+        storage::record_review_decision(&data_paths, 1, &storage::ReviewDecision::Approve);
+    assert!(matches!(
+        duplicate_decision,
+        Err(storage::StorageError::InvalidReviewDecision)
+    ));
+    let decision_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM review_decisions WHERE proposal_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("duplicate decision must not create a second record");
+    assert_eq!(decision_count, 1);
 }
 
 #[test]

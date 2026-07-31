@@ -262,6 +262,17 @@ pub struct PendingReviewProposal {
     pub model_id: String,
 }
 
+/// An operator's durable decision for one pending proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewDecision {
+    /// Accept the provider's original statement.
+    Approve,
+    /// Accept an operator-corrected statement while preserving the original.
+    CorrectAndApprove { statement: String },
+    /// Reject the proposal, optionally recording why.
+    Reject { reason: Option<String> },
+}
+
 impl Initialization {
     /// Return the initialized SQLite database file path.
     #[must_use]
@@ -326,6 +337,9 @@ pub enum StorageError {
         "stored inspection evidence is invalid; run a new inspection after resolving the local store"
     )]
     InvalidStoredEvidence,
+    /// A requested review action cannot be applied to a pending proposal.
+    #[error("review decision is invalid or the proposal is no longer pending")]
+    InvalidReviewDecision,
 }
 
 /// Resolve the default Windows local-data location used by `pmemc init`.
@@ -636,6 +650,64 @@ pub fn pending_review_proposals(
         })
     })
     .collect()
+}
+
+/// Persist an operator decision and remove the proposal from the pending queue.
+///
+/// The original provider proposal is never changed. A correction is stored next
+/// to it in the durable decision record for later finalization and audit.
+///
+/// # Errors
+///
+/// Returns an error if the proposal is not pending or SQLite cannot atomically
+/// retain the decision and proposal state.
+pub fn record_review_decision(
+    data_paths: &DataPaths,
+    proposal_id: i64,
+    decision: &ReviewDecision,
+) -> Result<(), StorageError> {
+    let (action, corrected_statement, reason, proposal_status) = match decision {
+        ReviewDecision::Approve => ("approved", None, None, "approved"),
+        ReviewDecision::CorrectAndApprove { statement } if !statement.trim().is_empty() => (
+            "corrected_and_approved",
+            Some(statement.as_str()),
+            None,
+            "approved",
+        ),
+        ReviewDecision::CorrectAndApprove { .. } => {
+            return Err(StorageError::InvalidReviewDecision);
+        }
+        ReviewDecision::Reject { reason } => (
+            "rejected",
+            None,
+            reason.as_deref().filter(|reason| !reason.trim().is_empty()),
+            "rejected",
+        ),
+    };
+    initialize(data_paths)?;
+    let mut connection = open_connection(&data_paths.database_path())
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let transaction = connection
+        .transaction()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let updated = transaction
+        .execute(
+            "UPDATE proposals SET status = ?1 WHERE id = ?2 AND status = 'pending_review'",
+            params![proposal_status, proposal_id],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    if updated != 1 {
+        return Err(StorageError::InvalidReviewDecision);
+    }
+    transaction
+        .execute(
+            "INSERT INTO review_decisions (proposal_id, action, corrected_statement, reason) VALUES (?1, ?2, ?3, ?4)",
+            params![proposal_id, action, corrected_statement, reason],
+        )
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    transaction
+        .commit()
+        .map_err(|source| StorageError::ProjectDatabase { source })
 }
 
 /// Persist a schema-validated provider response as pending review records.
