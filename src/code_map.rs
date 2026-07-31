@@ -2,19 +2,20 @@
 
 use std::{collections::BTreeMap, fs, path::Path};
 
+use serde::Serialize;
 use thiserror::Error;
 use tree_sitter::{Node, Parser};
 
 use crate::inventory::{InventoryError, Language, inventory};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SymbolKind {
     Function,
     Method,
     Struct,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Symbol {
     pub path: String,
     pub name: String,
@@ -22,7 +23,7 @@ pub struct Symbol {
     pub line: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DirectCall {
     pub caller: String,
     pub callee: String,
@@ -30,20 +31,20 @@ pub struct DirectCall {
     pub confidence: Confidence,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Confidence {
     Exact,
     Inferred,
     UserConfirmed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Evidence {
     pub path: String,
     pub line: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Import {
     pub source_path: String,
     pub target_path: String,
@@ -51,8 +52,9 @@ pub struct Import {
     pub confidence: Confidence,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct CodeMap {
+    pub files: Vec<crate::inventory::InventoryFile>,
     pub symbols: Vec<Symbol>,
     pub calls: Vec<DirectCall>,
     pub imports: Vec<Import>,
@@ -77,7 +79,10 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
         .iter()
         .map(|file| file.path.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    let mut map = CodeMap::default();
+    let mut map = CodeMap {
+        files: inventory.files.clone(),
+        ..CodeMap::default()
+    };
     let mut candidate_calls = Vec::new();
 
     for file in inventory.files {
@@ -207,6 +212,11 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
         ))
     });
     Ok(map)
+}
+
+/// Serialize the already-sorted compact map deterministically as JSON.
+pub fn serialize_code_map(map: &CodeMap) -> Result<String, serde_json::Error> {
+    serde_json::to_string(map)
 }
 
 /// Return exact direct-call neighbours for one unambiguous symbol name.

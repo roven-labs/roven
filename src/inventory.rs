@@ -7,17 +7,18 @@ use std::{
     process::Command,
 };
 
+use serde::Serialize;
 use thiserror::Error;
 
 /// One file eligible for structural extraction or generic fallback.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InventoryFile {
     pub path: String,
     pub language: Language,
 }
 
 /// The supported structural language or safe fallback classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Language {
     Rust,
     Python,
