@@ -26,6 +26,11 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
     .expect("Rust fixture should be written");
     std::fs::write(repository.path().join("broken.py"), "def unfinished(:\n")
         .expect("malformed fixture should be written");
+    std::fs::write(
+        repository.path().join("good.py"),
+        "def caller():\n    py_helper()\n\ndef py_helper():\n    pass\n",
+    )
+    .expect("Python fixture should be written");
 
     let map = build_code_map(repository.path()).expect("map should be built");
 
@@ -50,4 +55,14 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
             .any(|call| call.caller == "run" && call.callee == "helper")
     );
     assert!(map.unsupported_paths.contains(&"broken.py".into()));
+    assert!(
+        map.symbols
+            .iter()
+            .any(|symbol| symbol.name == "caller" && symbol.kind == SymbolKind::Function)
+    );
+    assert!(
+        map.calls
+            .iter()
+            .any(|call| call.caller == "caller" && call.callee == "py_helper")
+    );
 }

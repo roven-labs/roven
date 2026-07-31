@@ -52,7 +52,7 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
     let mut candidate_calls = Vec::new();
 
     for file in inventory.files {
-        if file.language != Language::Rust {
+        if !matches!(file.language, Language::Rust | Language::Python) {
             if !matches!(file.language, Language::GenericText) {
                 map.unsupported_paths.push(file.path);
             }
@@ -62,7 +62,12 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
             map.unsupported_paths.push(file.path);
             continue;
         };
-        let Some(tree) = rust_tree(&source) else {
+        let tree = match file.language {
+            Language::Rust => rust_tree(&source),
+            Language::Python => python_tree(&source),
+            _ => None,
+        };
+        let Some(tree) = tree else {
             map.unsupported_paths.push(file.path);
             continue;
         };
@@ -70,14 +75,25 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
             map.unsupported_paths.push(file.path);
             continue;
         }
-        visit_rust(
-            tree.root_node(),
-            source.as_bytes(),
-            &file.path,
-            None,
-            &mut map.symbols,
-            &mut candidate_calls,
-        );
+        match file.language {
+            Language::Rust => visit_rust(
+                tree.root_node(),
+                source.as_bytes(),
+                &file.path,
+                None,
+                &mut map.symbols,
+                &mut candidate_calls,
+            ),
+            Language::Python => visit_python(
+                tree.root_node(),
+                source.as_bytes(),
+                &file.path,
+                None,
+                &mut map.symbols,
+                &mut candidate_calls,
+            ),
+            _ => unreachable!("only structural languages reach this branch"),
+        }
     }
 
     let counts = map
@@ -106,6 +122,57 @@ fn rust_tree(source: &str) -> Option<tree_sitter::Tree> {
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .ok()?;
     parser.parse(source, None)
+}
+
+fn python_tree(source: &str) -> Option<tree_sitter::Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .ok()?;
+    parser.parse(source, None)
+}
+
+fn visit_python(
+    node: Node<'_>,
+    source: &[u8],
+    path: &str,
+    current_function: Option<&str>,
+    symbols: &mut Vec<Symbol>,
+    calls: &mut Vec<DirectCall>,
+) {
+    let mut next_function = current_function;
+    if node.kind() == "function_definition" {
+        if let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|node| node.utf8_text(source).ok())
+        {
+            symbols.push(Symbol {
+                path: path.into(),
+                name: name.into(),
+                kind: SymbolKind::Function,
+                line: node.start_position().row + 1,
+            });
+            next_function = Some(name);
+        }
+    } else if node.kind() == "call"
+        && let (Some(caller), Some(callee)) = (
+            current_function,
+            node.child_by_field_name("function")
+                .and_then(|node| node.utf8_text(source).ok()),
+        )
+        && callee
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+    {
+        calls.push(DirectCall {
+            caller: caller.into(),
+            callee: callee.into(),
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_python(child, source, path, next_function, symbols, calls);
+    }
 }
 
 fn visit_rust(
