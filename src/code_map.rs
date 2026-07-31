@@ -12,7 +12,12 @@ use crate::inventory::{InventoryError, Language, inventory};
 pub enum SymbolKind {
     Function,
     Method,
+    Class,
+    Interface,
+    Trait,
     Struct,
+    Enum,
+    Module,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -209,6 +214,7 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
     let counts = map
         .symbols
         .iter()
+        .filter(|symbol| matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method))
         .fold(BTreeMap::new(), |mut counts, symbol| {
             *counts.entry(symbol.name.as_str()).or_insert(0_usize) += 1;
             counts
@@ -306,7 +312,10 @@ pub fn structural_neighbors(map: &CodeMap, symbol_name: &str) -> Vec<Symbol> {
     let mut neighbours = map
         .symbols
         .iter()
-        .filter(|symbol| names.contains(symbol.name.as_str()))
+        .filter(|symbol| {
+            matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method)
+                && names.contains(symbol.name.as_str())
+        })
         .cloned()
         .collect::<Vec<_>>();
     neighbours.sort_by(|left, right| {
@@ -644,6 +653,24 @@ fn visit_rust(
                 path: path.into(),
                 name: name.into(),
                 kind: SymbolKind::Struct,
+                line: node.start_position().row + 1,
+            });
+        }
+    } else if matches!(node.kind(), "trait_item" | "enum_item" | "mod_item") {
+        if let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|node| node.utf8_text(source).ok())
+        {
+            let kind = match node.kind() {
+                "trait_item" => SymbolKind::Trait,
+                "enum_item" => SymbolKind::Enum,
+                "mod_item" => SymbolKind::Module,
+                _ => unreachable!("Rust symbol kind was filtered above"),
+            };
+            symbols.push(Symbol {
+                path: path.into(),
+                name: name.into(),
+                kind,
                 line: node.start_position().row + 1,
             });
         }

@@ -23,7 +23,7 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
     std::fs::create_dir_all(repository.path().join("src")).expect("source directory should exist");
     std::fs::write(
         repository.path().join("src/lib.rs"),
-        "mod helper;\nuse crate::helper::utility;\npub struct Service;\nimpl Service { pub fn start(&self) {} }\npub fn run() { helper(); utility(); }\nfn helper() {}\n",
+        "mod helper;\nuse crate::helper::utility;\npub trait Worker {}\npub enum State { Ready }\npub struct Service;\nimpl Service { pub fn start(&self) {} }\npub fn run() { helper(); utility(); }\nfn helper() {}\n",
     )
     .expect("Rust fixture should be written");
     std::fs::write(
@@ -85,6 +85,21 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
         map.symbols
             .iter()
             .any(|symbol| symbol.name == "run" && symbol.kind == SymbolKind::Function)
+    );
+    assert!(
+        map.symbols
+            .iter()
+            .any(|symbol| symbol.name == "Worker" && symbol.kind == SymbolKind::Trait)
+    );
+    assert!(
+        map.symbols
+            .iter()
+            .any(|symbol| symbol.name == "State" && symbol.kind == SymbolKind::Enum)
+    );
+    assert!(
+        map.symbols
+            .iter()
+            .any(|symbol| symbol.name == "helper" && symbol.kind == SymbolKind::Module)
     );
     assert!(
         map.calls
