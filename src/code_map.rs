@@ -208,6 +208,17 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
                 &known_paths,
                 &mut map.imports,
             );
+        } else if matches!(
+            file.language,
+            Language::JavaScript | Language::TypeScript | Language::Jsx | Language::Tsx
+        ) {
+            collect_ecmascript_imports(
+                tree.root_node(),
+                source.as_bytes(),
+                &file.path,
+                &known_paths,
+                &mut map.imports,
+            );
         }
     }
 
@@ -364,6 +375,67 @@ fn rust_import_target(
     [format!("src/{module}.rs"), format!("src/{module}/mod.rs")]
         .into_iter()
         .find(|candidate| known_paths.contains(candidate))
+}
+
+fn collect_ecmascript_imports(
+    node: Node<'_>,
+    source: &[u8],
+    path: &str,
+    known_paths: &std::collections::BTreeSet<String>,
+    imports: &mut Vec<Import>,
+) {
+    if node.kind() == "import_statement"
+        && let Some(text) = node.utf8_text(source).ok()
+        && let Some(module) = text
+            .split("from")
+            .nth(1)
+            .map(str::trim)
+            .or_else(|| text.trim().strip_prefix("import").map(str::trim))
+        && let Some(module) = module
+            .trim_end_matches(';')
+            .trim()
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                module
+                    .trim_end_matches(';')
+                    .trim()
+                    .strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })
+        && let Some(target_path) = relative_import_target(path, module, known_paths)
+    {
+        imports.push(Import {
+            source_path: path.into(),
+            target_path,
+            evidence: Evidence {
+                path: path.into(),
+                line: node.start_position().row + 1,
+            },
+            confidence: Confidence::Exact,
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_ecmascript_imports(child, source, path, known_paths, imports);
+    }
+}
+
+fn relative_import_target(
+    source_path: &str,
+    module: &str,
+    known_paths: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    let module = module.strip_prefix("./")?;
+    let directory = source_path
+        .rsplit_once('/')
+        .map_or("", |(directory, _)| directory);
+    let candidate = if directory.is_empty() {
+        module.into()
+    } else {
+        format!("{directory}/{module}")
+    };
+    known_paths.contains(&candidate).then_some(candidate)
 }
 
 fn rust_tree(source: &str) -> Option<tree_sitter::Tree> {

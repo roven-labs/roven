@@ -40,9 +40,14 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
     .expect("Python fixture should be written");
     std::fs::write(
         repository.path().join("web.js"),
-        "function webCaller() { webHelper(); }\nfunction webHelper() {}\n",
+        "import { utility } from \"./util.js\";\nfunction webCaller() { webHelper(); }\nfunction webHelper() {}\n",
     )
     .expect("JavaScript fixture should be written");
+    std::fs::write(
+        repository.path().join("util.js"),
+        "export function utility() {}\n",
+    )
+    .expect("JavaScript utility fixture should be written");
     std::fs::write(
         repository.path().join("typed.ts"),
         "class Typed {}\ninterface Shape {}\nenum Mode { Ready }\nfunction typedCaller(): void { typedHelper(); }\nfunction typedHelper(): void {}\n",
@@ -180,12 +185,17 @@ fn rust_symbols_and_unambiguous_calls_are_deterministic_and_malformed_files_do_n
     assert!(map.imports.iter().any(|import| {
         import.source_path == "src/lib.rs" && import.target_path == "src/helper.rs"
     }));
+    assert!(
+        map.imports
+            .iter()
+            .any(|import| { import.source_path == "web.js" && import.target_path == "util.js" })
+    );
     let neighbors = structural_neighbors(&map, "run");
     let neighbor_names = neighbors
         .iter()
         .map(|symbol| symbol.name.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(neighbor_names, ["helper", "utility"]);
+    assert_eq!(neighbor_names, ["helper"]);
     let repeat = build_code_map(repository.path()).expect("repeat map should be built");
     assert_eq!(
         serialize_code_map(&map).expect("map should serialize"),
