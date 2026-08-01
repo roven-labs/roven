@@ -168,7 +168,10 @@ fn build_bundle(
         if !selected_paths.contains(&file.path) || remaining_bytes == 0 {
             continue;
         }
-        let Ok(content) = fs::read_to_string(repository.join(&file.path)) else {
+        let Some(path) = crate::inventory::contained_path(repository, &file.path) else {
+            continue;
+        };
+        let Ok(content) = fs::read_to_string(path) else {
             continue;
         };
         let limit = remaining_bytes.min(MAX_FILE_BYTES);
@@ -247,8 +250,9 @@ fn incremental_paths(code_map: &CodeMap, status: &WorkingTreeStatus) -> BTreeSet
 
 fn changed_paths(status: &WorkingTreeStatus) -> BTreeSet<&str> {
     status
-        .added_paths
+        .committed_paths
         .iter()
+        .chain(&status.added_paths)
         .chain(&status.modified_paths)
         .chain(&status.untracked_paths)
         .chain(&status.staged_paths)
@@ -328,8 +332,14 @@ fn redact_suspected_secrets(content: String) -> (String, bool) {
         let looks_sensitive = [
             "api_key",
             "api_token",
+            "access_key",
+            "bearer",
             "password",
             "secret",
+            "client_secret",
+            "database_url",
+            "connection_string",
+            "dsn",
             "token",
             "authorization",
             "private_key",

@@ -35,6 +35,8 @@ pub enum PathRelationshipKind {
 /// A single read-only snapshot of a repository working tree.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkingTreeStatus {
+    /// Paths changed by commits after the approved baseline.
+    pub committed_paths: Vec<String>,
     pub added_paths: Vec<String>,
     pub modified_paths: Vec<String>,
     pub untracked_paths: Vec<String>,
@@ -164,6 +166,38 @@ pub fn commit_count_since(path: &Path, observed_commit: &str) -> Result<u64, Git
             path: path.into(),
             value: count,
         })
+}
+
+/// Return paths changed by commits after an approved baseline commit.
+///
+/// # Errors
+///
+/// Returns an error when Git cannot compare the observed commit with `HEAD`.
+pub fn committed_paths_since(path: &Path, observed_commit: &str) -> Result<Vec<String>, GitError> {
+    let revision_range = format!("{observed_commit}..HEAD");
+    Ok(
+        run_bytes(path, &["diff", "--name-only", "-z", &revision_range])?
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+            .map(|record| String::from_utf8_lossy(record).into_owned())
+            .collect(),
+    )
+}
+
+/// Return Git's content fingerprint for a current working-tree path.
+///
+/// Git reads the file through its own executable, so callers can compare
+/// working-tree content without opening repository files in the application.
+///
+/// # Errors
+///
+/// Returns an error when Git cannot hash the path.
+pub fn working_tree_fingerprint(path: &Path, relative_path: &str) -> Result<String, GitError> {
+    Ok(
+        run(path, &["hash-object", "--no-filters", "--", relative_path])?
+            .trim()
+            .to_owned(),
+    )
 }
 
 fn parse_working_tree_status(output: &[u8]) -> WorkingTreeStatus {

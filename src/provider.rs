@@ -1,19 +1,32 @@
 //! Narrow, validated model-provider boundary for inspection proposals.
 
-use std::{collections::BTreeSet, env, fmt, thread, time::Duration};
+use std::{cell::RefCell, collections::BTreeSet, env, fmt, thread, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::inspection::EvidenceBundle;
+use crate::{
+    credentials,
+    inspection::{EvidenceBundle, EvidenceState},
+};
 
 const RESPONSE_SCHEMA_VERSION: u8 = 1;
 const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
+pub const DEFAULT_MODEL_ID: &str = "openrouter/free";
+const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const DEFAULT_MAX_ATTEMPTS: u8 = 3;
 const MAX_ATTEMPTS: u8 = 3;
 const RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Return the configured model override or the free OpenRouter router.
+#[must_use]
+pub fn configured_model_id() -> String {
+    env::var("PMEMC_OPENROUTER_MODEL")
+        .ok()
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL_ID.to_owned())
+}
 
 /// Non-secret metadata recorded for each provider invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +81,24 @@ pub enum ProviderFailureCategory {
     RequestFailed,
     /// The provider had a retryable service failure.
     TemporarilyUnavailable,
+}
+
+/// A safe transport failure returned by an OpenRouter adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenRouterTransportError {
+    /// Durable failure classification.
+    pub category: ProviderFailureCategory,
+    /// Bounded, non-secret diagnostic for the operator.
+    pub detail: String,
+}
+
+impl OpenRouterTransportError {
+    fn new(category: ProviderFailureCategory, detail: impl Into<String>) -> Self {
+        Self {
+            category,
+            detail: detail.into(),
+        }
+    }
 }
 
 impl ProviderFailureCategory {
@@ -155,16 +186,21 @@ pub struct ProviderResponse {
 /// Errors from an untrusted provider response or provider invocation.
 #[derive(Debug, Error)]
 pub enum ProviderError {
-    #[error("provider response is invalid; no proposals were stored")]
-    InvalidResponse,
-    #[error("OPENROUTER_API_KEY is required to inspect a project")]
+    #[error("provider response is invalid ({reason}); no proposals were stored")]
+    InvalidResponse { reason: &'static str },
+    #[error(
+        "OpenRouter credential is required; run `pmemc auth set` or configure OPENROUTER_API_KEY"
+    )]
     MissingApiKey,
     #[error(
-        "OpenRouter configuration is invalid; set PMEMC_OPENROUTER_MODEL and valid bounded settings"
+        "OpenRouter configuration is invalid; check PMEMC_OPENROUTER_MODEL and bounded settings"
     )]
     InvalidConfiguration,
-    #[error("OpenRouter request failed ({category})")]
-    RequestFailed { category: ProviderFailureCategory },
+    #[error("OpenRouter request failed ({category}): {detail}")]
+    RequestFailed {
+        category: ProviderFailureCategory,
+        detail: String,
+    },
 }
 
 impl ProviderError {
@@ -172,8 +208,8 @@ impl ProviderError {
     #[must_use]
     pub const fn failure_category(&self) -> Option<ProviderFailureCategory> {
         match self {
-            Self::InvalidResponse => Some(ProviderFailureCategory::InvalidResponse),
-            Self::RequestFailed { category } => Some(*category),
+            Self::InvalidResponse { .. } => Some(ProviderFailureCategory::InvalidResponse),
+            Self::RequestFailed { category, .. } => Some(*category),
             Self::MissingApiKey | Self::InvalidConfiguration => {
                 Some(ProviderFailureCategory::Configuration)
             }
@@ -227,8 +263,9 @@ impl OpenRouterConfig {
 
     /// Read non-secret provider configuration from the process environment.
     ///
-    /// `PMEMC_OPENROUTER_MODEL` is required. `PMEMC_OPENROUTER_TIMEOUT_SECS`
-    /// and `PMEMC_OPENROUTER_MAX_ATTEMPTS` default to bounded values.
+    /// `PMEMC_OPENROUTER_MODEL` overrides [`DEFAULT_MODEL_ID`].
+    /// `PMEMC_OPENROUTER_TIMEOUT_SECS` and `PMEMC_OPENROUTER_MAX_ATTEMPTS`
+    /// default to bounded values.
     ///
     /// # Errors
     ///
@@ -245,8 +282,9 @@ impl OpenRouterConfig {
     pub fn from_environment_with(
         value: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, ProviderError> {
-        let model_id =
-            value("PMEMC_OPENROUTER_MODEL").ok_or(ProviderError::InvalidConfiguration)?;
+        let model_id = value("PMEMC_OPENROUTER_MODEL")
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_MODEL_ID.to_owned());
         let timeout_seconds = value("PMEMC_OPENROUTER_TIMEOUT_SECS")
             .map_or(Ok(DEFAULT_TIMEOUT_SECONDS), |value| value.parse::<u64>())
             .map_err(|_| ProviderError::InvalidConfiguration)?;
@@ -254,6 +292,12 @@ impl OpenRouterConfig {
             .map_or(Ok(DEFAULT_MAX_ATTEMPTS), |value| value.parse::<u8>())
             .map_err(|_| ProviderError::InvalidConfiguration)?;
         Self::new(model_id, Duration::from_secs(timeout_seconds), max_attempts)
+    }
+
+    /// Return the configured model identifier.
+    #[must_use]
+    pub fn model_id(&self) -> &str {
+        &self.model_id
     }
 
     /// Return metadata that is safe to persist with proposals.
@@ -270,7 +314,7 @@ impl OpenRouterConfig {
 /// Synchronous transport boundary allowing provider tests to run without a network.
 pub trait OpenRouterTransport {
     /// Send one OpenRouter completion request and return the raw response body.
-    fn complete(&self, api_key: &str, request: &Value) -> Result<String, ProviderFailureCategory>;
+    fn complete(&self, api_key: &str, request: &Value) -> Result<String, OpenRouterTransportError>;
 }
 
 /// Production HTTPS transport for OpenRouter.
@@ -282,6 +326,7 @@ impl UreqOpenRouterTransport {
     fn new(timeout: Duration) -> Self {
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
+            .http_status_as_error(false)
             .https_only(true)
             .build()
             .new_agent();
@@ -290,19 +335,35 @@ impl UreqOpenRouterTransport {
 }
 
 impl OpenRouterTransport for UreqOpenRouterTransport {
-    fn complete(&self, api_key: &str, request: &Value) -> Result<String, ProviderFailureCategory> {
+    fn complete(&self, api_key: &str, request: &Value) -> Result<String, OpenRouterTransportError> {
         let authorization = format!("Bearer {api_key}");
         let mut response = self
             .agent
             .post(OPENROUTER_CHAT_COMPLETIONS_URL)
             .header("Authorization", &authorization)
             .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("Accept-Encoding", "identity")
             .send_json(request)
             .map_err(classify_ureq_error)?;
-        response
-            .body_mut()
-            .read_to_string()
-            .map_err(|_| ProviderFailureCategory::RequestFailed)
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_string().map_err(|error| {
+            let category = match &error {
+                ureq::Error::Timeout(_) => ProviderFailureCategory::TimedOut,
+                _ => classify_status(status),
+            };
+            OpenRouterTransportError::new(
+                category,
+                format!("HTTP status {status}; response body could not be read: {error}"),
+            )
+        })?;
+        if !(200..=299).contains(&status) {
+            return Err(OpenRouterTransportError::new(
+                classify_status(status),
+                openrouter_error_detail(&body, status),
+            ));
+        }
+        Ok(body)
     }
 }
 
@@ -311,25 +372,28 @@ pub struct OpenRouterProvider<T = UreqOpenRouterTransport> {
     config: OpenRouterConfig,
     api_key: String,
     transport: T,
+    actual_model_id: RefCell<Option<String>>,
 }
 
 impl OpenRouterProvider<UreqOpenRouterTransport> {
-    /// Construct the production adapter from its documented environment values.
+    /// Construct the production adapter from the OS credential store or CI environment.
     ///
     /// # Errors
     ///
     /// Returns an error when the key or non-secret configuration is unavailable.
     pub fn from_environment() -> Result<Self, ProviderError> {
-        let api_key = env::var("OPENROUTER_API_KEY")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(ProviderError::MissingApiKey)?;
+        let api_key = credentials::openrouter_api_key().map_err(|error| match error {
+            credentials::CredentialError::Missing
+            | credentials::CredentialError::StoreUnavailable => ProviderError::MissingApiKey,
+            _ => ProviderError::InvalidConfiguration,
+        })?;
         let config = OpenRouterConfig::from_environment()?;
         let transport = UreqOpenRouterTransport::new(config.timeout);
         Ok(Self {
             config,
             api_key,
             transport,
+            actual_model_id: RefCell::new(None),
         })
     }
 }
@@ -346,34 +410,50 @@ impl<T> OpenRouterProvider<T> {
             config,
             api_key: api_key.into(),
             transport,
+            actual_model_id: RefCell::new(None),
         }
     }
 }
 
 impl<T: OpenRouterTransport> ModelProvider for OpenRouterProvider<T> {
     fn metadata(&self) -> ProviderInvocationMetadata {
-        self.config.metadata()
+        let mut metadata = self.config.metadata();
+        if let Some(actual_model_id) = self.actual_model_id.borrow().clone() {
+            metadata.model_id = actual_model_id;
+        }
+        metadata
     }
 
     fn propose(&self, bundle: &EvidenceBundle) -> Result<ProviderResponse, ProviderError> {
+        self.actual_model_id.replace(None);
         let request = openrouter_request(&self.config.model_id, bundle)?;
         for attempt in 0..self.config.max_attempts {
             match self.transport.complete(&self.api_key, &request) {
-                Ok(body) => return parse_openrouter_response(&body, bundle),
-                Err(category)
+                Ok(body) => {
+                    let (response, actual_model_id) = parse_openrouter_response(&body, bundle)?;
+                    self.actual_model_id.replace(actual_model_id);
+                    return Ok(response);
+                }
+                Err(error)
                     if matches!(
-                        category,
+                        error.category,
                         ProviderFailureCategory::RateLimited
                             | ProviderFailureCategory::TemporarilyUnavailable
                     ) && attempt + 1 < self.config.max_attempts =>
                 {
                     thread::sleep(RETRY_DELAY);
                 }
-                Err(category) => return Err(ProviderError::RequestFailed { category }),
+                Err(error) => {
+                    return Err(ProviderError::RequestFailed {
+                        category: error.category,
+                        detail: error.detail,
+                    });
+                }
             }
         }
         Err(ProviderError::RequestFailed {
             category: ProviderFailureCategory::RequestFailed,
+            detail: "request attempts exhausted".into(),
         })
     }
 }
@@ -421,8 +501,8 @@ pub fn parse_response(
     response_json: &str,
     bundle: &EvidenceBundle,
 ) -> Result<ProviderResponse, ProviderError> {
-    let response =
-        serde_json::from_str(response_json).map_err(|_| ProviderError::InvalidResponse)?;
+    let response = serde_json::from_str(response_json)
+        .map_err(|_| invalid_response("model content did not match PMEMC response schema"))?;
     validate_response(&response, bundle)?;
     Ok(response)
 }
@@ -438,7 +518,7 @@ pub fn validate_response(
     bundle: &EvidenceBundle,
 ) -> Result<(), ProviderError> {
     if response.schema_version != RESPONSE_SCHEMA_VERSION {
-        return Err(ProviderError::InvalidResponse);
+        return Err(invalid_response("schema version was unsupported"));
     }
     let selected_paths = bundle
         .files
@@ -447,10 +527,10 @@ pub fn validate_response(
         .collect::<BTreeSet<_>>();
     for proposal in &response.proposals {
         if !valid_fact_kind(&proposal.fact_kind) {
-            return Err(ProviderError::InvalidResponse);
+            return Err(invalid_response("proposal fact kind was invalid"));
         }
         if proposal.statement.trim().is_empty() {
-            return Err(ProviderError::InvalidResponse);
+            return Err(invalid_response("proposal statement was blank"));
         }
         if proposal.evidence_paths.is_empty()
             || proposal
@@ -464,7 +544,20 @@ pub fn validate_response(
                 .iter()
                 .any(|path| !selected_paths.contains(path.as_str()))
         {
-            return Err(ProviderError::InvalidResponse);
+            return Err(invalid_response("proposal evidence paths were invalid"));
+        }
+        if proposal.lifecycle == ProposedLifecycle::Committed
+            && proposal.evidence_paths.iter().any(|path| {
+                bundle
+                    .files
+                    .iter()
+                    .find(|file| file.path == *path)
+                    .is_none_or(|file| file.state != EvidenceState::Committed)
+            })
+        {
+            return Err(invalid_response(
+                "committed proposal cited non-committed evidence",
+            ));
         }
     }
     if response
@@ -472,9 +565,13 @@ pub fn validate_response(
         .iter()
         .any(|question| question.trim().is_empty())
     {
-        return Err(ProviderError::InvalidResponse);
+        return Err(invalid_response("provider question was blank"));
     }
     Ok(())
+}
+
+fn invalid_response(reason: &'static str) -> ProviderError {
+    ProviderError::InvalidResponse { reason }
 }
 
 fn valid_fact_kind(fact_kind: &str) -> bool {
@@ -486,8 +583,8 @@ fn valid_fact_kind(fact_kind: &str) -> bool {
 }
 
 fn openrouter_request(model_id: &str, bundle: &EvidenceBundle) -> Result<Value, ProviderError> {
-    let evidence_json =
-        serde_json::to_string(bundle).map_err(|_| ProviderError::InvalidResponse)?;
+    let evidence_json = serde_json::to_string(bundle)
+        .map_err(|_| invalid_response("evidence bundle could not be serialized"))?;
     let prompt = format!(
         "PMEMC proposal schema version: {RESPONSE_SCHEMA_VERSION}\n\
          Return only one JSON object with exactly schema_version, proposals, and questions.\n\
@@ -549,22 +646,78 @@ fn openrouter_request(model_id: &str, bundle: &EvidenceBundle) -> Result<Value, 
 fn parse_openrouter_response(
     response_body: &str,
     bundle: &EvidenceBundle,
-) -> Result<ProviderResponse, ProviderError> {
-    let response: Value =
-        serde_json::from_str(response_body).map_err(|_| ProviderError::InvalidResponse)?;
+) -> Result<(ProviderResponse, Option<String>), ProviderError> {
+    let response: Value = serde_json::from_str(response_body)
+        .map_err(|_| invalid_response("provider envelope was not valid JSON"))?;
+    let actual_model_id = response
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.trim().is_empty())
+        .map(str::to_owned);
     let content = response
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
-        .ok_or(ProviderError::InvalidResponse)?;
-    parse_response(content, bundle)
+        .ok_or_else(|| invalid_response("provider envelope did not contain response content"))?;
+    Ok((parse_response(content, bundle)?, actual_model_id))
 }
 
-fn classify_ureq_error(error: ureq::Error) -> ProviderFailureCategory {
+fn classify_ureq_error(error: ureq::Error) -> OpenRouterTransportError {
     match error {
-        ureq::Error::StatusCode(401 | 403) => ProviderFailureCategory::Unauthorized,
-        ureq::Error::StatusCode(429) => ProviderFailureCategory::RateLimited,
-        ureq::Error::StatusCode(500..=599) => ProviderFailureCategory::TemporarilyUnavailable,
-        ureq::Error::Timeout(_) => ProviderFailureCategory::TimedOut,
+        ureq::Error::StatusCode(status) => {
+            OpenRouterTransportError::new(classify_status(status), format!("HTTP status {status}"))
+        }
+        ureq::Error::Timeout(_) => {
+            OpenRouterTransportError::new(ProviderFailureCategory::TimedOut, "request timed out")
+        }
+        _ => OpenRouterTransportError::new(
+            ProviderFailureCategory::RequestFailed,
+            "network transport failed",
+        ),
+    }
+}
+
+fn classify_status(status: u16) -> ProviderFailureCategory {
+    match status {
+        401 | 403 => ProviderFailureCategory::Unauthorized,
+        429 => ProviderFailureCategory::RateLimited,
+        500..=599 => ProviderFailureCategory::TemporarilyUnavailable,
         _ => ProviderFailureCategory::RequestFailed,
+    }
+}
+
+fn openrouter_error_detail(body: &str, status: u16) -> String {
+    let message = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .map(|message| message.trim().to_owned())
+        .filter(|message| !message.is_empty())
+        .unwrap_or_default();
+    if message.is_empty() {
+        return format!("HTTP status {status}");
+    }
+    message
+        .chars()
+        .filter(|character| !character.is_control() || *character == '\t')
+        .take(512)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::openrouter_error_detail;
+
+    #[test]
+    fn provider_error_details_are_bounded_and_read_from_openrouter_errors() {
+        let detail = openrouter_error_detail(
+            r#"{"error":{"code":400,"message":"invalid response format"}}"#,
+            400,
+        );
+        assert_eq!(detail, "invalid response format");
+        assert!(openrouter_error_detail("{}", 413).contains("413"));
     }
 }

@@ -67,7 +67,10 @@ pub fn inventory(repository: &Path) -> Result<Inventory, InventoryError> {
         .filter(|path| !path.is_empty())
         .map(|path| String::from_utf8_lossy(path).into_owned())
         .filter(|path| !is_excluded(path, &patterns))
-        .filter(|path| !is_binary(&root.join(path)))
+        .filter_map(|path| {
+            let contained = contained_path(&root, &path)?;
+            (!is_binary(&contained)).then_some(path)
+        })
         .map(|path| InventoryFile {
             language: language_for(&path),
             path,
@@ -75,6 +78,17 @@ pub fn inventory(repository: &Path) -> Result<Inventory, InventoryError> {
         .collect::<Vec<_>>();
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(Inventory { files })
+}
+
+/// Canonicalize a repository-relative path and reject symlink escapes.
+#[must_use]
+pub fn contained_path(root: &Path, relative_path: &str) -> Option<PathBuf> {
+    let canonical_root = fs::canonicalize(root).ok()?;
+    let candidate = fs::canonicalize(root.join(relative_path)).ok()?;
+    candidate
+        .strip_prefix(&canonical_root)
+        .is_ok()
+        .then_some(candidate)
 }
 
 fn git_paths(root: &Path) -> Result<Vec<u8>, InventoryError> {
@@ -130,6 +144,9 @@ fn is_credential_path(path: &str) -> bool {
     let filename = path.rsplit('/').next().unwrap_or(path);
     filename == ".env"
         || filename.starts_with(".env.")
+        || matches!(filename, ".npmrc" | ".pypirc" | ".netrc" | "credentials")
+        || filename.starts_with("id_rsa")
+        || filename.starts_with("id_ecdsa")
         || [".pem", ".key", ".p12", ".pfx"]
             .iter()
             .any(|extension| filename.ends_with(extension))

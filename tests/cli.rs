@@ -15,9 +15,14 @@ fn help_describes_the_version_one_command_surface() {
 
     let stdout = String::from_utf8(output.stdout).expect("help should be UTF-8");
     assert!(stdout.contains("Project Memory CLI"));
-    for command in ["init", "project", "status", "inspect", "review", "history"] {
+    for command in [
+        "init", "project", "status", "inspect", "review", "history", "auth",
+    ] {
         assert!(stdout.contains(command), "help should list `{command}`");
     }
+    let project_help = pmemc(&["project", "--help"]);
+    assert!(project_help.status.success());
+    assert!(String::from_utf8_lossy(&project_help.stdout).contains("forget"));
 }
 
 #[test]

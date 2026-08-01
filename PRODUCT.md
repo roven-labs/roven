@@ -38,6 +38,11 @@ Version 1 promises that:
 7. Local project memory remains on the operator's laptop.
 8. A provider, parsing, or Git failure cannot corrupt already verified facts.
 
+The operator may explicitly use `pmemc project forget <project-id>` to erase
+one project's PMEMC registration and memory. This destructive action requires
+exact confirmation and never changes the source repository, Git state,
+credentials, or other projects.
+
 ## Evidence and authority policy
 
 Evidence sources can include:
@@ -91,7 +96,7 @@ The model:
 - Cannot finalize a baseline.
 - Cannot write directly to verified memory.
 
-Provider keys are supplied through environment variables and are never written to the repository or PMEMC database.
+Local provider keys are stored in the operating-system credential store and are never written to the repository or PMEMC database. CI may supply `OPENROUTER_API_KEY` as a runtime fallback.
 
 ## Long-term context — not authorized Version 1 scope
 

@@ -1,8 +1,9 @@
 use pmemc::{
     inspection::{EvidenceBundle, EvidenceFile, EvidenceState},
     provider::{
-        FakeProvider, ModelProvider, Proposal, ProposedConfidence, ProposedLifecycle,
-        ProviderFailureCategory, ProviderInvocationMetadata, ProviderResponse, parse_response,
+        FakeProvider, ModelProvider, OpenRouterTransportError, Proposal, ProposedConfidence,
+        ProposedLifecycle, ProviderFailureCategory, ProviderInvocationMetadata, ProviderResponse,
+        parse_response,
     },
     storage,
 };
@@ -42,7 +43,11 @@ impl ScriptedTransport {
 }
 
 impl OpenRouterTransport for ScriptedTransport {
-    fn complete(&self, _api_key: &str, request: &Value) -> Result<String, ProviderFailureCategory> {
+    fn complete(
+        &self,
+        _api_key: &str,
+        request: &Value,
+    ) -> Result<String, OpenRouterTransportError> {
         self.requests
             .lock()
             .expect("requests lock should work")
@@ -52,21 +57,47 @@ impl OpenRouterTransport for ScriptedTransport {
             .expect("results lock should work")
             .pop_front()
             .expect("test response should be available")
+            .map_err(|category| OpenRouterTransportError {
+                category,
+                detail: category.to_string(),
+            })
     }
 }
 
 fn bundle() -> EvidenceBundle {
+    bundle_with_state(EvidenceState::Committed)
+}
+
+fn bundle_with_state(state: EvidenceState) -> EvidenceBundle {
     EvidenceBundle {
         schema_version: 1,
         project_id: "project-1".into(),
         initial_inspection: true,
         files: vec![EvidenceFile {
             path: "src/lib.rs".into(),
-            state: EvidenceState::Committed,
+            state,
             content: "pub fn run() {}\n".into(),
             redacted: false,
         }],
     }
+}
+
+#[test]
+fn missing_model_uses_the_free_router_default() {
+    let config =
+        OpenRouterConfig::from_environment_with(|_| None).expect("default model should be valid");
+
+    assert_eq!(config.model_id(), "openrouter/free");
+}
+
+#[test]
+fn explicit_model_override_remains_supported() {
+    let config = OpenRouterConfig::from_environment_with(|name| {
+        (name == "PMEMC_OPENROUTER_MODEL").then(|| "provider/model".into())
+    })
+    .expect("explicit model should be valid");
+
+    assert_eq!(config.model_id(), "provider/model");
 }
 
 #[test]
@@ -127,6 +158,138 @@ fn provider_response_rejects_unknown_fields_and_unselected_evidence() {
     assert!(unknown_evidence.is_err());
     assert!(invalid_fact_kind.is_err());
     assert!(duplicate_evidence.is_err());
+}
+
+#[test]
+fn invalid_provider_response_exposes_only_a_safe_bounded_reason() {
+    let error = parse_response("provider-secret-and-invalid-json", &bundle())
+        .expect_err("invalid provider content should be rejected");
+    let display = error.to_string();
+
+    assert!(display.contains("model content did not match PMEMC response schema"));
+    assert!(!display.contains("provider-secret-and-invalid-json"));
+    assert_eq!(
+        error.failure_category(),
+        Some(ProviderFailureCategory::InvalidResponse)
+    );
+}
+
+#[test]
+fn provider_rejects_committed_proposals_backed_by_working_tree_evidence() {
+    let response = parse_response(
+        r#"{
+            "schema_version": 1,
+            "proposals": [{
+                "fact_kind": "repository_observation",
+                "statement": "The project exposes a run function.",
+                "lifecycle": "committed",
+                "confidence": "exact",
+                "evidence_paths": ["src/lib.rs"]
+            }],
+            "questions": []
+        }"#,
+        &bundle_with_state(EvidenceState::Unstaged),
+    );
+
+    assert!(response.is_err());
+}
+
+#[test]
+fn inferred_and_user_confirmed_proposals_can_be_finalized() {
+    for confidence in [
+        ProposedConfidence::Inferred,
+        ProposedConfidence::UserConfirmed,
+    ] {
+        let data_directory = support::TemporaryDirectory::new();
+        let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
+        let project = storage::add_project(
+            &data_paths,
+            "fixture",
+            data_directory.path().join("repository").as_path(),
+            None,
+            None,
+        )
+        .expect("project should be stored");
+        let response = ProviderResponse {
+            schema_version: 1,
+            proposals: vec![Proposal {
+                fact_kind: "repository_observation".into(),
+                statement: "The project exposes a run function.".into(),
+                lifecycle: ProposedLifecycle::Committed,
+                confidence,
+                evidence_paths: vec!["src/lib.rs".into()],
+            }],
+            questions: Vec::new(),
+        };
+        let provider = FakeProvider::new(response);
+
+        let _attempt_id =
+            pmemc::submit_approved_bundle(&data_paths, project.id, &bundle(), &provider)
+                .expect("fake submission should succeed");
+        storage::record_review_decision(&data_paths, 1, &storage::ReviewDecision::Approve)
+            .expect("proposal approval should be recorded");
+        storage::finalize_review(&data_paths, project.id)
+            .expect("valid provider confidence should finalize");
+
+        let connection = rusqlite::Connection::open(data_paths.database_path())
+            .expect("database should be readable");
+        let stored_confidence: String = connection
+            .query_row("SELECT confidence FROM fact_evidence", [], |row| row.get(0))
+            .expect("fact evidence should be stored");
+        assert_eq!(stored_confidence, confidence.as_str());
+    }
+}
+
+#[test]
+fn provider_flags_materially_different_statements_as_conflicts() {
+    let data_directory = support::TemporaryDirectory::new();
+    let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
+    let project = storage::add_project(
+        &data_paths,
+        "fixture",
+        data_directory.path().join("repository").as_path(),
+        None,
+        None,
+    )
+    .expect("project should be stored");
+    let connection = rusqlite::Connection::open(data_paths.database_path())
+        .expect("database should be readable");
+    connection
+        .execute(
+            "INSERT INTO verified_facts (project_id, fact_kind, statement, lifecycle_state, verification_status) VALUES (?1, 'database', 'The project uses SQLite.', 'committed', 'verified')",
+            [project.id],
+        )
+        .expect("existing fact should be stored");
+    let fact_id = connection.last_insert_rowid();
+    connection
+        .execute(
+            "INSERT INTO fact_evidence (fact_id, project_id, relative_path, repository_commit, working_tree_state, excerpt, evidence_type, confidence) VALUES (?1, ?2, 'src/lib.rs', NULL, 'committed', 'database evidence', 'source', 'exact')",
+            rusqlite::params![fact_id, project.id],
+        )
+        .expect("existing evidence should be stored");
+    let bundle_json = serde_json::to_string(&bundle()).expect("bundle should serialize");
+    let attempt_id = storage::stage_inspection_attempt(&data_paths, project.id, 1, &bundle_json)
+        .expect("attempt should be staged");
+    let response = ProviderResponse {
+        schema_version: 1,
+        proposals: vec![Proposal {
+            fact_kind: "database".into(),
+            statement: "The project uses PostgreSQL.".into(),
+            lifecycle: ProposedLifecycle::Committed,
+            confidence: ProposedConfidence::Exact,
+            evidence_paths: vec!["src/lib.rs".into()],
+        }],
+        questions: Vec::new(),
+    };
+    let metadata = ProviderInvocationMetadata::new("fake", "offline-test-model", 1)
+        .expect("metadata should be valid");
+    storage::store_provider_response(&data_paths, attempt_id, &metadata, &response)
+        .expect("response should be stored");
+
+    let conflict_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM conflicts", [], |row| row.get(0))
+        .expect("conflict count should be readable");
+    assert_eq!(conflict_count, 1);
 }
 
 #[test]
@@ -669,6 +832,70 @@ fn openrouter_provider_sends_a_versioned_prompt_and_validates_chat_content() {
         "^[a-z0-9_]+$"
     );
     assert!(prompt.contains("src/lib.rs"));
+}
+
+#[test]
+fn provider_metadata_records_the_actual_routed_model() {
+    let transport = ScriptedTransport::new([Ok(json!({
+        "model": "provider/actual-free-model",
+        "choices": [{
+            "message": {
+                "content": "{\"schema_version\":1,\"proposals\":[],\"questions\":[]}"
+            }
+        }]
+    })
+    .to_string())]);
+    let provider = OpenRouterProvider::with_transport(
+        OpenRouterConfig::new("openrouter/free", Duration::from_millis(1), 1)
+            .expect("config should be valid"),
+        "test-key",
+        transport,
+    );
+
+    provider
+        .propose(&bundle())
+        .expect("provider response should validate");
+
+    assert_eq!(provider.metadata().model_id, "provider/actual-free-model");
+}
+
+#[test]
+fn submitted_provider_invocation_persists_the_actual_routed_model() {
+    let data_directory = support::TemporaryDirectory::new();
+    let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
+    let project = storage::add_project(
+        &data_paths,
+        "fixture",
+        data_directory.path().join("repository").as_path(),
+        None,
+        None,
+    )
+    .expect("project should be stored");
+    let transport = ScriptedTransport::new([Ok(json!({
+        "model": "provider/actual-free-model",
+        "choices": [{
+            "message": {"content": "{\"schema_version\":1,\"proposals\":[],\"questions\":[]}"}
+        }]
+    })
+    .to_string())]);
+    let provider = OpenRouterProvider::with_transport(
+        OpenRouterConfig::new("openrouter/free", Duration::from_millis(1), 1)
+            .expect("config should be valid"),
+        "test-key",
+        transport,
+    );
+
+    pmemc::submit_approved_bundle(&data_paths, project.id, &bundle(), &provider)
+        .expect("submission should succeed");
+
+    let connection = rusqlite::Connection::open(data_paths.database_path())
+        .expect("database should be readable");
+    let model_id: String = connection
+        .query_row("SELECT model_id FROM provider_invocations", [], |row| {
+            row.get(0)
+        })
+        .expect("provider invocation should be stored");
+    assert_eq!(model_id, "provider/actual-free-model");
 }
 
 #[test]

@@ -6,7 +6,7 @@ use serde::Serialize;
 use thiserror::Error;
 use tree_sitter::{Node, Parser};
 
-use crate::inventory::{InventoryError, Language, inventory};
+use crate::inventory::{InventoryError, Language, contained_path, inventory};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SymbolKind {
@@ -127,7 +127,11 @@ pub fn build_code_map(repository: &Path) -> Result<CodeMap, CodeMapError> {
             }
             continue;
         }
-        let Ok(source) = fs::read_to_string(root.join(&file.path)) else {
+        let Some(path) = contained_path(&root, &file.path) else {
+            map.unsupported_paths.push(file.path);
+            continue;
+        };
+        let Ok(source) = fs::read_to_string(path) else {
             map.unsupported_paths.push(file.path);
             continue;
         };

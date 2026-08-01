@@ -61,6 +61,7 @@ Deliver:
 - Git command runner with structured results.
 - Canonical Windows repository-path handling.
 - `pmemc project add`, `project list`, and `project show`.
+- Directory-based project names accepted alongside stable numeric IDs.
 - Duplicate-registration protection.
 - `pmemc status` for initial, committed, staged, unstaged, untracked, renamed, and deleted states.
 - Temporary Git-repository fixtures.
@@ -114,10 +115,15 @@ Deliver:
 
 - Narrow model-provider interface.
 - Deterministic fake adapter for tests.
-- OpenRouter HTTP adapter using `OPENROUTER_API_KEY`.
-- Configurable model ID, timeout, and bounded retry policy.
+- OpenRouter HTTP adapter using the operating-system credential store, with
+  `OPENROUTER_API_KEY` as a non-persisted CI fallback.
+- `pmemc auth set`, `auth status`, and `auth remove` with hidden input and
+  secret-safe failure handling.
+- `openrouter/free` as the default model router, an optional model override,
+  timeout, and bounded retry policy.
 - Versioned prompt and strict response schema.
-- Proposal/question validation and provider-invocation metadata.
+- Proposal/question validation and provider-invocation metadata, including the
+  concrete model selected by the free router.
 
 Exit criteria:
 
@@ -149,6 +155,8 @@ Exit criteria:
 Deliver:
 
 - Release build of `pmemc.exe`.
+- Per-user PowerShell installation script with user-level `PATH` registration.
+- First-run `pmemc init` onboarding that remains non-blocking in scripts.
 - Native PowerShell verification using one approved pilot repository.
 - Verification of paths with spaces and non-ASCII characters.
 - Initial inspection followed by committed and uncommitted change cycles.

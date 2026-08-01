@@ -1,6 +1,6 @@
 mod support;
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use pmemc::storage::{DataPaths, initialize};
 use rusqlite::Connection;
@@ -55,4 +55,21 @@ fn init_uses_local_app_data_without_touching_the_callers_real_data_directory() {
             .join("pmemc.sqlite3")
             .is_file()
     );
+}
+
+#[test]
+fn first_run_init_explains_free_model_setup_without_blocking_noninteractive_users() {
+    let temporary_directory = TemporaryDirectory::new();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pmemc"))
+        .arg("init")
+        .env("LOCALAPPDATA", temporary_directory.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("pmemc should run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("openrouter/free"));
+    assert!(stdout.contains("pmemc auth set"));
 }

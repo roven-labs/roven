@@ -42,13 +42,15 @@ Version 1 owns only these user-facing commands:
 
 ```text
 pmemc init
-pmemc project add <path>
-pmemc project list
-pmemc project show <project-id>
-pmemc status [project-id]
+  pmemc project add <path>
+  pmemc project list
+  pmemc project show <project-id>
+  pmemc project forget <project-id> [--confirm-name <name>]
+  pmemc status [project-id]
 pmemc inspect <project-id>
 pmemc review [project-id]
 pmemc history <project-id>
+pmemc auth set|status|remove
 ```
 
 Commands may gain flags needed to satisfy this specification, but agents must not add new top-level capabilities without an approved specification change.
@@ -61,12 +63,16 @@ Must:
 - Create required local cache/export directories.
 - Be idempotent.
 - Report the resolved local data location without exposing secrets.
+- Use `openrouter/free` when no model override is configured.
+- On the first initialization, offer hidden credential setup in an interactive
+  terminal and print non-blocking setup guidance otherwise.
 
 Must not:
 
 - Register a repository.
 - Call a model provider.
 - Modify Git configuration.
+- Block waiting for credential input in a non-interactive shell.
 
 ### 4.2 `pmemc project add <path>`
 
@@ -76,10 +82,16 @@ Must:
 - Verify that the path exists and is a Git working tree.
 - Read the repository root, current branch when present, and HEAD commit when present.
 - Create a stable project ID.
+- Use the repository directory name as the default user-facing project name.
+- Report both the project name and stable ID after registration.
 - Reject duplicate registrations of the same canonical repository path.
 - Leave the project in `registered_needs_inspection` state.
 
 Must not inspect source content or create verified project facts.
+
+Commands that accept a project ID also accept an exact registered project name.
+If names are ambiguous, the command must request the stable `project-<number>`
+identifier.
 
 ### 4.3 `pmemc project list`
 
@@ -89,7 +101,20 @@ Must show project ID, display name, canonical path, state, current branch if ava
 
 Must show registration details, baseline details, verified facts, unresolved questions, and counts of evidence, proposals, and decisions. It must not invoke OpenRouter.
 
-### 4.5 `pmemc status [project-id]`
+### 4.5 `pmemc project forget <project-id>`
+
+Must:
+
+- Show the selected project's display name, canonical repository path, and non-secret counts of memory records before mutation.
+- Require the operator to type the exact display name, or accept `--confirm-name <name>` when the exact name is supplied by an automation environment.
+- Delete only the selected project's PMEMC registration, inspections, provider metadata, proposals, questions, decisions, conflicts, evidence, verified facts, baselines, and code-map snapshots.
+- Complete all deletion and registration removal in one SQLite transaction.
+- Report that repository files, Git state, credentials, and other registered projects were not changed.
+- Leave the repository available for a fresh `pmemc project add <path>` registration.
+
+This is the explicit operator-requested exception to ordinary decision-history retention. It is irreversible through the V1 CLI and must never be performed implicitly by inspection, review, or provider failure.
+
+### 4.6 `pmemc status [project-id]`
 
 Must compare the current repository with its last approved baseline and report:
 
@@ -105,7 +130,7 @@ When no project ID is provided, it must summarize every registered project.
 
 Status is read-only and must not change the baseline.
 
-### 4.6 `pmemc inspect <project-id>`
+### 4.7 `pmemc inspect <project-id>`
 
 Must:
 
@@ -122,7 +147,7 @@ Must:
 
 An initial inspection examines the repository broadly enough to establish project context. Later inspections prioritize changes since the baseline and their direct structural neighbours.
 
-### 4.7 `pmemc review [project-id]`
+### 4.8 `pmemc review [project-id]`
 
 For each pending proposal, the command must show:
 
@@ -144,9 +169,23 @@ The tool must preserve every decision. Correcting a proposal must preserve both 
 
 After all required proposals and conflicts are resolved, the command asks whether to finalize the inspection. Finalization atomically records the accepted facts, decisions, code-map snapshot, and new baseline.
 
-### 4.8 `pmemc history <project-id>`
+### 4.9 `pmemc history <project-id>`
 
 Must show an ordered audit trail of inspections, proposals, decisions, conflicts, and baseline changes without invoking a provider.
+
+### 4.10 `pmemc auth set|status|remove`
+
+These commands manage the local OpenRouter credential without exposing its value.
+
+- `auth set` reads the key through hidden interactive input, requires confirmation,
+  and stores it in the operating-system credential store.
+- `auth status` reports only whether the stored credential is configured.
+- `auth remove` deletes the stored credential and is idempotent when it is absent.
+- Credential-store failures are reported without revealing the key.
+- Inspection resolves the operating-system credential first and falls back to
+  `OPENROUTER_API_KEY` for CI or other non-interactive environments.
+- Empty keys, mismatched confirmation, missing credentials, unavailable stores,
+  and provider authentication failures must not mutate verified facts or baselines.
 
 ## 5. Project lifecycle
 
@@ -274,9 +313,13 @@ Version 1 includes:
 
 - One OpenRouter production adapter
 - One deterministic fake adapter for tests
-- Configurable OpenRouter model identifier
+- `openrouter/free` as the default model router, with an optional configurable
+  model override
 - Provider/model/prompt-schema metadata recorded with proposals
-- API key read from `OPENROUTER_API_KEY`
+- The model identifier returned by OpenRouter is recorded when the router
+  selects a concrete model
+- API key read from the operating-system credential store, with `OPENROUTER_API_KEY`
+  as a non-persisted CI fallback
 
 The provider must not receive blocked files, full Git history, or entire repositories by default. HTTP, authentication, rate-limit, timeout, invalid JSON, and schema-validation failures leave verified facts and baselines unchanged.
 

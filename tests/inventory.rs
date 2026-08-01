@@ -55,6 +55,13 @@ fn inventory_is_deterministic_and_excludes_ignored_unsafe_and_binary_files() {
     .expect("build fixture should be written");
     std::fs::write(repository.path().join(".env"), "SECRET=value\n")
         .expect("secret fixture should be written");
+    std::fs::write(
+        repository.path().join(".npmrc"),
+        "//registry.example/:_authToken=secret\n",
+    )
+    .expect("package credential fixture should be written");
+    std::fs::write(repository.path().join("credentials"), "access_key=secret\n")
+        .expect("credential fixture should be written");
     std::fs::write(repository.path().join("key.pem"), "private key\n")
         .expect("key fixture should be written");
     std::fs::write(
@@ -88,4 +95,22 @@ fn inventory_is_deterministic_and_excludes_ignored_unsafe_and_binary_files() {
     assert_eq!(inventory.files[3].language, Language::Rust);
     assert_eq!(inventory.files[4].language, Language::Unsupported);
     assert_eq!(inventory.files[5].language, Language::GenericText);
+}
+
+#[test]
+fn inventory_rejects_a_tracked_symlink_that_escapes_the_repository() {
+    let repository = TemporaryDirectory::new();
+    let external = TemporaryDirectory::new();
+    git(repository.path(), &["init"]);
+    std::fs::write(external.path().join("outside.rs"), "pub fn outside() {}\n")
+        .expect("external fixture should be written");
+    let link = repository.path().join("linked.rs");
+    if std::os::windows::fs::symlink_file(external.path().join("outside.rs"), &link).is_err() {
+        return;
+    }
+    git(repository.path(), &["add", "linked.rs"]);
+
+    let inventory = inventory(repository.path()).expect("inventory should succeed");
+
+    assert!(inventory.files.iter().all(|file| file.path != "linked.rs"));
 }

@@ -425,6 +425,29 @@ pub struct ProjectMemory {
     pub decision_count: i64,
 }
 
+/// Non-secret counts returned after one project's PMEMC memory is forgotten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgetSummary {
+    /// Stable identifier of the forgotten project.
+    pub project_id: i64,
+    /// Display name shown before confirmation.
+    pub display_name: String,
+    /// Canonical repository path that was deliberately left untouched.
+    pub canonical_path: PathBuf,
+    /// Number of verified facts removed.
+    pub verified_fact_count: i64,
+    /// Number of evidence rows removed.
+    pub evidence_count: i64,
+    /// Number of proposals removed.
+    pub proposal_count: i64,
+    /// Number of questions removed.
+    pub question_count: i64,
+    /// Number of review decisions removed.
+    pub decision_count: i64,
+    /// Number of inspection attempts removed.
+    pub inspection_count: i64,
+}
+
 impl Initialization {
     /// Return the initialized SQLite database file path.
     #[must_use]
@@ -627,6 +650,86 @@ pub fn project_by_id(data_paths: &DataPaths, id: i64) -> Result<Option<Project>,
     let connection = open_connection(&data_paths.database_path())
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     connection.query_row("SELECT id, display_name, canonical_path, lifecycle_state, current_branch, head_commit FROM projects WHERE id = ?1", params![id], |row| Ok(Project { id: row.get(0)?, display_name: row.get(1)?, canonical_path: PathBuf::from(row.get::<_, String>(2)?), lifecycle_state: row.get(3)?, current_branch: row.get(4)?, head_commit: row.get(5)? })).optional().map_err(|source| StorageError::ProjectDatabase { source })
+}
+
+/// Atomically forget one project's PMEMC registration and all project-owned memory.
+///
+/// This operation never opens or mutates the registered repository. It removes
+/// only rows owned by `project_id`, then removes the registration itself.
+/// Callers must obtain explicit operator confirmation before invoking it.
+///
+/// # Errors
+///
+/// Returns an error when the project is absent or any deletion cannot commit.
+pub fn forget_project(
+    data_paths: &DataPaths,
+    project_id: i64,
+) -> Result<ForgetSummary, StorageError> {
+    initialize(data_paths)?;
+    let mut connection = open_connection(&data_paths.database_path())
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let transaction = connection
+        .transaction()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    let (display_name, canonical_path) = transaction
+        .query_row(
+            "SELECT display_name, canonical_path FROM projects WHERE id = ?1",
+            params![project_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                ))
+            },
+        )
+        .optional()
+        .map_err(|source| StorageError::ProjectDatabase { source })?
+        .ok_or_else(|| StorageError::ProjectDatabase {
+            source: rusqlite::Error::QueryReturnedNoRows,
+        })?;
+    let count = |query: &str| {
+        transaction
+            .query_row(query, params![project_id], |row| row.get::<_, i64>(0))
+            .map_err(|source| StorageError::ProjectDatabase { source })
+    };
+    let summary = ForgetSummary {
+        project_id,
+        display_name,
+        canonical_path,
+        verified_fact_count: count("SELECT COUNT(*) FROM verified_facts WHERE project_id = ?1")?,
+        evidence_count: count("SELECT COUNT(*) FROM fact_evidence WHERE project_id = ?1")?,
+        proposal_count: count(
+            "SELECT COUNT(*) FROM proposals JOIN inspection_attempts ON inspection_attempts.id = proposals.inspection_attempt_id WHERE inspection_attempts.project_id = ?1",
+        )?,
+        question_count: count(
+            "SELECT COUNT(*) FROM questions JOIN inspection_attempts ON inspection_attempts.id = questions.inspection_attempt_id WHERE inspection_attempts.project_id = ?1",
+        )?,
+        decision_count: count(
+            "SELECT COUNT(*) FROM review_decisions JOIN proposals ON proposals.id = review_decisions.proposal_id JOIN inspection_attempts ON inspection_attempts.id = proposals.inspection_attempt_id WHERE inspection_attempts.project_id = ?1",
+        )?,
+        inspection_count: count("SELECT COUNT(*) FROM inspection_attempts WHERE project_id = ?1")?,
+    };
+    for query in [
+        "DELETE FROM conflicts WHERE proposal_id IN (SELECT proposals.id FROM proposals JOIN inspection_attempts ON inspection_attempts.id = proposals.inspection_attempt_id WHERE inspection_attempts.project_id = ?1)",
+        "DELETE FROM fact_evidence WHERE project_id = ?1",
+        "DELETE FROM verified_facts WHERE project_id = ?1",
+        "DELETE FROM review_decisions WHERE proposal_id IN (SELECT proposals.id FROM proposals JOIN inspection_attempts ON inspection_attempts.id = proposals.inspection_attempt_id WHERE inspection_attempts.project_id = ?1)",
+        "DELETE FROM questions WHERE inspection_attempt_id IN (SELECT id FROM inspection_attempts WHERE project_id = ?1)",
+        "DELETE FROM proposals WHERE inspection_attempt_id IN (SELECT id FROM inspection_attempts WHERE project_id = ?1)",
+        "DELETE FROM provider_invocations WHERE inspection_attempt_id IN (SELECT id FROM inspection_attempts WHERE project_id = ?1)",
+        "DELETE FROM inspection_baselines WHERE project_id = ?1",
+        "DELETE FROM inspection_attempts WHERE project_id = ?1",
+        "DELETE FROM code_map_snapshots WHERE project_id = ?1",
+        "DELETE FROM projects WHERE id = ?1",
+    ] {
+        transaction
+            .execute(query, params![project_id])
+            .map_err(|source| StorageError::ProjectDatabase { source })?;
+    }
+    transaction
+        .commit()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    Ok(summary)
 }
 
 /// Return the latest approved baseline for a project.
@@ -849,7 +952,7 @@ pub fn stage_inspection_attempt_with_baseline_provenance(
         })?;
     let review_in_progress: bool = transaction
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM inspection_attempts WHERE project_id = ?1 AND status = 'pending_review')",
+            "SELECT EXISTS(SELECT 1 FROM inspection_attempts WHERE project_id = ?1 AND status IN ('pending_review', 'staged_pending_provider', 'provider_failed'))",
             params![project_id],
             |row| row.get(0),
         )
@@ -877,7 +980,7 @@ pub fn stage_inspection_attempt_with_baseline_provenance(
     Ok(attempt_id)
 }
 
-/// Return the latest failed provider attempt for a project, if it can be retried.
+/// Return the latest recoverable provider attempt for a project, if it can be retried.
 ///
 /// # Errors
 ///
@@ -892,7 +995,7 @@ pub fn failed_provider_attempt_for_project(
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let row = connection
         .query_row(
-            "SELECT id, bundle_json FROM inspection_attempts WHERE project_id = ?1 AND status = 'provider_failed' ORDER BY id DESC LIMIT 1",
+            "SELECT id, bundle_json FROM inspection_attempts WHERE project_id = ?1 AND status IN ('staged_pending_provider', 'provider_failed') ORDER BY id DESC LIMIT 1",
             params![project_id],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
@@ -1495,7 +1598,7 @@ fn valid_stored_proposal(proposal: &FinalizedProposal, statement: &str) -> bool 
         )
         && matches!(
             proposal.confidence.as_str(),
-            "exact" | "supported" | "uncertain"
+            "exact" | "inferred" | "user_confirmed"
         )
 }
 
@@ -1508,6 +1611,9 @@ fn insert_fact_evidence(
     locator: Option<&EvidenceLocator>,
     confidence: &str,
 ) -> Result<(), StorageError> {
+    let repository_commit = (file.state == crate::inspection::EvidenceState::Committed)
+        .then_some(repository_commit)
+        .flatten();
     let line = locator
         .map(|locator| i64::try_from(locator.line))
         .transpose()
@@ -1625,7 +1731,8 @@ pub fn store_provider_response(
                 .map_err(|source| StorageError::ProjectDatabase { source })?;
             existing_fact_ids.extend(matched_fact_ids.into_iter().filter_map(
                 |(fact_id, statement)| {
-                    explicit_statement_negation(&proposal.statement, &statement).then_some(fact_id)
+                    materially_different_statements(&proposal.statement, &statement)
+                        .then_some(fact_id)
                 },
             ));
         }
@@ -1663,7 +1770,7 @@ pub fn store_provider_response(
         .map_err(|source| StorageError::ProjectDatabase { source })
 }
 
-fn explicit_statement_negation(left: &str, right: &str) -> bool {
+fn materially_different_statements(left: &str, right: &str) -> bool {
     let normalize = |statement: &str| {
         let words = statement
             .trim()
@@ -1689,23 +1796,35 @@ fn explicit_statement_negation(left: &str, right: &str) -> bool {
                 index += 1;
                 continue;
             }
-            let word = match words[index].as_str() {
-                "uses" => "use",
-                "includes" => "include",
-                "contains" => "contain",
-                "supports" => "support",
-                "exposes" => "expose",
-                "depends" => "depend",
-                _ => words[index].as_str(),
-            };
-            normalized.push(word);
+            normalized.push(
+                match words[index].as_str() {
+                    "uses" => "use",
+                    "includes" => "include",
+                    "contains" => "contain",
+                    "supports" => "support",
+                    "exposes" => "expose",
+                    "depends" => "depend",
+                    word => word,
+                }
+                .to_owned(),
+            );
             index += 1;
         }
-        (negated, normalized.join(" "))
+        (negated, normalized)
     };
     let (left_negated, left) = normalize(left);
     let (right_negated, right) = normalize(right);
-    left == right && left_negated != right_negated && !left.is_empty()
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    if left == right {
+        return left_negated != right_negated;
+    }
+    !left_negated
+        && !right_negated
+        && left.len() == right.len()
+        && left.len() > 1
+        && left[..left.len() - 1] == right[..right.len() - 1]
 }
 
 /// Mark a provider attempt as failed and restore its prior durable lifecycle.
@@ -1782,7 +1901,7 @@ pub fn retry_provider_attempt(data_paths: &DataPaths, attempt_id: i64) -> Result
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let exists = transaction
         .query_row(
-            "SELECT 1 FROM inspection_attempts WHERE id = ?1 AND status = 'provider_failed'",
+            "SELECT 1 FROM inspection_attempts WHERE id = ?1 AND status IN ('staged_pending_provider', 'provider_failed')",
             params![attempt_id],
             |_| Ok(()),
         )
@@ -1979,12 +2098,12 @@ mod tests {
     }
 
     #[test]
-    fn explicit_statement_negation_normalizes_common_auxiliary_negation() {
-        assert!(explicit_statement_negation(
+    fn materially_different_statements_normalize_case_and_punctuation() {
+        assert!(materially_different_statements(
             "The project uses SQLite.",
             "The project does not use SQLite."
         ));
-        assert!(!explicit_statement_negation(
+        assert!(!materially_different_statements(
             "The project uses SQLite.",
             "The project uses SQLite."
         ));

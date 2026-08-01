@@ -44,6 +44,11 @@ pub(crate) enum Command {
         /// Registered project identifier.
         project_id: String,
     },
+    /// Manage provider credentials without exposing their values.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -60,6 +65,24 @@ pub(crate) enum ProjectCommand {
         /// Registered project identifier.
         project_id: String,
     },
+    /// Irreversibly forget one project's PMEMC memory and registration.
+    Forget {
+        /// Registered project identifier.
+        project_id: String,
+        /// Exact display name for non-interactive confirmation.
+        #[arg(long, value_name = "PROJECT_NAME")]
+        confirm_name: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AuthCommand {
+    /// Store the OpenRouter API key in the operating-system credential store.
+    Set,
+    /// Report whether a stored OpenRouter credential exists.
+    Status,
+    /// Remove the stored OpenRouter credential.
+    Remove,
 }
 
 pub(crate) fn parse() -> Command {

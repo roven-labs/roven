@@ -34,7 +34,7 @@ fn pmemc_with_input(
         .env("LOCALAPPDATA", data_directory.path())
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("PMEMC_OPENROUTER_MODEL")
-        .env_remove("PMEMC_OPENROUTER_TIMEOUT_SECS")
+        .env("PMEMC_OPENROUTER_TIMEOUT_SECS", "0")
         .env_remove("PMEMC_OPENROUTER_MAX_ATTEMPTS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -57,7 +57,7 @@ fn initial_bundle_is_bounded_deterministic_and_redacts_suspected_secrets() {
     std::fs::create_dir_all(repository.path().join("src")).expect("source directory should exist");
     std::fs::write(
         repository.path().join("src/lib.rs"),
-        "pub const API_TOKEN: &str = \"actual-secret-value\";\npub fn run() {}\n",
+        "pub const API_TOKEN: &str = \"actual-secret-value\";\nconst DATABASE_URL: &str = \"postgres://user:password@host/db\";\npub fn run() {}\n",
     )
     .expect("source fixture should be written");
     std::fs::write(repository.path().join("README.md"), "# Fixture\n")
@@ -85,6 +85,7 @@ fn initial_bundle_is_bounded_deterministic_and_redacts_suspected_secrets() {
     assert_eq!(first, second);
     assert!(serialized.contains("[REDACTED]"));
     assert!(!serialized.contains("actual-secret-value"));
+    assert!(!serialized.contains("postgres://user:password@host/db"));
     assert!(!serialized.contains("sensitive-value"));
     assert!(!serialized.contains("-----BEGIN PRIVATE KEY-----"));
     assert!(!serialized.contains("private-key-body-must-not-leak"));
@@ -118,6 +119,8 @@ fn denied_inspection_does_not_read_source_or_create_a_pending_attempt() {
     let inspection = pmemc_with_input(&data_directory, &["inspect", "project-1"], b"n\n");
     assert!(inspection.status.success());
     let output = String::from_utf8_lossy(&inspection.stdout);
+    assert!(output.contains("[1/7] Repository check"));
+    assert!(!output.contains('\x1b'));
     assert!(output.contains("inspection cancelled"));
     assert!(output.contains("unread-source.rs"));
     assert!(!output.contains("must-never-be-read"));
@@ -134,7 +137,7 @@ fn denied_inspection_does_not_read_source_or_create_a_pending_attempt() {
 }
 
 #[test]
-fn approved_inspection_with_missing_provider_configuration_preserves_a_redacted_retryable_attempt()
+fn approved_inspection_with_invalid_provider_configuration_preserves_a_redacted_retryable_attempt()
 {
     let data_directory = TemporaryDirectory::new();
     let repository = TemporaryDirectory::new();
@@ -157,8 +160,14 @@ fn approved_inspection_with_missing_provider_configuration_preserves_a_redacted_
 
     let inspection = pmemc_with_input(&data_directory, &["inspect", "project-1"], b"yes\n");
     assert!(!inspection.status.success());
+    let stdout = String::from_utf8_lossy(&inspection.stdout);
+    assert!(stdout.contains("[1/7] Repository check"));
+    assert!(stdout.contains("[2/7] Evidence preparation"));
+    assert!(stdout.contains("[3/7] Local staging"));
+    assert!(stdout.contains("[4/7] OpenRouter request"));
+    assert!(!stdout.contains('\x1b'));
     let stderr = String::from_utf8_lossy(&inspection.stderr);
-    assert!(stderr.contains("OPENROUTER_API_KEY"));
+    assert!(stderr.contains("OpenRouter configuration is invalid"));
 
     let connection =
         rusqlite::Connection::open(data_directory.path().join("PMEMC").join("pmemc.sqlite3"))
@@ -236,6 +245,8 @@ fn a_later_inspect_retries_the_retained_provider_attempt() {
     assert!(!second.status.success());
     let retry_output = String::from_utf8_lossy(&second.stdout);
     assert!(retry_output.contains("retained approved evidence"));
+    assert!(retry_output.contains("[2/7] Evidence preparation"));
+    assert!(retry_output.contains("reused approved bundle"));
     assert!(retry_output.contains("scope\tmain.rs"));
     assert!(!retry_output.contains("scope\tlater.rs"));
     let connection = rusqlite::Connection::open(&database_path).expect("database should open");
@@ -714,6 +725,237 @@ fn finalization_is_atomic_and_defers_conflict_supersession_until_commit() {
     });
     assert!(history_positions.windows(2).all(|pair| pair[0] < pair[1]));
     assert!(history_output.contains("operator-confirmed command entry point"));
+}
+
+#[test]
+fn finalization_does_not_attribute_working_tree_evidence_to_head_commit() {
+    let data_directory = TemporaryDirectory::new();
+    let repository = TemporaryDirectory::new();
+    git_command(repository.path(), &["init"]);
+    git_command(
+        repository.path(),
+        &["config", "user.email", "pmemc-test@example.invalid"],
+    );
+    git_command(repository.path(), &["config", "user.name", "PMEMC Test"]);
+    std::fs::create_dir_all(repository.path().join("src")).expect("src directory should exist");
+    std::fs::write(repository.path().join("src/lib.rs"), "pub fn run() {}\n")
+        .expect("fixture source should be written");
+    git_command(repository.path(), &["add", "."]);
+    git_command(repository.path(), &["commit", "-m", "initial fixture"]);
+    std::fs::write(
+        repository.path().join("src/lib.rs"),
+        "pub fn run() { println!(\"changed\"); }\n",
+    )
+    .expect("working-tree change should be written");
+
+    let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
+    let project = storage::add_project(&data_paths, "fixture", repository.path(), None, None)
+        .expect("project should be stored");
+    let bundle = EvidenceBundle {
+        schema_version: 1,
+        project_id: format!("project-{}", project.id),
+        initial_inspection: true,
+        files: vec![EvidenceFile {
+            path: "src/lib.rs".into(),
+            state: EvidenceState::Unstaged,
+            content: "pub fn run() { println!(\"changed\"); }\n".into(),
+            redacted: false,
+        }],
+    };
+    let bundle_json = serde_json::to_string(&bundle).expect("bundle should serialize");
+    let commit = git::metadata(repository.path())
+        .expect("repository metadata should be available")
+        .head_commit
+        .expect("fixture repository should have a commit");
+    let attempt_id = storage::stage_inspection_attempt_with_baseline_provenance(
+        &data_paths,
+        project.id,
+        1,
+        &bundle_json,
+        Some(r#"{"symbols":[]}"#),
+        &storage::BaselineProvenance {
+            repository_commit: Some(commit),
+            repository_branch: Some("main".into()),
+            working_tree_status_json: r#"{"unstaged_paths":["src/lib.rs"]}"#.into(),
+            uncommitted_fingerprints_json: r#"{"src/lib.rs":"working-tree"}"#.into(),
+        },
+    )
+    .expect("attempt should stage");
+    let response = parse_response(
+        r#"{"schema_version":1,"proposals":[{"fact_kind":"repository_observation","statement":"The working tree exposes a run function.","lifecycle":"in_progress","confidence":"exact","evidence_paths":["src/lib.rs"]}],"questions":[]}"#,
+        &bundle,
+    )
+    .expect("response should validate");
+    let metadata = ProviderInvocationMetadata::new("fake", "offline-test-model", 1)
+        .expect("metadata should validate");
+    storage::store_provider_response(&data_paths, attempt_id, &metadata, &response)
+        .expect("response should be stored");
+    storage::record_review_decision(&data_paths, 1, &storage::ReviewDecision::Approve)
+        .expect("approval should be recorded");
+    storage::finalize_review(&data_paths, project.id).expect("review should finalize");
+
+    let connection = rusqlite::Connection::open(data_paths.database_path())
+        .expect("database should be readable");
+    let provenance: (Option<String>, String) = connection
+        .query_row(
+            "SELECT repository_commit, working_tree_state FROM fact_evidence WHERE fact_id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("fact evidence should be readable");
+    assert_eq!(provenance, (None, "unstaged".into()));
+}
+
+#[test]
+fn interrupted_staged_provider_attempt_blocks_a_competing_inspection() {
+    let data_directory = TemporaryDirectory::new();
+    let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
+    let project = storage::add_project(
+        &data_paths,
+        "fixture",
+        data_directory.path().join("repository").as_path(),
+        None,
+        None,
+    )
+    .expect("project should be stored");
+    let bundle_json = serde_json::to_string(&EvidenceBundle {
+        schema_version: 1,
+        project_id: format!("project-{}", project.id),
+        initial_inspection: true,
+        files: vec![EvidenceFile {
+            path: "src/lib.rs".into(),
+            state: EvidenceState::Committed,
+            content: "pub fn run() {}\n".into(),
+            redacted: false,
+        }],
+    })
+    .expect("bundle should serialize");
+    let attempt_id = storage::stage_inspection_attempt(&data_paths, project.id, 1, &bundle_json)
+        .expect("attempt should be staged");
+
+    let recoverable = storage::failed_provider_attempt_for_project(&data_paths, project.id)
+        .expect("recoverable attempt should be readable")
+        .expect("staged attempt should be recoverable");
+    assert_eq!(recoverable.id, attempt_id);
+    storage::retry_provider_attempt(&data_paths, attempt_id).expect("staged attempt should retry");
+
+    let duplicate = storage::stage_inspection_attempt(&data_paths, project.id, 1, &bundle_json);
+
+    assert!(matches!(
+        duplicate,
+        Err(storage::StorageError::ReviewInProgress)
+    ));
+}
+
+#[test]
+fn status_compares_dirty_content_to_the_approved_baseline() {
+    let data_directory = TemporaryDirectory::new();
+    let repository = TemporaryDirectory::new();
+    git_command(repository.path(), &["init"]);
+    git_command(
+        repository.path(),
+        &["config", "user.email", "pmemc-test@example.invalid"],
+    );
+    git_command(repository.path(), &["config", "user.name", "PMEMC Test"]);
+    std::fs::write(repository.path().join("main.rs"), "pub fn run() {}\n")
+        .expect("fixture source should be written");
+    git_command(repository.path(), &["add", "."]);
+    git_command(repository.path(), &["commit", "-m", "initial fixture"]);
+    let add = Command::new(env!("CARGO_BIN_EXE_pmemc"))
+        .args([
+            "project",
+            "add",
+            repository.path().to_str().expect("UTF-8 test path"),
+        ])
+        .env("LOCALAPPDATA", data_directory.path())
+        .output()
+        .expect("project should be registered");
+    assert!(add.status.success());
+
+    std::fs::write(repository.path().join("main.rs"), "pub fn run() { 1 }\n")
+        .expect("working-tree change should be written");
+    let status = git::working_tree_status(repository.path()).expect("status should be read");
+    let fingerprint = git::working_tree_fingerprint(repository.path(), "main.rs")
+        .expect("working-tree fingerprint should be available");
+    let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
+    let project = storage::project_by_id(&data_paths, 1)
+        .expect("project should be readable")
+        .expect("project should exist");
+    let bundle = EvidenceBundle {
+        schema_version: 1,
+        project_id: "project-1".into(),
+        initial_inspection: true,
+        files: vec![EvidenceFile {
+            path: "main.rs".into(),
+            state: EvidenceState::Unstaged,
+            content: "pub fn run() { 1 }\n".into(),
+            redacted: false,
+        }],
+    };
+    let attempt_id = storage::stage_inspection_attempt_with_baseline_provenance(
+        &data_paths,
+        project.id,
+        1,
+        &serde_json::to_string(&bundle).expect("bundle should serialize"),
+        Some(r#"{"symbols":[]}"#),
+        &storage::BaselineProvenance {
+            repository_commit: git::metadata(repository.path())
+                .expect("metadata should be available")
+                .head_commit,
+            repository_branch: Some("main".into()),
+            working_tree_status_json: serde_json::to_string(&serde_json::json!({
+                "added_paths": status.added_paths,
+                "modified_paths": status.modified_paths,
+                "untracked_paths": status.untracked_paths,
+                "staged_paths": status.staged_paths,
+                "unstaged_paths": status.unstaged_paths,
+                "deleted_paths": status.deleted_paths,
+                "relationships": [],
+            }))
+            .expect("status should serialize"),
+            uncommitted_fingerprints_json: serde_json::json!({"main.rs": fingerprint}).to_string(),
+        },
+    )
+    .expect("attempt should stage");
+    let response = parse_response(
+        r#"{"schema_version":1,"proposals":[{"fact_kind":"repository_observation","statement":"The working tree defines run.","lifecycle":"in_progress","confidence":"exact","evidence_paths":["main.rs"]}],"questions":[]}"#,
+        &bundle,
+    )
+    .expect("response should validate");
+    let metadata = ProviderInvocationMetadata::new("fake", "offline-test-model", 1)
+        .expect("metadata should validate");
+    storage::store_provider_response(&data_paths, attempt_id, &metadata, &response)
+        .expect("response should be stored");
+    storage::record_review_decision(&data_paths, 1, &storage::ReviewDecision::Approve)
+        .expect("approval should be recorded");
+    storage::finalize_review(&data_paths, project.id).expect("review should finalize");
+
+    let unchanged = pmemc_with_input(&data_directory, &["status", "project-1"], b"\n");
+    let unchanged_output = String::from_utf8_lossy(&unchanged.stdout);
+    assert!(unchanged.status.success());
+    assert!(!unchanged_output.contains("unstaged\tmain.rs"));
+    let unchanged_list = pmemc_with_input(&data_directory, &["project", "list"], b"\n");
+    let unchanged_list_output = String::from_utf8_lossy(&unchanged_list.stdout);
+    assert!(unchanged_list.status.success());
+    assert!(unchanged_list_output.contains("changes-detected=no"));
+
+    std::fs::write(repository.path().join("main.rs"), "pub fn run() { 2 }\n")
+        .expect("second working-tree change should be written");
+    let changed = pmemc_with_input(&data_directory, &["status", "project-1"], b"\n");
+    let changed_output = String::from_utf8_lossy(&changed.stdout);
+    assert!(changed.status.success());
+    assert!(changed_output.contains("unstaged\tmain.rs"));
+    let changed_list = pmemc_with_input(&data_directory, &["project", "list"], b"\n");
+    let changed_list_output = String::from_utf8_lossy(&changed_list.stdout);
+    assert!(changed_list.status.success());
+    assert!(changed_list_output.contains("changes-detected=yes"));
+
+    git_command(repository.path(), &["add", "main.rs"]);
+    git_command(repository.path(), &["commit", "-m", "second fixture"]);
+    let committed_inspection = pmemc_with_input(&data_directory, &["inspect", "project-1"], b"n\n");
+    let committed_output = String::from_utf8_lossy(&committed_inspection.stdout);
+    assert!(committed_inspection.status.success());
+    assert!(committed_output.contains("scope\tmain.rs"));
 }
 
 #[test]
