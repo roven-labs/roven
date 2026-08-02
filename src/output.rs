@@ -207,7 +207,7 @@ fn startup_registration_message(
     colors: bool,
 ) -> String {
     format!(
-        "[2/3] {}\n  {}\n  Project: {}\n  Repository: {}",
+        "[2/4] {}\n  {}\n  Project: {}\n  Repository: {}",
         styled("Project registration", Style::Info, colors),
         styled(&format!("✓ {outcome}"), Style::Success, colors),
         project.name,
@@ -221,7 +221,7 @@ fn startup_repository_validation_message(
     colors: bool,
 ) -> String {
     format!(
-        "[1/3] {}\n  {}\n  {}\n  Repository: {}\n  HEAD:       {head_commit}",
+        "[1/4] {}\n  {}\n  {}\n  Repository: {}\n  HEAD:       {head_commit}",
         styled("Repository validation", Style::Info, colors),
         styled("✓ Git repository verified", Style::Success, colors),
         styled("✓ Clean committed state", Style::Success, colors),
@@ -235,7 +235,7 @@ pub(crate) fn print_startup_codegraph_preparation() {
         env::var_os("NO_COLOR").is_some(),
     );
     println!(
-        "\n[3/3] {}",
+        "\n[3/4] {}",
         styled("CodeGraph preparation", Style::Info, colors)
     );
 }
@@ -283,6 +283,38 @@ pub(crate) fn print_startup_codegraph_cancelled() {
     println!(
         "\nCodeGraph initialization cancelled.\n\nPMEMC V1 cannot inspect this project without CodeGraph.\nNo CodeGraph index was created and no LLM work was started."
     );
+}
+
+pub(crate) fn print_startup_provider_access() {
+    let colors = colors_enabled(
+        io::stdout().is_terminal(),
+        env::var_os("NO_COLOR").is_some(),
+    );
+    println!("\n[4/4] {}", styled("Provider access", Style::Info, colors));
+}
+
+pub(crate) fn print_startup_provider_access_configured() {
+    print_startup_provider_access_line(Style::Success, "✓ OpenRouter API key configured");
+}
+
+pub(crate) fn print_startup_provider_access_missing() {
+    let colors = colors_enabled(
+        io::stdout().is_terminal(),
+        env::var_os("NO_COLOR").is_some(),
+    );
+    println!(
+        "  {} OpenRouter API key is required for PMEMC V1.\n\n  PMEMC stores the key securely in Windows Credential Manager.",
+        styled("•", Style::Info, colors),
+    );
+    print!("  Enter OpenRouter API key (input hidden): ");
+}
+
+fn print_startup_provider_access_line(style: Style, message: &str) {
+    let colors = colors_enabled(
+        io::stdout().is_terminal(),
+        env::var_os("NO_COLOR").is_some(),
+    );
+    println!("  {}", styled(message, style, colors));
 }
 
 fn append_operations(
@@ -357,7 +389,7 @@ mod tests {
     fn startup_repository_validation_uses_terminal_colors() {
         assert_eq!(
             startup_repository_validation_message(std::path::Path::new("C:/repo"), "abc123", true,),
-            "[1/3] \x1b[36mRepository validation\x1b[0m\n  \x1b[32m✓ Git repository verified\x1b[0m\n  \x1b[32m✓ Clean committed state\x1b[0m\n  Repository: C:/repo\n  HEAD:       abc123"
+            "[1/4] \x1b[36mRepository validation\x1b[0m\n  \x1b[32m✓ Git repository verified\x1b[0m\n  \x1b[32m✓ Clean committed state\x1b[0m\n  Repository: C:/repo\n  HEAD:       abc123"
         );
     }
 

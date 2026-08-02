@@ -37,16 +37,17 @@ The codebase remains the strongest technical evidence, but it is not the final a
 
 ## Provider credentials
 
-On a fresh installation, run `pmemc init`. It initializes local storage, uses
-OpenRouter's `openrouter/free` router by default, and offers to configure the
-key when an interactive terminal is available. In scripts or other
-non-interactive shells, it never waits for input; run `pmemc auth set` once in
-an interactive PowerShell session if inspection needs the provider.
+On a fresh installation, `pmemc init` initializes local storage and uses
+OpenRouter's `openrouter/free` router by default. It never asks for a key.
+When bare `pmemc` has validated a clean repository and prepared CodeGraph, it
+checks `OPENROUTER_API_KEY` first, then Windows Credential Manager, and asks
+for a hidden key only if both are absent. You can also run `pmemc auth set` in
+an interactive PowerShell session.
 
 For local Windows use, `pmemc auth set` stores the OpenRouter key in the
 operating-system credential store and never prints it. `pmemc auth status`
-reports only whether it is configured, and `pmemc auth remove` deletes it. CI
-environments may use `OPENROUTER_API_KEY` as a runtime fallback.
+reports only whether it is configured, and `pmemc auth remove` deletes it. A
+non-empty `OPENROUTER_API_KEY` takes precedence when present.
 
 The free router may select a different free model for each request. PMEMC
 records the model returned by OpenRouter with the provider invocation. Advanced

@@ -58,7 +58,7 @@ fn init_uses_local_app_data_without_touching_the_callers_real_data_directory() {
 }
 
 #[test]
-fn first_run_init_explains_free_model_setup_without_blocking_noninteractive_users() {
+fn first_run_init_defers_provider_setup_until_repository_startup() {
     let temporary_directory = TemporaryDirectory::new();
 
     let output = Command::new(env!("CARGO_BIN_EXE_pmemc"))
@@ -71,5 +71,5 @@ fn first_run_init_explains_free_model_setup_without_blocking_noninteractive_user
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("openrouter/free"));
-    assert!(stdout.contains("pmemc auth set"));
+    assert!(stdout.contains("after CodeGraph preparation"));
 }

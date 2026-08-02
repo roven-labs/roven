@@ -47,7 +47,9 @@ pmemc
   CodeGraph: a valid existing index is synchronized and verified; a missing
   index requires an interactive approval before PMEMC creates it. Validation
   failure stops before database access. Declining initialization stops without
-  creating CodeGraph data or starting provider work.
+  creating CodeGraph data or starting provider work. Once CodeGraph is ready,
+  provider access checks `OPENROUTER_API_KEY` before Windows Credential Manager
+  and prompts for a hidden key only when neither is configured.
 pmemc init
   pmemc project add <path>
   pmemc project list
@@ -73,7 +75,12 @@ synchronized or a new one is initialized, it must display a progress line. A
 missing CLI error must explain that CodeGraph is required, show the official
 PowerShell installation command and guide URL, and state that PMEMC did not
 start CodeGraph, source inspection, or LLM work; PMEMC must not install it or
-open the guide automatically.
+open the guide automatically. Only after CodeGraph is ready may it render a
+fourth provider-access step. This step must prefer a non-empty
+`OPENROUTER_API_KEY`, then Windows Credential Manager, and never contact
+OpenRouter. If neither source has a key, it must prompt once using hidden input
+and store a non-empty key only in Windows Credential Manager. Empty input or
+prompt cancellation stops without provider work.
 
 ### 4.1 `pmemc init`
 
@@ -84,13 +91,14 @@ Must:
 - Be idempotent.
 - Report the resolved local data location without exposing secrets.
 - Use `openrouter/free` when no model override is configured.
-- On the first initialization, offer hidden credential setup in an interactive
-  terminal and print non-blocking setup guidance otherwise.
+- Explain that provider setup occurs only after CodeGraph preparation during
+  bare `pmemc` startup.
 
 Must not:
 
 - Register a repository.
 - Call a model provider.
+- Prompt for a provider credential.
 - Modify Git configuration.
 - Block waiting for credential input in a non-interactive shell.
 
@@ -203,8 +211,9 @@ These commands manage the local OpenRouter credential without exposing its value
 - `auth status` reports only whether the stored credential is configured.
 - `auth remove` deletes the stored credential and is idempotent when it is absent.
 - Credential-store failures are reported without revealing the key.
-- Inspection resolves the operating-system credential first and falls back to
-  `OPENROUTER_API_KEY` for CI or other non-interactive environments.
+- Provider access resolves `OPENROUTER_API_KEY` first and then the operating-
+  system credential store. An environment key is never overwritten or replaced
+  by a stored key.
 - Empty keys, mismatched confirmation, missing credentials, unavailable stores,
   and provider authentication failures must not mutate verified facts or baselines.
 
@@ -376,6 +385,8 @@ Human-readable project summaries may be exported from verified memory. Exports a
 - SQL uses bound parameters.
 - Paths are canonicalized and displayed before inspection.
 - Provider keys are never printed.
+- Provider keys are never stored in SQLite, repository files, configuration,
+  command arguments, logs, or errors.
 
 ## 13. Failure and recovery
 

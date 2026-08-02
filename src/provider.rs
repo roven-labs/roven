@@ -376,7 +376,7 @@ pub struct OpenRouterProvider<T = UreqOpenRouterTransport> {
 }
 
 impl OpenRouterProvider<UreqOpenRouterTransport> {
-    /// Construct the production adapter from the OS credential store or CI environment.
+    /// Construct the production adapter from the environment or OS credential store.
     ///
     /// # Errors
     ///
@@ -446,7 +446,7 @@ impl<T: OpenRouterTransport> ModelProvider for OpenRouterProvider<T> {
                 Err(error) => {
                     return Err(ProviderError::RequestFailed {
                         category: error.category,
-                        detail: error.detail,
+                        detail: redact_api_key(&error.detail, &self.api_key),
                     });
                 }
             }
@@ -455,6 +455,14 @@ impl<T: OpenRouterTransport> ModelProvider for OpenRouterProvider<T> {
             category: ProviderFailureCategory::RequestFailed,
             detail: "request attempts exhausted".into(),
         })
+    }
+}
+
+fn redact_api_key(detail: &str, api_key: &str) -> String {
+    if api_key.is_empty() {
+        detail.to_owned()
+    } else {
+        detail.replace(api_key, "[redacted]")
     }
 }
 

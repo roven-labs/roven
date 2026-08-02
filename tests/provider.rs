@@ -66,6 +66,21 @@ impl OpenRouterTransport for ScriptedTransport {
     }
 }
 
+struct ReflectingTransport;
+
+impl OpenRouterTransport for ReflectingTransport {
+    fn complete(
+        &self,
+        api_key: &str,
+        _request: &Value,
+    ) -> Result<String, OpenRouterTransportError> {
+        Err(OpenRouterTransportError {
+            category: ProviderFailureCategory::Unauthorized,
+            detail: format!("upstream reflected Bearer {api_key}"),
+        })
+    }
+}
+
 fn bundle() -> EvidenceBundle {
     bundle_with_state(EvidenceState::Committed)
 }
@@ -981,6 +996,26 @@ fn openrouter_provider_preserves_failure_categories_without_exposing_a_key() {
             .to_string()
             .contains("test-key-must-not-appear-in-error")
     );
+}
+
+#[test]
+fn openrouter_provider_redacts_a_key_reflected_by_transport_failure() {
+    let provider = OpenRouterProvider::with_transport(
+        OpenRouterConfig::new("test/model", Duration::from_millis(1), 1)
+            .expect("config should be valid"),
+        "test-key-reflected-by-upstream",
+        ReflectingTransport,
+    );
+
+    let error = provider
+        .propose(&bundle())
+        .expect_err("request should fail");
+
+    assert_eq!(
+        error.failure_category(),
+        Some(ProviderFailureCategory::Unauthorized)
+    );
+    assert!(!error.to_string().contains("test-key-reflected-by-upstream"));
 }
 
 #[test]

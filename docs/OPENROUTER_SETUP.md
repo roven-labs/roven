@@ -16,17 +16,15 @@ Remove it with:
 pmemc auth remove
 ```
 
-On the first run, `pmemc init` initializes local storage and uses
-`openrouter/free` by default. In an interactive PowerShell session it offers
-to configure the credential. In a non-interactive shell it prints setup
-guidance and exits without waiting for input.
+`pmemc init` initializes local storage and uses `openrouter/free` by default;
+it never asks for a credential. Bare `pmemc` asks for a hidden key only after
+it has validated a clean Git repository and prepared CodeGraph.
 
-PMEMC reads the operating-system credential first. It uses `OPENROUTER_API_KEY`
-only as a runtime fallback for CI or another non-interactive environment. It
+PMEMC reads `OPENROUTER_API_KEY` first, then Windows Credential Manager. It
 does not read `.env` files, and the key must not be committed to the repository,
 passed as a command-line argument, or stored in SQLite.
 
-## CI or non-interactive fallback
+## CI or non-interactive environment key
 
 Use the CI platform's encrypted secret store and inject `OPENROUTER_API_KEY`
 at runtime. For a temporary local fallback, use Windows Settings > System >

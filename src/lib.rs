@@ -47,12 +47,15 @@ pub fn run() -> anyhow::Result<()> {
                 }
             };
             output::print_startup_registration(&project, registration_outcome);
-            prepare_codegraph_startup(&repository.root)
+            if prepare_codegraph_startup(&repository.root)? {
+                prepare_provider_access()?;
+            }
+            Ok(())
         }
     }
 }
 
-fn prepare_codegraph_startup(repository: &std::path::Path) -> anyhow::Result<()> {
+fn prepare_codegraph_startup(repository: &std::path::Path) -> anyhow::Result<bool> {
     output::print_startup_codegraph_preparation();
     codegraph::check_available(repository)?;
     if codegraph::index_exists(repository)? {
@@ -61,12 +64,12 @@ fn prepare_codegraph_startup(repository: &std::path::Path) -> anyhow::Result<()>
         let ready = codegraph::synchronize(repository)?;
         debug_assert_eq!(ready.repository_root, repository);
         output::print_startup_codegraph_ready();
-        return Ok(());
+        return Ok(true);
     }
     output::print_startup_codegraph_missing();
     if !startup_confirmation()? {
         output::print_startup_codegraph_cancelled();
-        return Ok(());
+        return Ok(false);
     }
     output::print_startup_codegraph_initializing();
     codegraph::initialize(repository)?;
@@ -74,7 +77,7 @@ fn prepare_codegraph_startup(repository: &std::path::Path) -> anyhow::Result<()>
     let ready = codegraph::synchronize(repository)?;
     debug_assert_eq!(ready.repository_root, repository);
     output::print_startup_codegraph_ready();
-    Ok(())
+    Ok(true)
 }
 
 fn startup_confirmation() -> anyhow::Result<bool> {
@@ -87,6 +90,22 @@ fn startup_confirmation() -> anyhow::Result<bool> {
         response.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
+}
+
+fn prepare_provider_access() -> anyhow::Result<()> {
+    output::print_startup_provider_access();
+    if credentials::openrouter_credential_source()?.is_some() {
+        output::print_startup_provider_access_configured();
+        return Ok(());
+    }
+
+    output::print_startup_provider_access_missing();
+    use std::io::Write;
+
+    std::io::stdout().flush()?;
+    credentials::prompt_and_store_openrouter_api_key_once()?;
+    output::print_startup_provider_access_configured();
+    Ok(())
 }
 
 /// Format repository-validation failures for terminal display.

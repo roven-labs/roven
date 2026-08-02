@@ -195,7 +195,7 @@ fn startup_command(
     command
         .current_dir(repository)
         .env("LOCALAPPDATA", data_directory.path())
-        .env_remove("OPENROUTER_API_KEY");
+        .env("OPENROUTER_API_KEY", "pmemc-test-openrouter-key");
     command
 }
 
@@ -253,10 +253,10 @@ fn bare_pmemc_validates_then_registers_a_clean_repository() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let validation = stdout
-        .find("[1/3] Repository validation")
+        .find("[1/4] Repository validation")
         .expect("startup should show repository validation");
     let registration = stdout
-        .find("[2/3] Project registration")
+        .find("[2/4] Project registration")
         .expect("startup should show project registration");
     assert!(validation < registration);
     assert!(stdout.contains("✓ Clean committed state"));
@@ -270,6 +270,23 @@ fn bare_pmemc_validates_then_registers_a_clean_repository() {
     assert!(!stdout.contains("Project ID:"));
     assert!(stdout.contains(&git_output(repository.path(), &["rev-parse", "HEAD"])));
     assert!(!stdout.contains(r"\\?\"));
+    let codegraph = stdout
+        .find("[3/4] CodeGraph preparation")
+        .expect("startup should show CodeGraph preparation");
+    let provider = stdout
+        .find("[4/4] Provider access")
+        .expect("startup should show provider access");
+    assert!(registration < codegraph && codegraph < provider);
+    assert!(stdout.contains("OpenRouter API key configured"));
+    assert!(!stdout.contains("pmemc-test-openrouter-key"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("pmemc-test-openrouter-key"));
+    assert!(
+        !String::from_utf8_lossy(
+            &fs::read(data_directory.path().join("PMEMC/pmemc.sqlite3"))
+                .expect("project database should be readable")
+        )
+        .contains("pmemc-test-openrouter-key")
+    );
 }
 
 #[test]
@@ -287,19 +304,20 @@ fn bare_pmemc_declines_missing_codegraph_before_inspection_or_provider_work() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let validation = stdout
-        .find("[1/3] Repository validation")
+        .find("[1/4] Repository validation")
         .expect("startup should validate before CodeGraph preparation");
     let registration = stdout
-        .find("[2/3] Project registration")
+        .find("[2/4] Project registration")
         .expect("startup should register before CodeGraph preparation");
     let codegraph = stdout
-        .find("[3/3] CodeGraph preparation")
+        .find("[3/4] CodeGraph preparation")
         .expect("startup should show CodeGraph preparation");
     assert!(validation < registration && registration < codegraph);
     assert!(stdout.contains("CodeGraph index not found for this project."));
     assert!(stdout.contains("Initialize the local code graph now? [y/N]"));
     assert!(stdout.contains("CodeGraph initialization cancelled."));
     assert!(stdout.contains("No CodeGraph index was created and no LLM work was started."));
+    assert!(!stdout.contains("[4/4] Provider access"));
     assert!(!repository.path().join(".codegraph").exists());
     let connection = rusqlite::Connection::open(data_directory.path().join("PMEMC/pmemc.sqlite3"))
         .expect("project database should open");
@@ -325,7 +343,7 @@ fn bare_pmemc_stops_when_codegraph_is_unavailable() {
     .expect("pmemc should run");
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("[3/3] CodeGraph preparation"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("[3/4] CodeGraph preparation"));
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
         "CodeGraph is not installed.\n\nPMEMC V1 requires CodeGraph to inspect repositories.\n\nInstall CodeGraph in PowerShell:\n\n  irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex\n\nAfter installation, open a new terminal and run `pmemc` again.\n\nOfficial installation guide:\nhttps://colbymchenry.github.io/codegraph/getting-started/installation/\n\nNo CodeGraph, source inspection, or LLM work was started.\n"
@@ -341,7 +359,7 @@ fn bare_pmemc_synchronizes_an_existing_codegraph_index() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("[3/3] CodeGraph preparation"));
+    assert!(stdout.contains("[3/4] CodeGraph preparation"));
     let found = stdout
         .find("Existing index found")
         .expect("existing index should be reported");
@@ -518,7 +536,7 @@ fn bare_pmemc_stops_before_database_access_when_validation_fails() {
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Untracked files (1)"));
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("[2/3] Project registration"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("[2/4] Project registration"));
     assert!(!data_directory.path().join("PMEMC/pmemc.sqlite3").exists());
 }
 
@@ -531,8 +549,8 @@ fn bare_pmemc_reports_a_database_failure_after_validation() {
     let output = pmemc_in_with_data(repository.path(), &data_directory, &[]);
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("[1/3] Repository validation"));
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("[2/3] Project registration"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("[1/4] Repository validation"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("[2/4] Project registration"));
 }
 
 #[test]
