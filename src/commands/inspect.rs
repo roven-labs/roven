@@ -3,7 +3,8 @@
 use std::io::{self, Write};
 
 use crate::{
-    application, baseline, git, inspection, output, provider, provider::ModelProvider, storage,
+    application, baseline, codegraph, git, inspection, output, provider, provider::ModelProvider,
+    storage,
 };
 
 pub(crate) fn run(project_id: &str) -> anyhow::Result<()> {
@@ -13,6 +14,8 @@ pub(crate) fn run(project_id: &str) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("project {project_id} is not registered"))?;
     let reporter = output::InspectionReporter::new();
     let validated_repository = git::validate_repository_for_inspection(&project.canonical_path)?;
+    let codegraph = codegraph::prepare_existing(&validated_repository.root)?;
+    debug_assert_eq!(codegraph.repository_root, validated_repository.root);
     let inspected_metadata = git::metadata(&validated_repository.root)?;
     let status = git::working_tree_status(&validated_repository.root)?;
     let baseline = storage::latest_baseline(&data_paths, id)?;

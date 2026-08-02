@@ -1,6 +1,7 @@
 //! Testable application entry points for PMEMC.
 
 pub mod code_map;
+mod codegraph;
 mod credentials;
 pub mod domain;
 pub mod git;
@@ -32,21 +33,60 @@ pub fn run() -> anyhow::Result<()> {
             let existing_project = storage::list_projects(&data_paths)?
                 .into_iter()
                 .find(|project| project.canonical_path == repository.root);
-            if let Some(project) = existing_project {
-                output::print_startup_registration(&project, "Already registered");
-                return Ok(());
-            }
-            let metadata = git::metadata(&repository.root)?;
-            let project = storage::add_project(
-                &data_paths,
-                &repository.root,
-                metadata.branch.as_deref(),
-                Some(&repository.head_commit),
-            )?;
-            output::print_startup_registration(&project, "Registered successfully");
-            Ok(())
+            let (project, registration_outcome) = match existing_project {
+                Some(project) => (project, "Already registered"),
+                None => {
+                    let metadata = git::metadata(&repository.root)?;
+                    let project = storage::add_project(
+                        &data_paths,
+                        &repository.root,
+                        metadata.branch.as_deref(),
+                        Some(&repository.head_commit),
+                    )?;
+                    (project, "Registered successfully")
+                }
+            };
+            output::print_startup_registration(&project, registration_outcome);
+            prepare_codegraph_startup(&repository.root)
         }
     }
+}
+
+fn prepare_codegraph_startup(repository: &std::path::Path) -> anyhow::Result<()> {
+    output::print_startup_codegraph_preparation();
+    codegraph::check_available(repository)?;
+    if codegraph::index_exists(repository)? {
+        output::print_startup_codegraph_existing_index();
+        output::print_startup_codegraph_synchronizing();
+        let ready = codegraph::synchronize(repository)?;
+        debug_assert_eq!(ready.repository_root, repository);
+        output::print_startup_codegraph_ready();
+        return Ok(());
+    }
+    output::print_startup_codegraph_missing();
+    if !startup_confirmation()? {
+        output::print_startup_codegraph_cancelled();
+        return Ok(());
+    }
+    output::print_startup_codegraph_initializing();
+    codegraph::initialize(repository)?;
+    output::print_startup_codegraph_building_and_synchronizing();
+    let ready = codegraph::synchronize(repository)?;
+    debug_assert_eq!(ready.repository_root, repository);
+    output::print_startup_codegraph_ready();
+    Ok(())
+}
+
+fn startup_confirmation() -> anyhow::Result<bool> {
+    use std::io::{self, Write};
+
+    io::stdout().flush()?;
+    let mut response = String::new();
+    io::stdin().read_line(&mut response)?;
+    Ok(matches!(
+        response.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 /// Format repository-validation failures for terminal display.
@@ -54,6 +94,15 @@ pub fn validation_error_message(error: &anyhow::Error) -> Option<String> {
     error
         .downcast_ref::<git::RepositoryValidationError>()
         .and_then(output::validation_error_message)
+}
+
+/// Format user-facing failures that require structured terminal presentation.
+pub fn user_error_message(error: &anyhow::Error) -> Option<String> {
+    validation_error_message(error).or_else(|| {
+        error
+            .downcast_ref::<codegraph::CodeGraphError>()
+            .map(output::codegraph_error_message)
+    })
 }
 
 /// Stage an approved bundle, invoke a supplied provider, and retain only

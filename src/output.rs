@@ -121,6 +121,20 @@ pub(crate) fn validation_error_message(error: &RepositoryValidationError) -> Opt
     }
 }
 
+pub(crate) fn codegraph_error_message(error: &crate::codegraph::CodeGraphError) -> String {
+    let colors = colors_enabled(
+        io::stderr().is_terminal(),
+        env::var_os("NO_COLOR").is_some(),
+    );
+    match error {
+        crate::codegraph::CodeGraphError::Unavailable => format!(
+            "{}\n\nPMEMC V1 requires CodeGraph to inspect repositories.\n\nInstall CodeGraph in PowerShell:\n\n  irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex\n\nAfter installation, open a new terminal and run `pmemc` again.\n\nOfficial installation guide:\nhttps://colbymchenry.github.io/codegraph/getting-started/installation/\n\nNo CodeGraph, source inspection, or LLM work was started.",
+            styled("CodeGraph is not installed.", Style::Failure, colors),
+        ),
+        _ => format!("{} {error}", styled("✗", Style::Failure, colors)),
+    }
+}
+
 fn render_validation_error(
     title: &str,
     root: &std::path::Path,
@@ -193,7 +207,7 @@ fn startup_registration_message(
     colors: bool,
 ) -> String {
     format!(
-        "[2/2] {}\n  {}\n  Project: {}\n  Repository: {}",
+        "[2/3] {}\n  {}\n  Project: {}\n  Repository: {}",
         styled("Project registration", Style::Info, colors),
         styled(&format!("✓ {outcome}"), Style::Success, colors),
         project.name,
@@ -207,12 +221,68 @@ fn startup_repository_validation_message(
     colors: bool,
 ) -> String {
     format!(
-        "[1/2] {}\n  {}\n  {}\n  Repository: {}\n  HEAD:       {head_commit}",
+        "[1/3] {}\n  {}\n  {}\n  Repository: {}\n  HEAD:       {head_commit}",
         styled("Repository validation", Style::Info, colors),
         styled("✓ Git repository verified", Style::Success, colors),
         styled("✓ Clean committed state", Style::Success, colors),
         root.display(),
     )
+}
+
+pub(crate) fn print_startup_codegraph_preparation() {
+    let colors = colors_enabled(
+        io::stdout().is_terminal(),
+        env::var_os("NO_COLOR").is_some(),
+    );
+    println!(
+        "\n[3/3] {}",
+        styled("CodeGraph preparation", Style::Info, colors)
+    );
+}
+
+pub(crate) fn print_startup_codegraph_missing() {
+    let colors = colors_enabled(
+        io::stdout().is_terminal(),
+        env::var_os("NO_COLOR").is_some(),
+    );
+    println!(
+        "  {} CodeGraph index not found for this project.\n\n  PMEMC V1 requires CodeGraph to inspect this repository.\n  Initialize the local code graph now? [y/N]",
+        styled("•", Style::Info, colors),
+    );
+}
+
+pub(crate) fn print_startup_codegraph_existing_index() {
+    print_startup_codegraph_line(Style::Success, "✓ Existing index found");
+}
+
+pub(crate) fn print_startup_codegraph_synchronizing() {
+    print_startup_codegraph_line(Style::Info, "• Synchronizing code graph...");
+}
+
+pub(crate) fn print_startup_codegraph_initializing() {
+    print_startup_codegraph_line(Style::Info, "• Initializing CodeGraph...");
+}
+
+pub(crate) fn print_startup_codegraph_building_and_synchronizing() {
+    print_startup_codegraph_line(Style::Info, "• Building and synchronizing code graph...");
+}
+
+pub(crate) fn print_startup_codegraph_ready() {
+    print_startup_codegraph_line(Style::Success, "✓ Code graph is ready");
+}
+
+fn print_startup_codegraph_line(style: Style, message: &str) {
+    let colors = colors_enabled(
+        io::stdout().is_terminal(),
+        env::var_os("NO_COLOR").is_some(),
+    );
+    println!("  {}", styled(message, style, colors));
+}
+
+pub(crate) fn print_startup_codegraph_cancelled() {
+    println!(
+        "\nCodeGraph initialization cancelled.\n\nPMEMC V1 cannot inspect this project without CodeGraph.\nNo CodeGraph index was created and no LLM work was started."
+    );
 }
 
 fn append_operations(
@@ -267,6 +337,17 @@ mod tests {
     }
 
     #[test]
+    fn codegraph_errors_use_the_failure_style() {
+        let error = crate::codegraph::CodeGraphError::Unavailable;
+        let message = codegraph_error_message(&error);
+
+        assert_eq!(
+            message,
+            "CodeGraph is not installed.\n\nPMEMC V1 requires CodeGraph to inspect repositories.\n\nInstall CodeGraph in PowerShell:\n\n  irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex\n\nAfter installation, open a new terminal and run `pmemc` again.\n\nOfficial installation guide:\nhttps://colbymchenry.github.io/codegraph/getting-started/installation/\n\nNo CodeGraph, source inspection, or LLM work was started."
+        );
+    }
+
+    #[test]
     fn no_color_disables_styling() {
         assert!(!colors_enabled(true, true));
         assert!(!colors_enabled(false, true));
@@ -276,7 +357,7 @@ mod tests {
     fn startup_repository_validation_uses_terminal_colors() {
         assert_eq!(
             startup_repository_validation_message(std::path::Path::new("C:/repo"), "abc123", true,),
-            "[1/2] \x1b[36mRepository validation\x1b[0m\n  \x1b[32m✓ Git repository verified\x1b[0m\n  \x1b[32m✓ Clean committed state\x1b[0m\n  Repository: C:/repo\n  HEAD:       abc123"
+            "[1/3] \x1b[36mRepository validation\x1b[0m\n  \x1b[32m✓ Git repository verified\x1b[0m\n  \x1b[32m✓ Clean committed state\x1b[0m\n  Repository: C:/repo\n  HEAD:       abc123"
         );
     }
 

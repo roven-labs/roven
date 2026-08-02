@@ -1,6 +1,7 @@
 mod support;
 
 use std::{
+    env, fs,
     io::Write,
     process::{Command, Stdio},
 };
@@ -40,7 +41,40 @@ fn pmemc_with_input(
     arguments: &[&str],
     input: &[u8],
 ) -> std::process::Output {
-    let mut process = Command::new(env!("CARGO_BIN_EXE_pmemc"))
+    pmemc_with_codegraph(data_directory, arguments, input, true)
+}
+
+fn pmemc_with_codegraph(
+    data_directory: &TemporaryDirectory,
+    arguments: &[&str],
+    input: &[u8],
+    ready: bool,
+) -> std::process::Output {
+    let tools_directory = data_directory.path().join("codegraph-tools");
+    fs::create_dir_all(&tools_directory).expect("CodeGraph tools directory should be created");
+    let status = if ready {
+        r#"{"initialized":true,"worktreeMismatch":null,"index":{"state":"complete","pendingRefs":0}}"#
+    } else {
+        r#"{"initialized":false}"#
+    };
+    fs::write(
+        tools_directory.join("codegraph.cmd"),
+        format!(
+            "@echo off\r\nif \"%~1\"==\"--version\" (echo codegraph 1.0 & exit /b 0)\r\nif \"%~1\"==\"status\" (echo {status} & exit /b 0)\r\nif \"%~1\"==\"sync\" exit /b 0\r\nexit /b 1\r\n"
+        ),
+    )
+    .expect("CodeGraph command fixture should be written");
+    let runner = tools_directory.join("run-pmemc.cmd");
+    fs::write(
+        &runner,
+        format!(
+            "@echo off\r\nset \"PATH={};%PATH%\"\r\n\"{}\" %*\r\n",
+            tools_directory.display(),
+            env!("CARGO_BIN_EXE_pmemc")
+        ),
+    )
+    .expect("PMEMC runner fixture should be written");
+    let mut process = Command::new(runner)
         .args(arguments)
         .env("LOCALAPPDATA", data_directory.path())
         .env_remove("OPENROUTER_API_KEY")
@@ -59,6 +93,42 @@ fn pmemc_with_input(
         .write_all(input)
         .expect("inspection response should be written");
     process.wait_with_output().expect("pmemc should finish")
+}
+
+#[test]
+fn inspect_stops_before_provider_work_without_a_ready_codegraph_index() {
+    let data_directory = TemporaryDirectory::new();
+    let repository = TemporaryDirectory::new();
+    git_command(repository.path(), &["init"]);
+    std::fs::write(repository.path().join("source.rs"), "pub fn inspect() {}\n")
+        .expect("source fixture should be written");
+    let _validated = validated_repository(repository.path());
+    let add = Command::new(env!("CARGO_BIN_EXE_pmemc"))
+        .args([
+            "project",
+            "add",
+            repository.path().to_str().expect("UTF-8 test path"),
+        ])
+        .env("LOCALAPPDATA", data_directory.path())
+        .output()
+        .expect("project should be registered");
+    assert!(add.status.success());
+
+    let inspection = pmemc_with_codegraph(&data_directory, &["inspect", "project-1"], b"", false);
+
+    assert!(!inspection.status.success());
+    assert!(
+        String::from_utf8_lossy(&inspection.stderr).contains("CodeGraph index is not initialized")
+    );
+    let connection =
+        rusqlite::Connection::open(data_directory.path().join("PMEMC").join("pmemc.sqlite3"))
+            .expect("database should open");
+    let attempts: i64 = connection
+        .query_row("SELECT COUNT(*) FROM inspection_attempts", [], |row| {
+            row.get(0)
+        })
+        .expect("attempt count should be queryable");
+    assert_eq!(attempts, 0);
 }
 
 #[test]

@@ -4,7 +4,7 @@ This document is the normative scope and behaviour contract for PMEMC (Project M
 
 ## 1. Capability
 
-Version 1 is a local Windows CLI that registers Git repositories, detects committed and uncommitted changes since an approved inspection baseline, constructs a compact structural code map, creates evidence-backed project-fact proposals through OpenRouter, and requires operator review before changing permanent project memory. Status reports uncommitted changes, but repository inspection, code mapping, and provider analysis require a clean repository with a committed HEAD.
+Version 1 is a local Windows CLI that registers Git repositories, detects committed and uncommitted changes since an approved inspection baseline, prepares a CodeGraph index before any repository inspection, creates evidence-backed project-fact proposals through OpenRouter, and requires operator review before changing permanent project memory. Status reports uncommitted changes, but repository inspection, CodeGraph synchronization, code mapping, and provider analysis require a clean repository with a committed HEAD.
 
 ## 2. Fixed decisions
 
@@ -25,7 +25,7 @@ Version 1 is a local Windows CLI that registers Git repositories, detects commit
 
 ## 3. Trust boundaries and invariants
 
-1. Registered repositories are read-only inspection targets.
+1. Registered repositories are read-only inspection targets, except for operator-approved CodeGraph-managed local data.
 2. Repository content is untrusted and is never executed.
 3. Model output is untrusted and cannot directly mutate verified facts.
 4. A verified fact changes only through an explicit operator review decision.
@@ -42,9 +42,12 @@ Version 1 owns only these user-facing commands:
 
 ```text
 pmemc
-  Validate the current Git working tree, then register its canonical repository
-  path when it is not already registered. It does not inspect, map, or send
-  repository content.
+  First validate the current Git working tree, then register its canonical
+  repository path when it is not already registered. Finally prepare
+  CodeGraph: a valid existing index is synchronized and verified; a missing
+  index requires an interactive approval before PMEMC creates it. Validation
+  failure stops before database access. Declining initialization stops without
+  creating CodeGraph data or starting provider work.
 pmemc init
   pmemc project add <path>
   pmemc project list
@@ -63,7 +66,14 @@ When invoked without a subcommand, `pmemc` must render repository validation
 before project registration. Validation failure must stop before the project
 database is opened or written. On successful validation, registration must use
 the canonical repository directory slug as the project name and must not show
-the database relationship identifier.
+the database relationship identifier. It must then render CodeGraph preparation
+as a third visible startup step and stop if CodeGraph is unavailable, cannot be
+initialized or synchronized, or is not ready. Before an existing index is
+synchronized or a new one is initialized, it must display a progress line. A
+missing CLI error must explain that CodeGraph is required, show the official
+PowerShell installation command and guide URL, and state that PMEMC did not
+start CodeGraph, source inspection, or LLM work; PMEMC must not install it or
+open the guide automatically.
 
 ### 4.1 `pmemc init`
 
@@ -144,16 +154,17 @@ Status is read-only and must not change the baseline.
 
 Must:
 
-1. Validate the registered repository before reading source, building the code map, retrying a provider request, or invoking OpenRouter. Validation resolves the root, requires a committed HEAD, and rejects staged, unstaged, non-ignored untracked, conflicted, merged, rebased, cherry-picked, or reverted working trees. Ignored files, locally committed unpushed commits, and untracked data below a confirmed CodeGraph `.codegraph/` directory (identified by `.codegraph/codegraph.db`) do not block validation. Tracked or modified CodeGraph files still block validation.
-2. Ask the operator whether to inspect the reported files.
-3. Stop without mutation if permission is denied.
-4. Inventory allowed files while respecting `.gitignore` and `.pmemcignore`.
-5. Build or update the compact code map.
-6. Build a minimized evidence bundle from changed code, relevant structural neighbours, tests, manifests, and documentation.
-7. Remove blocked secret files and reject suspected credentials from the provider bundle.
-8. Send the approved minimized bundle to OpenRouter.
-9. Validate the provider's structured response.
-10. Store proposals and questions as pending review, without modifying verified facts or the approved baseline.
+1. Validate the registered repository before reading source, synchronizing CodeGraph, building the code map, retrying a provider request, or invoking OpenRouter. Validation resolves the root, requires a committed HEAD, and rejects staged, unstaged, non-ignored untracked, conflicted, merged, rebased, cherry-picked, or reverted working trees. Ignored files, locally committed unpushed commits, and untracked data below a confirmed CodeGraph `.codegraph/` directory (identified by `.codegraph/codegraph.db`) do not block validation. Tracked or modified CodeGraph files still block validation.
+2. Require a synchronized, ready CodeGraph index before any source inspection, code-map construction, retry, or provider submission. PMEMC has no source-reading, custom-code-map, or provider fallback when CodeGraph is unavailable or not ready. If it is missing, direct the operator to run bare `pmemc` from the repository and approve initialization; `inspect` does not create it.
+3. Ask the operator whether to inspect the reported files.
+4. Stop without mutation if permission is denied.
+5. Inventory allowed files while respecting `.gitignore` and `.pmemcignore`.
+6. Build or update the compact code map.
+7. Build a minimized evidence bundle from changed code, relevant structural neighbours, tests, manifests, and documentation.
+8. Remove blocked secret files and reject suspected credentials from the provider bundle.
+9. Send the approved minimized bundle to OpenRouter.
+10. Validate the provider's structured response.
+11. Store proposals and questions as pending review, without modifying verified facts or the approved baseline.
 
 An initial inspection examines the repository broadly enough to establish project context. Later inspections prioritize changes since the baseline and their direct structural neighbours.
 
@@ -361,7 +372,7 @@ Human-readable project summaries may be exported from verified memory. Exports a
 - OpenRouter receives only operator-approved, minimized, filtered evidence.
 - `.env`, private keys, credentials, tokens, and known secret-file patterns are blocked.
 - Logs redact authorization headers and suspected secret values.
-- The tool does not alter source repositories, Git configuration, branches, index, commits, or remotes.
+- The tool does not alter source repositories, Git configuration, branches, index, commits, or remotes. The sole repository-local exception is an operator-approved CodeGraph initialization, which creates only CodeGraph-managed local data.
 - SQL uses bound parameters.
 - Paths are canonicalized and displayed before inspection.
 - Provider keys are never printed.
@@ -382,7 +393,7 @@ Human-readable project summaries may be exported from verified memory. Exports a
 - Normal read-only commands do not require network access.
 - User-facing errors explain the failed operation and recovery action.
 - The CLI works with Windows paths containing spaces and non-ASCII characters.
-- Version 1 remains usable without Graphify, CodeGraph, Docker, WSL, a graph database, or an MCP host.
+- Version 1 requires the CodeGraph CLI and a ready repository-local CodeGraph index for inspection. It does not require Graphify, Docker, WSL, a graph database, or an MCP host.
 - The codebase must pass formatting, Clippy with warnings denied, and automated tests.
 
 ## 15. Acceptance criteria
@@ -402,7 +413,7 @@ Version 1 is complete only when automated tests and a native Windows pilot demon
 11. A conflict cannot be finalized without an operator decision.
 12. Review finalization atomically changes facts and baseline.
 13. Provider and database failures preserve the previous baseline and facts.
-14. Inspection blocks every in-progress Git state before CodeGraph or provider analysis begins.
+14. Inspection blocks every in-progress Git state before CodeGraph or provider analysis begins, and no source or provider work begins before CodeGraph is ready.
 15. New commits and later working-tree changes are detected relative to the approved baseline.
 16. History shows original proposals, corrections, decisions, and evidence.
 17. A fresh agent session can retrieve the same verified memory through the CLI.
