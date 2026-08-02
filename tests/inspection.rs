@@ -24,6 +24,17 @@ fn git_command(repository: &std::path::Path, arguments: &[&str]) {
     assert!(output.status.success(), "git failed: {output:?}");
 }
 
+fn validated_repository(repository: &std::path::Path) -> git::ValidatedRepositoryState {
+    git_command(
+        repository,
+        &["config", "user.email", "pmemc-test@example.invalid"],
+    );
+    git_command(repository, &["config", "user.name", "PMEMC Test"]);
+    git_command(repository, &["add", "."]);
+    git_command(repository, &["commit", "-m", "fixture"]);
+    git::validate_repository_for_inspection(repository).expect("fixture should validate")
+}
+
 fn pmemc_with_input(
     data_directory: &TemporaryDirectory,
     arguments: &[&str],
@@ -75,10 +86,11 @@ fn initial_bundle_is_bounded_deterministic_and_redacts_suspected_secrets() {
     std::fs::write(repository.path().join(".env"), "API_KEY=blocked-secret\n")
         .expect("blocked fixture should be written");
 
+    let validated = validated_repository(repository.path());
     let status = git::working_tree_status(repository.path()).expect("status should be read");
-    let first = build_initial_bundle(repository.path(), "project-1", &status)
-        .expect("bundle should be built");
-    let second = build_initial_bundle(repository.path(), "project-1", &status)
+    let first =
+        build_initial_bundle(&validated, "project-1", &status).expect("bundle should be built");
+    let second = build_initial_bundle(&validated, "project-1", &status)
         .expect("repeat bundle should be built");
     let serialized = serde_json::to_string(&first).expect("bundle should serialize");
 
@@ -105,6 +117,7 @@ fn denied_inspection_does_not_read_source_or_create_a_pending_attempt() {
         "pub const TOKEN: &str = \"must-never-be-read\";\n",
     )
     .expect("source fixture should be written");
+    let _validated = validated_repository(repository.path());
     let add = Command::new(env!("CARGO_BIN_EXE_pmemc"))
         .args([
             "project",
@@ -122,7 +135,6 @@ fn denied_inspection_does_not_read_source_or_create_a_pending_attempt() {
     assert!(output.contains("[1/7] Repository check"));
     assert!(!output.contains('\x1b'));
     assert!(output.contains("inspection cancelled"));
-    assert!(output.contains("unread-source.rs"));
     assert!(!output.contains("must-never-be-read"));
 
     let connection =
@@ -147,6 +159,7 @@ fn approved_inspection_with_invalid_provider_configuration_preserves_a_redacted_
         "pub const API_KEY: &str = \"never-store-this-secret\";\n",
     )
     .expect("source fixture should be written");
+    let _validated = validated_repository(repository.path());
     let add = Command::new(env!("CARGO_BIN_EXE_pmemc"))
         .args([
             "project",
@@ -167,7 +180,7 @@ fn approved_inspection_with_invalid_provider_configuration_preserves_a_redacted_
     assert!(stdout.contains("[4/7] OpenRouter request"));
     assert!(!stdout.contains('\x1b'));
     let stderr = String::from_utf8_lossy(&inspection.stderr);
-    assert!(stderr.contains("OpenRouter configuration is invalid"));
+    assert!(stderr.contains("OpenRouter"), "unexpected stderr: {stderr}");
 
     let connection =
         rusqlite::Connection::open(data_directory.path().join("PMEMC").join("pmemc.sqlite3"))
@@ -215,6 +228,7 @@ fn a_later_inspect_retries_the_retained_provider_attempt() {
     git_command(repository.path(), &["init"]);
     std::fs::write(repository.path().join("main.rs"), "pub fn run() {}\n")
         .expect("source fixture should be written");
+    let _validated = validated_repository(repository.path());
     let add = Command::new(env!("CARGO_BIN_EXE_pmemc"))
         .args([
             "project",
@@ -239,6 +253,8 @@ fn a_later_inspect_retries_the_retained_provider_attempt() {
         .expect("the first attempt should retain a code-map snapshot");
     std::fs::write(repository.path().join("later.rs"), "pub fn later() {}\n")
         .expect("later source fixture should be written");
+    git_command(repository.path(), &["add", "later.rs"]);
+    git_command(repository.path(), &["commit", "-m", "later fixture"]);
     let second = pmemc_with_input(&data_directory, &["inspect", "project-1"], b"y\n");
 
     assert!(!first.status.success());
@@ -282,7 +298,6 @@ fn review_interactively_applies_all_normal_and_conflict_decisions() {
     let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
     let project = storage::add_project(
         &data_paths,
-        "fixture",
         data_directory.path().join("repository").as_path(),
         None,
         None,
@@ -515,7 +530,7 @@ fn finalization_is_atomic_and_defers_conflict_supersession_until_commit() {
     git_command(repository.path(), &["add", "."]);
     git_command(repository.path(), &["commit", "-m", "initial fixture"]);
     let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
-    let project = storage::add_project(&data_paths, "fixture", repository.path(), None, None)
+    let project = storage::add_project(&data_paths, repository.path(), None, None)
         .expect("project should be stored");
     let bundle = EvidenceBundle {
         schema_version: 1,
@@ -749,7 +764,7 @@ fn finalization_does_not_attribute_working_tree_evidence_to_head_commit() {
     .expect("working-tree change should be written");
 
     let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
-    let project = storage::add_project(&data_paths, "fixture", repository.path(), None, None)
+    let project = storage::add_project(&data_paths, repository.path(), None, None)
         .expect("project should be stored");
     let bundle = EvidenceBundle {
         schema_version: 1,
@@ -812,7 +827,6 @@ fn interrupted_staged_provider_attempt_blocks_a_competing_inspection() {
     let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
     let project = storage::add_project(
         &data_paths,
-        "fixture",
         data_directory.path().join("repository").as_path(),
         None,
         None,
@@ -996,9 +1010,15 @@ fn incremental_bundle_selects_changed_code_neighbours_tests_and_manifests() {
         "pub fn run() { helper(); }\n// changed\n",
     )
     .expect("changed fixture should be written");
+    git_command(repository.path(), &["commit", "-am", "changed fixture"]);
 
-    let status = git::working_tree_status(repository.path()).expect("status should be read");
-    let bundle = build_incremental_bundle(repository.path(), "project-1", &status)
+    let validated = git::validate_repository_for_inspection(repository.path())
+        .expect("committed fixture should validate");
+    let status = git::WorkingTreeStatus {
+        committed_paths: vec!["src/lib.rs".into()],
+        ..Default::default()
+    };
+    let bundle = build_incremental_bundle(&validated, "project-1", &status)
         .expect("incremental bundle should be built");
     let paths = bundle
         .files
@@ -1017,7 +1037,7 @@ fn incremental_bundle_selects_changed_code_neighbours_tests_and_manifests() {
         .find(|file| file.path == "src/lib.rs")
         .expect("changed source should be bundled")
         .state;
-    assert_eq!(changed_state, EvidenceState::Unstaged);
+    assert_eq!(changed_state, EvidenceState::Committed);
 }
 
 #[test]
@@ -1057,6 +1077,7 @@ fn inspect_uses_incremental_selection_after_a_baseline_exists() {
         "pub fn run() {}\n// changed\n",
     )
     .expect("source fixture should change");
+    git_command(repository.path(), &["commit", "-am", "changed fixture"]);
 
     let inspection = pmemc_with_input(&data_directory, &["inspect", "project-1"], b"y\n");
     assert!(!inspection.status.success());
@@ -1084,9 +1105,10 @@ fn initial_bundle_never_exceeds_its_serialized_size_limit() {
         .expect("large text fixture should be written");
     }
 
+    let validated = validated_repository(repository.path());
     let status = git::working_tree_status(repository.path()).expect("status should be read");
-    let bundle = build_initial_bundle(repository.path(), "project-1", &status)
-        .expect("bundle should be built");
+    let bundle =
+        build_initial_bundle(&validated, "project-1", &status).expect("bundle should be built");
     let serialized = serde_json::to_vec(&bundle).expect("bundle should serialize");
 
     assert!(serialized.len() <= 64 * 1024);

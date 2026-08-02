@@ -13,6 +13,7 @@ use crate::{inspection, provider, storage};
 pub fn submit_approved_bundle(
     data_paths: &storage::DataPaths,
     project_id: i64,
+    validated_repository: &crate::git::ValidatedRepositoryState,
     bundle: &inspection::EvidenceBundle,
     provider: &dyn provider::ModelProvider,
 ) -> anyhow::Result<i64> {
@@ -23,13 +24,21 @@ pub fn submit_approved_bundle(
         bundle.schema_version,
         &bundle_json,
     )?;
-    submit_staged_bundle(data_paths, attempt_id, bundle, provider, |_, _| {})?;
+    submit_staged_bundle(
+        data_paths,
+        attempt_id,
+        validated_repository,
+        bundle,
+        provider,
+        |_, _| {},
+    )?;
     Ok(attempt_id)
 }
 
 pub(crate) fn submit_staged_bundle(
     data_paths: &storage::DataPaths,
     attempt_id: i64,
+    _validated_repository: &crate::git::ValidatedRepositoryState,
     bundle: &inspection::EvidenceBundle,
     provider: &dyn provider::ModelProvider,
     on_valid_response: impl FnOnce(&provider::ProviderResponse, &provider::ProviderInvocationMetadata),

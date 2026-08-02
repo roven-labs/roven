@@ -11,15 +11,16 @@ pub(crate) fn run(project_id: &str) -> anyhow::Result<()> {
     let id = super::resolve_project_id(&data_paths, project_id)?;
     let project = storage::project_by_id(&data_paths, id)?
         .ok_or_else(|| anyhow::anyhow!("project {project_id} is not registered"))?;
-    let inspected_metadata = git::metadata(&project.canonical_path)?;
-    let status = git::working_tree_status(&project.canonical_path)?;
+    let reporter = output::InspectionReporter::new();
+    let validated_repository = git::validate_repository_for_inspection(&project.canonical_path)?;
+    let inspected_metadata = git::metadata(&validated_repository.root)?;
+    let status = git::working_tree_status(&validated_repository.root)?;
     let baseline = storage::latest_baseline(&data_paths, id)?;
     let inspection_status =
         baseline::status_since_baseline(&project.canonical_path, &status, baseline.as_ref())?;
     let retryable_attempt = storage::failed_provider_attempt_for_project(&data_paths, id)?;
     let reused_attempt = retryable_attempt.is_some();
     let initial_inspection = project.lifecycle_state == "registered_needs_inspection";
-    let reporter = output::InspectionReporter::new();
     let branch = inspected_metadata
         .branch
         .as_deref()
@@ -34,10 +35,7 @@ pub(crate) fn run(project_id: &str) -> anyhow::Result<()> {
         output::Style::Success,
         format!("{branch} @ {head_commit}"),
     );
-    reporter.detail(
-        "project",
-        format!("{} (project-{id})", project.display_name),
-    );
+    reporter.detail("project", &project.name);
     reporter.detail(
         "changed paths",
         baseline::changed_path_count(&inspection_status),
@@ -45,8 +43,8 @@ pub(crate) fn run(project_id: &str) -> anyhow::Result<()> {
     match &retryable_attempt {
         Some(attempt) => {
             println!(
-                "inspection scope for project-{id}: retained approved evidence from attempt {}",
-                attempt.id
+                "inspection scope for {}: retained approved evidence from attempt {}",
+                project.name, attempt.id
             );
             println!(
                 "current changed paths detected: {}",
@@ -63,7 +61,7 @@ pub(crate) fn run(project_id: &str) -> anyhow::Result<()> {
             } else {
                 "changed files and direct structural context"
             };
-            println!("inspection scope for project-{id}: {scope_description}");
+            println!("inspection scope for {}: {scope_description}", project.name);
             println!(
                 "changed paths detected: {}",
                 baseline::changed_path_count(&inspection_status)
@@ -88,27 +86,29 @@ pub(crate) fn run(project_id: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let (bundle, attempt_id) = if let Some(attempt) = retryable_attempt {
+    let (bundle, attempt_id, provider_repository) = if let Some(attempt) = retryable_attempt {
         storage::retry_provider_attempt(&data_paths, attempt.id)?;
-        (attempt.bundle, attempt.id)
+        let provider_repository =
+            git::validate_repository_for_inspection(&validated_repository.root)?;
+        (attempt.bundle, attempt.id, provider_repository)
     } else {
         let package = if initial_inspection {
             inspection::build_initial_package(
-                &project.canonical_path,
+                &validated_repository,
                 project_id,
                 &inspection_status,
             )?
         } else {
             inspection::build_incremental_package(
-                &project.canonical_path,
+                &validated_repository,
                 project_id,
                 &inspection_status,
             )?
         };
-        let post_inspection_metadata = git::metadata(&project.canonical_path)?;
-        let post_inspection_status = git::working_tree_status(&project.canonical_path)?;
-        if post_inspection_metadata.head_commit != inspected_metadata.head_commit
-            || post_inspection_status != status
+        let post_inspection_repository =
+            git::validate_repository_for_inspection(&validated_repository.root)?;
+        if post_inspection_repository.root != validated_repository.root
+            || post_inspection_repository.head_commit != validated_repository.head_commit
         {
             anyhow::bail!(
                 "repository changed during inspection; no evidence was staged, retry the inspection"
@@ -125,13 +125,13 @@ pub(crate) fn run(project_id: &str) -> anyhow::Result<()> {
             &bundle_json,
             Some(&package.code_map_json),
             &storage::BaselineProvenance {
-                repository_commit: inspected_metadata.head_commit.clone(),
+                repository_commit: Some(validated_repository.head_commit.clone()),
                 repository_branch: inspected_metadata.branch.clone(),
                 working_tree_status_json,
                 uncommitted_fingerprints_json,
             },
         )?;
-        (package.bundle, attempt_id)
+        (package.bundle, attempt_id, post_inspection_repository)
     };
     let bundle_bytes = serde_json::to_vec(&bundle)?;
     let redaction_count = bundle.files.iter().filter(|file| file.redacted).count();
@@ -202,6 +202,7 @@ pub(crate) fn run(project_id: &str) -> anyhow::Result<()> {
     let result = application::submit_staged_bundle(
         &data_paths,
         attempt_id,
+        &provider_repository,
         &bundle,
         &provider,
         |response, metadata| {
@@ -240,7 +241,7 @@ pub(crate) fn run(project_id: &str) -> anyhow::Result<()> {
         7,
         "Inspection complete",
         output::Style::Success,
-        format!("run: pmemc review {}", project.display_name),
+        format!("run: pmemc review {}", project.name),
     );
     Ok(())
 }

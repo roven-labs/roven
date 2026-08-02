@@ -31,8 +31,8 @@ fn print_project_status(project: &storage::Project) -> anyhow::Result<()> {
         "initial inspection required"
     };
     println!(
-        "project-{}\t{label}\t{}",
-        project.id,
+        "{}\t{label}\t{}",
+        project.name,
         project.canonical_path.display()
     );
     let metadata = git::metadata(&project.canonical_path)?;

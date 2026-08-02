@@ -83,7 +83,8 @@ fn project_add_registers_a_git_working_tree_without_reading_source_content() {
         .and_then(|name| name.to_str())
         .expect("temporary repository should have a name");
     let add_output = String::from_utf8_lossy(&output.stdout);
-    assert!(add_output.contains(&format!("as {repository_name} (project-1)")));
+    assert!(add_output.contains(&format!("as {repository_name}")));
+    assert!(!add_output.contains("project-1"));
     let list = pmemc(&data_directory, &["project", "list"]);
     assert!(list.status.success());
     let list_output = String::from_utf8_lossy(&list.stdout);
@@ -142,13 +143,12 @@ fn project_add_registers_a_git_working_tree_without_reading_source_content() {
         ],
     );
     assert!(!duplicate.status.success());
-    let after_duplicate = pmemc(&data_directory, &["project", "list"]);
-    assert_eq!(
-        String::from_utf8_lossy(&after_duplicate.stdout)
-            .matches("project-1")
-            .count(),
-        1
-    );
+    let connection = rusqlite::Connection::open(data_directory.path().join("PMEMC/pmemc.sqlite3"))
+        .expect("database should be readable after duplicate registration");
+    let project_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+        .expect("project count should be readable");
+    assert_eq!(project_count, 1);
 
     let non_repository = TemporaryDirectory::new();
     let invalid_add = pmemc(
@@ -164,9 +164,10 @@ fn project_add_registers_a_git_working_tree_without_reading_source_content() {
         String::from_utf8_lossy(&invalid_add.stderr).contains("Git could not inspect"),
         "registration error should identify the Git inspection failure"
     );
-    let after_invalid_add = pmemc(&data_directory, &["project", "list"]);
-    assert!(after_invalid_add.status.success());
-    assert!(!String::from_utf8_lossy(&after_invalid_add.stdout).contains("project-2"));
+    let project_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+        .expect("project count should be readable");
+    assert_eq!(project_count, 1);
 
     std::fs::remove_file(repository.path().join("tracked.txt"))
         .expect("fixture file should be deleted");
@@ -200,8 +201,12 @@ fn project_add_registers_a_git_working_tree_without_reading_source_content() {
     let all_status = pmemc(&data_directory, &["status"]);
     assert!(all_status.status.success());
     let all_status_output = String::from_utf8_lossy(&all_status.stdout);
-    assert!(all_status_output.contains("project-1\tinitial inspection required"));
-    assert!(all_status_output.contains("project-2\tinitial inspection required"));
+    assert!(all_status_output.contains(&repository.path().display().to_string()));
+    assert!(all_status_output.contains(&second_repository.path().display().to_string()));
+    let project_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+        .expect("project count should be readable");
+    assert_eq!(project_count, 2);
 }
 
 #[test]
@@ -344,7 +349,6 @@ fn forget_project_deletes_only_selected_project_memory_transactionally() {
     let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
     let project_a = storage::add_project(
         &data_paths,
-        "project-a",
         repository_a.path(),
         Some("main"),
         Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -352,7 +356,6 @@ fn forget_project_deletes_only_selected_project_memory_transactionally() {
     .expect("project A should be stored");
     let project_b = storage::add_project(
         &data_paths,
-        "project-b",
         repository_b.path(),
         Some("main"),
         Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -448,7 +451,7 @@ fn forget_project_deletes_only_selected_project_memory_transactionally() {
         .expect("project memory should be forgotten");
 
     assert_eq!(summary.project_id, project_a.id);
-    assert_eq!(summary.display_name, "project-a");
+    assert_eq!(summary.name, project_a.name);
     assert!(summary.verified_fact_count >= 1);
     assert!(summary.evidence_count >= 1);
     assert!(source_a.is_file());

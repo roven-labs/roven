@@ -44,19 +44,28 @@ pub(crate) fn resolve_project_id(
     let projects = storage::list_projects(data_paths)?;
     let named_projects = projects
         .iter()
-        .filter(|project| project.display_name == reference)
+        .filter(|project| project.name == reference)
         .collect::<Vec<_>>();
     match named_projects.as_slice() {
         [project] => return Ok(project.id),
         [] => {}
-        _ => anyhow::bail!(
-            "project name `{reference}` is ambiguous; use its project-<number> identifier"
-        ),
+        _ => {}
+    }
+
+    if let Some(project) = projects
+        .iter()
+        .find(|project| project.canonical_path == std::path::Path::new(reference))
+    {
+        return Ok(project.id);
+    }
+
+    if named_projects.len() > 1 {
+        anyhow::bail!("project name `{reference}` is ambiguous; use the canonical repository path");
     }
 
     reference
         .strip_prefix("project-")
         .ok_or_else(|| anyhow::anyhow!("project `{reference}` is not registered"))?
         .parse::<i64>()
-        .map_err(|_| anyhow::anyhow!("project reference must be a name or project-<number>"))
+        .map_err(|_| anyhow::anyhow!("project reference must be a name or repository path"))
 }

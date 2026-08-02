@@ -187,6 +187,12 @@ const MIGRATIONS: &[Migration] = &[
         ALTER TABLE inspection_baselines ADD COLUMN uncommitted_fingerprints_json TEXT NOT NULL DEFAULT '{}';
     ",
     },
+    Migration {
+        version: 10,
+        sql: "
+        ALTER TABLE projects RENAME COLUMN display_name TO name;
+    ",
+    },
 ];
 
 struct Migration {
@@ -243,8 +249,8 @@ pub struct Initialization {
 pub struct Project {
     /// Stable project identifier.
     pub id: i64,
-    /// User-visible repository name.
-    pub display_name: String,
+    /// Repository directory slug used as the project name.
+    pub name: String,
     /// Canonical repository path.
     pub canonical_path: PathBuf,
     /// Durable lifecycle state.
@@ -430,8 +436,8 @@ pub struct ProjectMemory {
 pub struct ForgetSummary {
     /// Stable identifier of the forgotten project.
     pub project_id: i64,
-    /// Display name shown before confirmation.
-    pub display_name: String,
+    /// Repository directory slug shown before confirmation.
+    pub name: String,
     /// Canonical repository path that was deliberately left untouched.
     pub canonical_path: PathBuf,
     /// Number of verified facts removed.
@@ -574,6 +580,7 @@ pub fn initialize(data_paths: &DataPaths) -> Result<Initialization, StorageError
             source,
         })?;
     apply_migrations(&mut connection, MIGRATIONS)?;
+    reconcile_project_names(&mut connection)?;
 
     Ok(Initialization { database_path })
 }
@@ -585,23 +592,23 @@ pub fn initialize(data_paths: &DataPaths) -> Result<Initialization, StorageError
 /// Returns an error if the project already exists or SQLite cannot persist it.
 pub fn add_project(
     data_paths: &DataPaths,
-    display_name: &str,
     canonical_path: &Path,
     current_branch: Option<&str>,
     head_commit: Option<&str>,
 ) -> Result<Project, StorageError> {
+    let name = project_name(canonical_path);
     initialize(data_paths)?;
     let database_path = data_paths.database_path();
     let connection = open_connection(&database_path)
         .map_err(|source| StorageError::ProjectDatabase { source })?;
     let result = connection.execute(
-        "INSERT INTO projects (display_name, canonical_path, lifecycle_state, current_branch, head_commit) VALUES (?1, ?2, 'registered_needs_inspection', ?3, ?4)",
-        params![display_name, canonical_path.to_string_lossy(), current_branch, head_commit],
+        "INSERT INTO projects (name, canonical_path, lifecycle_state, current_branch, head_commit) VALUES (?1, ?2, 'registered_needs_inspection', ?3, ?4)",
+        params![&name, canonical_path.to_string_lossy(), current_branch, head_commit],
     );
     match result {
         Ok(_) => Ok(Project {
             id: connection.last_insert_rowid(),
-            display_name: display_name.into(),
+            name,
             canonical_path: canonical_path.into(),
             lifecycle_state: "registered_needs_inspection".into(),
             current_branch: current_branch.map(str::to_owned),
@@ -627,12 +634,12 @@ pub fn list_projects(data_paths: &DataPaths) -> Result<Vec<Project>, StorageErro
     initialize(data_paths)?;
     let connection = open_connection(&data_paths.database_path())
         .map_err(|source| StorageError::ProjectDatabase { source })?;
-    let mut statement = connection.prepare("SELECT id, display_name, canonical_path, lifecycle_state, current_branch, head_commit FROM projects ORDER BY id").map_err(|source| StorageError::ProjectDatabase { source })?;
+    let mut statement = connection.prepare("SELECT id, name, canonical_path, lifecycle_state, current_branch, head_commit FROM projects ORDER BY id").map_err(|source| StorageError::ProjectDatabase { source })?;
     statement
         .query_map([], |row| {
             Ok(Project {
                 id: row.get(0)?,
-                display_name: row.get(1)?,
+                name: row.get(1)?,
                 canonical_path: PathBuf::from(row.get::<_, String>(2)?),
                 lifecycle_state: row.get(3)?,
                 current_branch: row.get(4)?,
@@ -649,7 +656,7 @@ pub fn project_by_id(data_paths: &DataPaths, id: i64) -> Result<Option<Project>,
     initialize(data_paths)?;
     let connection = open_connection(&data_paths.database_path())
         .map_err(|source| StorageError::ProjectDatabase { source })?;
-    connection.query_row("SELECT id, display_name, canonical_path, lifecycle_state, current_branch, head_commit FROM projects WHERE id = ?1", params![id], |row| Ok(Project { id: row.get(0)?, display_name: row.get(1)?, canonical_path: PathBuf::from(row.get::<_, String>(2)?), lifecycle_state: row.get(3)?, current_branch: row.get(4)?, head_commit: row.get(5)? })).optional().map_err(|source| StorageError::ProjectDatabase { source })
+    connection.query_row("SELECT id, name, canonical_path, lifecycle_state, current_branch, head_commit FROM projects WHERE id = ?1", params![id], |row| Ok(Project { id: row.get(0)?, name: row.get(1)?, canonical_path: PathBuf::from(row.get::<_, String>(2)?), lifecycle_state: row.get(3)?, current_branch: row.get(4)?, head_commit: row.get(5)? })).optional().map_err(|source| StorageError::ProjectDatabase { source })
 }
 
 /// Atomically forget one project's PMEMC registration and all project-owned memory.
@@ -671,9 +678,9 @@ pub fn forget_project(
     let transaction = connection
         .transaction()
         .map_err(|source| StorageError::ProjectDatabase { source })?;
-    let (display_name, canonical_path) = transaction
+    let (name, canonical_path) = transaction
         .query_row(
-            "SELECT display_name, canonical_path FROM projects WHERE id = ?1",
+            "SELECT name, canonical_path FROM projects WHERE id = ?1",
             params![project_id],
             |row| {
                 Ok((
@@ -694,7 +701,7 @@ pub fn forget_project(
     };
     let summary = ForgetSummary {
         project_id,
-        display_name,
+        name,
         canonical_path,
         verified_fact_count: count("SELECT COUNT(*) FROM verified_facts WHERE project_id = ?1")?,
         evidence_count: count("SELECT COUNT(*) FROM fact_evidence WHERE project_id = ?1")?,
@@ -1924,6 +1931,44 @@ pub fn retry_provider_attempt(data_paths: &DataPaths, attempt_id: i64) -> Result
         .map_err(|source| StorageError::ProjectDatabase { source })
 }
 
+fn project_name(canonical_path: &Path) -> String {
+    canonical_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project")
+        .to_owned()
+}
+
+fn reconcile_project_names(connection: &mut Connection) -> Result<(), StorageError> {
+    let projects = {
+        let mut statement = connection
+            .prepare("SELECT id, canonical_path FROM projects")
+            .map_err(|source| StorageError::ProjectDatabase { source })?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|source| StorageError::ProjectDatabase { source })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| StorageError::ProjectDatabase { source })?
+    };
+    let transaction = connection
+        .transaction()
+        .map_err(|source| StorageError::ProjectDatabase { source })?;
+    for (id, canonical_path) in projects {
+        let name = project_name(Path::new(&canonical_path));
+        transaction
+            .execute(
+                "UPDATE projects SET name = ?1 WHERE id = ?2 AND name <> ?1",
+                params![name, id],
+            )
+            .map_err(|source| StorageError::ProjectDatabase { source })?;
+    }
+    transaction
+        .commit()
+        .map_err(|source| StorageError::ProjectDatabase { source })
+}
+
 fn create_directory(path: &Path) -> Result<(), StorageError> {
     fs::create_dir_all(path).map_err(|source| StorageError::CreateDirectory {
         path: path.to_path_buf(),
@@ -2220,6 +2265,37 @@ mod tests {
         assert_eq!(repository_commit, None);
         assert_eq!(fact_kind, "repository_observation");
         assert_eq!(review_table_count, 5);
+    }
+
+    #[test]
+    fn project_name_migration_preserves_the_repository_slug() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite should open");
+        apply_migrations(&mut connection, &MIGRATIONS[..9])
+            .expect("version nine database should initialize");
+        connection
+            .execute(
+                "INSERT INTO projects (display_name, canonical_path, lifecycle_state) VALUES ('fixture', 'C:/fixture', 'registered_needs_inspection')",
+                [],
+            )
+            .expect("legacy project should insert");
+
+        apply_migrations(&mut connection, MIGRATIONS)
+            .expect("project-name migration should upgrade the database");
+
+        let name: String = connection
+            .query_row("SELECT name FROM projects WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("migrated project name should be readable");
+        assert_eq!(name, "fixture");
+        let legacy_column_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name = 'display_name'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("table metadata should be readable");
+        assert_eq!(legacy_column_count, 0);
     }
 
     #[test]

@@ -215,6 +215,12 @@ fn filter_status(
             .filter(|path| contains(path))
             .cloned()
             .collect(),
+        conflicted_paths: status
+            .conflicted_paths
+            .iter()
+            .filter(|path| contains(path))
+            .cloned()
+            .collect(),
         relationships: status
             .relationships
             .iter()

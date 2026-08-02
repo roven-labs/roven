@@ -4,7 +4,7 @@ This document is the normative scope and behaviour contract for PMEMC (Project M
 
 ## 1. Capability
 
-Version 1 is a local Windows CLI that registers Git repositories, detects committed and uncommitted changes since an approved inspection baseline, constructs a compact structural code map, creates evidence-backed project-fact proposals through OpenRouter, and requires operator review before changing permanent project memory.
+Version 1 is a local Windows CLI that registers Git repositories, detects committed and uncommitted changes since an approved inspection baseline, constructs a compact structural code map, creates evidence-backed project-fact proposals through OpenRouter, and requires operator review before changing permanent project memory. Status reports uncommitted changes, but repository inspection, code mapping, and provider analysis require a clean repository with a committed HEAD.
 
 ## 2. Fixed decisions
 
@@ -41,19 +41,29 @@ Version 1 is a local Windows CLI that registers Git repositories, detects commit
 Version 1 owns only these user-facing commands:
 
 ```text
+pmemc
+  Validate the current Git working tree, then register its canonical repository
+  path when it is not already registered. It does not inspect, map, or send
+  repository content.
 pmemc init
   pmemc project add <path>
   pmemc project list
-  pmemc project show <project-id>
-  pmemc project forget <project-id> [--confirm-name <name>]
-  pmemc status [project-id]
-pmemc inspect <project-id>
-pmemc review [project-id]
-pmemc history <project-id>
+  pmemc project show <project-reference>
+  pmemc project forget <project-reference> [--confirm-name <name>]
+  pmemc status [project-reference]
+pmemc inspect <project-reference>
+pmemc review [project-reference]
+pmemc history <project-reference>
 pmemc auth set|status|remove
 ```
 
 Commands may gain flags needed to satisfy this specification, but agents must not add new top-level capabilities without an approved specification change.
+
+When invoked without a subcommand, `pmemc` must render repository validation
+before project registration. Validation failure must stop before the project
+database is opened or written. On successful validation, registration must use
+the canonical repository directory slug as the project name and must not show
+the database relationship identifier.
 
 ### 4.1 `pmemc init`
 
@@ -81,32 +91,32 @@ Must:
 - Resolve and normalize a native Windows path.
 - Verify that the path exists and is a Git working tree.
 - Read the repository root, current branch when present, and HEAD commit when present.
-- Create a stable project ID.
-- Use the repository directory name as the default user-facing project name.
-- Report both the project name and stable ID after registration.
+- Use the repository directory name as the user-visible project name.
+- Keep the database relationship identifier internal.
+- Report the project name and canonical repository path after registration.
 - Reject duplicate registrations of the same canonical repository path.
 - Leave the project in `registered_needs_inspection` state.
 
 Must not inspect source content or create verified project facts.
 
-Commands that accept a project ID also accept an exact registered project name.
-If names are ambiguous, the command must request the stable `project-<number>`
-identifier.
+Commands that accept a project reference accept an exact registered project name
+or canonical repository path. If names are ambiguous, the command must request
+the canonical repository path.
 
 ### 4.3 `pmemc project list`
 
-Must show project ID, display name, canonical path, state, current branch if available, last approved inspection time, and whether changes are currently detected.
+Must show project name, canonical path, state, current branch if available, last approved inspection time, and whether changes are currently detected. Database identifiers must not be shown.
 
-### 4.4 `pmemc project show <project-id>`
+### 4.4 `pmemc project show <project-reference>`
 
 Must show registration details, baseline details, verified facts, unresolved questions, and counts of evidence, proposals, and decisions. It must not invoke OpenRouter.
 
-### 4.5 `pmemc project forget <project-id>`
+### 4.5 `pmemc project forget <project-reference>`
 
 Must:
 
-- Show the selected project's display name, canonical repository path, and non-secret counts of memory records before mutation.
-- Require the operator to type the exact display name, or accept `--confirm-name <name>` when the exact name is supplied by an automation environment.
+- Show the selected project's name, canonical repository path, and non-secret counts of memory records before mutation.
+- Require the operator to type the exact project name, or accept `--confirm-name <name>` when the exact name is supplied by an automation environment.
 - Delete only the selected project's PMEMC registration, inspections, provider metadata, proposals, questions, decisions, conflicts, evidence, verified facts, baselines, and code-map snapshots.
 - Complete all deletion and registration removal in one SQLite transaction.
 - Report that repository files, Git state, credentials, and other registered projects were not changed.
@@ -114,7 +124,7 @@ Must:
 
 This is the explicit operator-requested exception to ordinary decision-history retention. It is irreversible through the V1 CLI and must never be performed implicitly by inspection, review, or provider failure.
 
-### 4.6 `pmemc status [project-id]`
+### 4.6 `pmemc status [project-reference]`
 
 Must compare the current repository with its last approved baseline and report:
 
@@ -130,11 +140,11 @@ When no project ID is provided, it must summarize every registered project.
 
 Status is read-only and must not change the baseline.
 
-### 4.7 `pmemc inspect <project-id>`
+### 4.7 `pmemc inspect <project-reference>`
 
 Must:
 
-1. Run status and display the inspection scope.
+1. Validate the registered repository before reading source, building the code map, retrying a provider request, or invoking OpenRouter. Validation resolves the root, requires a committed HEAD, and rejects staged, unstaged, non-ignored untracked, conflicted, merged, rebased, cherry-picked, or reverted working trees. Ignored files, locally committed unpushed commits, and untracked data below a confirmed CodeGraph `.codegraph/` directory (identified by `.codegraph/codegraph.db`) do not block validation. Tracked or modified CodeGraph files still block validation.
 2. Ask the operator whether to inspect the reported files.
 3. Stop without mutation if permission is denied.
 4. Inventory allowed files while respecting `.gitignore` and `.pmemcignore`.
@@ -147,7 +157,7 @@ Must:
 
 An initial inspection examines the repository broadly enough to establish project context. Later inspections prioritize changes since the baseline and their direct structural neighbours.
 
-### 4.8 `pmemc review [project-id]`
+### 4.8 `pmemc review [project-reference]`
 
 For each pending proposal, the command must show:
 
@@ -169,7 +179,7 @@ The tool must preserve every decision. Correcting a proposal must preserve both 
 
 After all required proposals and conflicts are resolved, the command asks whether to finalize the inspection. Finalization atomically records the accepted facts, decisions, code-map snapshot, and new baseline.
 
-### 4.9 `pmemc history <project-id>`
+### 4.9 `pmemc history <project-reference>`
 
 Must show an ordered audit trail of inspections, proposals, decisions, conflicts, and baseline changes without invoking a provider.
 
@@ -209,13 +219,12 @@ The approved baseline records:
 
 - HEAD object ID, if the repository has commits
 - Branch name or detached-HEAD state
-- Relevant working-tree status
-- Fingerprints for inspected uncommitted files
+- Confirmed clean working-tree status
 - Inspection timestamp
 
 The database must not store complete repository copies. It stores evidence excerpts only when required for auditability and must minimize stored source content.
 
-Version 1 supports normal working trees, empty repositories, detached HEAD, renamed files, deleted files, staged changes, unstaged changes, and untracked non-ignored files. Git submodules may be recorded as explicit dependencies but are not recursively registered or inspected automatically.
+Status supports normal working trees, empty repositories, detached HEAD, renamed files, deleted files, staged changes, unstaged changes, and untracked non-ignored files. Inspection supports only clean repositories with at least one commit; it blocks the other states until the operator commits, stashes, removes, ignores, or resolves them. Git submodules may be recorded as explicit dependencies but are not recursively registered or inspected automatically.
 
 ## 7. Compact code map
 
@@ -291,6 +300,8 @@ An evidence reference contains, when available:
 - Confidence
 
 Facts must not contain invented metrics, results, ownership, team role, motivation, or architectural rationale. When those cannot be proven from repository evidence, the provider produces an operator question instead of a fact.
+
+Phase 1.1 creates inspection evidence only from a validated clean repository state and labels it `committed`.
 
 ## 9. Conflict handling
 
@@ -391,7 +402,7 @@ Version 1 is complete only when automated tests and a native Windows pilot demon
 11. A conflict cannot be finalized without an operator decision.
 12. Review finalization atomically changes facts and baseline.
 13. Provider and database failures preserve the previous baseline and facts.
-14. In-progress evidence remains labelled in progress.
+14. Inspection blocks every in-progress Git state before CodeGraph or provider analysis begins.
 15. New commits and later working-tree changes are detected relative to the approved baseline.
 16. History shows original proposals, corrections, decisions, and evidence.
 17. A fresh agent session can retrieve the same verified memory through the CLI.

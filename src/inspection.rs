@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::{
     code_map::{CodeMap, CodeMapError, build_code_map, serialize_code_map, structural_neighbors},
-    git::WorkingTreeStatus,
+    git::{ValidatedRepositoryState, WorkingTreeStatus},
     inventory::Language,
 };
 
@@ -71,7 +71,7 @@ pub enum InspectionError {
 ///
 /// Returns an error when the compact map cannot inventory the repository.
 pub fn build_initial_bundle(
-    repository: &Path,
+    repository: &ValidatedRepositoryState,
     project_id: &str,
     status: &WorkingTreeStatus,
 ) -> Result<EvidenceBundle, InspectionError> {
@@ -87,11 +87,11 @@ pub fn build_initial_bundle(
 ///
 /// Returns an error when the compact map cannot be built or serialized.
 pub fn build_initial_package(
-    repository: &Path,
+    repository: &ValidatedRepositoryState,
     project_id: &str,
     status: &WorkingTreeStatus,
 ) -> Result<InspectionPackage, InspectionError> {
-    let code_map = build_code_map(repository)?;
+    let code_map = build_code_map(&repository.root)?;
     let code_map_json = serialize_code_map(&code_map).map_err(InspectionError::SerializeCodeMap)?;
     let selected_paths = code_map
         .files
@@ -100,7 +100,7 @@ pub fn build_initial_package(
         .map(|file| file.path.clone())
         .collect();
     let bundle = build_bundle(
-        repository,
+        &repository.root,
         project_id,
         status,
         true,
@@ -119,7 +119,7 @@ pub fn build_initial_package(
 ///
 /// Returns an error when the compact map cannot inventory the repository.
 pub fn build_incremental_bundle(
-    repository: &Path,
+    repository: &ValidatedRepositoryState,
     project_id: &str,
     status: &WorkingTreeStatus,
 ) -> Result<EvidenceBundle, InspectionError> {
@@ -132,15 +132,15 @@ pub fn build_incremental_bundle(
 ///
 /// Returns an error when the compact map cannot be built or serialized.
 pub fn build_incremental_package(
-    repository: &Path,
+    repository: &ValidatedRepositoryState,
     project_id: &str,
     status: &WorkingTreeStatus,
 ) -> Result<InspectionPackage, InspectionError> {
-    let code_map = build_code_map(repository)?;
+    let code_map = build_code_map(&repository.root)?;
     let code_map_json = serialize_code_map(&code_map).map_err(InspectionError::SerializeCodeMap)?;
     let selected_paths = incremental_paths(&code_map, status);
     let bundle = build_bundle(
-        repository,
+        &repository.root,
         project_id,
         status,
         false,

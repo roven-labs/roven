@@ -17,6 +17,87 @@ pub struct RepositoryMetadata {
     pub head_commit: Option<String>,
 }
 
+/// A repository snapshot that is safe to use for code inspection and model analysis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedRepositoryState {
+    pub root: PathBuf,
+    pub head_commit: String,
+}
+
+/// Git state that blocks repository inspection without changing the repository.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepositoryValidationBlockers {
+    pub staged_paths: Vec<String>,
+    pub unstaged_paths: Vec<String>,
+    pub untracked_paths: Vec<String>,
+    pub conflicted_paths: Vec<String>,
+    pub unfinished_operations: Vec<UnfinishedGitOperation>,
+}
+
+impl RepositoryValidationBlockers {
+    fn is_empty(&self) -> bool {
+        self.staged_paths.is_empty()
+            && self.unstaged_paths.is_empty()
+            && self.untracked_paths.is_empty()
+            && self.conflicted_paths.is_empty()
+            && self.unfinished_operations.is_empty()
+    }
+}
+
+impl std::fmt::Display for RepositoryValidationBlockers {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut details = Vec::new();
+        if !self.staged_paths.is_empty() {
+            details.push(format!("staged changes: {}", self.staged_paths.join(", ")));
+        }
+        if !self.unstaged_paths.is_empty() {
+            details.push(format!(
+                "unstaged changes: {}",
+                self.unstaged_paths.join(", ")
+            ));
+        }
+        if !self.untracked_paths.is_empty() {
+            details.push(format!(
+                "untracked files: {}",
+                self.untracked_paths.join(", ")
+            ));
+        }
+        if !self.conflicted_paths.is_empty() {
+            details.push(format!(
+                "merge conflicts: {}",
+                self.conflicted_paths.join(", ")
+            ));
+        }
+        details.extend(
+            self.unfinished_operations
+                .iter()
+                .map(|operation| format!("unfinished {operation}")),
+        );
+        write!(formatter, "{}", details.join("; "))
+    }
+}
+
+/// A Git operation that must be completed or aborted before inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnfinishedGitOperation {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+}
+
+impl std::fmt::Display for UnfinishedGitOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+            Self::CherryPick => "cherry-pick",
+            Self::Revert => "revert",
+        };
+        write!(formatter, "{name}")
+    }
+}
+
 /// A rename or copy relationship reported by Git.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathRelationship {
@@ -43,6 +124,7 @@ pub struct WorkingTreeStatus {
     pub staged_paths: Vec<String>,
     pub unstaged_paths: Vec<String>,
     pub deleted_paths: Vec<String>,
+    pub conflicted_paths: Vec<String>,
     pub relationships: Vec<PathRelationship>,
 }
 
@@ -61,12 +143,31 @@ pub enum GitError {
     InvalidCommitCount { path: PathBuf, value: String },
 }
 
+/// A repository could not be used for source inspection or model analysis.
+#[derive(Debug, Error)]
+pub enum RepositoryValidationError {
+    #[error(transparent)]
+    Git(#[from] GitError),
+    #[error(
+        "PMEMC cannot inspect {root}: the repository has no commits. Create at least one commit before inspection."
+    )]
+    MissingCommit { root: PathBuf },
+    #[error(
+        "PMEMC inspection is blocked for {root}: {blockers}. Commit, stash, remove, or ignore the listed files as appropriate, then retry."
+    )]
+    Dirty {
+        root: PathBuf,
+        blockers: Box<RepositoryValidationBlockers>,
+    },
+}
+
 /// Read Git repository metadata without reading source files.
 pub fn metadata(path: &Path) -> Result<RepositoryMetadata, GitError> {
     let root = run(path, &["rev-parse", "--show-toplevel"])?;
     let root = PathBuf::from(root.trim());
     let root =
         fs::canonicalize(&root).map_err(|source| GitError::Canonicalize { path: root, source })?;
+    let root = normalized_windows_path(root);
     let branch = optional(&root, &["branch", "--show-current"])?;
     let head_commit = optional(&root, &["rev-parse", "HEAD"])?;
     Ok(RepositoryMetadata {
@@ -74,6 +175,57 @@ pub fn metadata(path: &Path) -> Result<RepositoryMetadata, GitError> {
         branch,
         head_commit,
     })
+}
+
+fn normalized_windows_path(path: PathBuf) -> PathBuf {
+    let path = path.to_string_lossy();
+    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{path}"))
+    } else {
+        PathBuf::from(path.strip_prefix(r"\\?\").unwrap_or(&path))
+    }
+}
+
+/// Validate that a repository can safely enter an inspection workflow.
+///
+/// This reads only Git metadata. Ignored files do not appear in the porcelain
+/// status output and therefore do not block validation.
+pub fn validate_repository_for_inspection(
+    path: &Path,
+) -> Result<ValidatedRepositoryState, RepositoryValidationError> {
+    let metadata = metadata(path)?;
+    let head_commit =
+        metadata
+            .head_commit
+            .ok_or_else(|| RepositoryValidationError::MissingCommit {
+                root: metadata.root.clone(),
+            })?;
+    let status = working_tree_status(&metadata.root)?;
+    let blockers = RepositoryValidationBlockers {
+        staged_paths: status.staged_paths,
+        unstaged_paths: status.unstaged_paths,
+        untracked_paths: status
+            .untracked_paths
+            .into_iter()
+            .filter(|path| !is_confirmed_codegraph_data(&metadata.root, path))
+            .collect(),
+        conflicted_paths: status.conflicted_paths,
+        unfinished_operations: unfinished_operations(&metadata.root)?,
+    };
+    if !blockers.is_empty() {
+        return Err(RepositoryValidationError::Dirty {
+            root: metadata.root,
+            blockers: Box::new(blockers),
+        });
+    }
+    Ok(ValidatedRepositoryState {
+        root: metadata.root,
+        head_commit,
+    })
+}
+
+fn is_confirmed_codegraph_data(root: &Path, path: &str) -> bool {
+    path.starts_with(".codegraph/") && root.join(".codegraph/codegraph.db").is_file()
 }
 
 /// Read all required working-tree changes in one Git status invocation.
@@ -212,6 +364,11 @@ fn parse_working_tree_status(output: &[u8]) -> WorkingTreeStatus {
             continue;
         }
 
+        if let Some(path) = conflicted_record(record) {
+            status.conflicted_paths.push(path);
+            continue;
+        }
+
         let Some((xy, path)) = ordinary_record(record)
             .or_else(|| relationship_record(record, &mut records, &mut status))
         else {
@@ -221,6 +378,13 @@ fn parse_working_tree_status(output: &[u8]) -> WorkingTreeStatus {
     }
 
     status
+}
+
+fn conflicted_record(record: &[u8]) -> Option<String> {
+    let mut fields = record.splitn(11, |byte| *byte == b' ');
+    (fields.next()? == b"u").then_some(())?;
+    let path = fields.nth(9)?;
+    Some(String::from_utf8_lossy(path).into_owned())
 }
 
 fn ordinary_record(record: &[u8]) -> Option<(&[u8], String)> {
@@ -270,6 +434,43 @@ fn collect_path_states(status: &mut WorkingTreeStatus, xy: &[u8], path: String) 
     if xy.contains(&b'D') {
         status.deleted_paths.push(path);
     }
+}
+
+fn unfinished_operations(root: &Path) -> Result<Vec<UnfinishedGitOperation>, GitError> {
+    let mut operations = Vec::new();
+    for (operation, markers) in [
+        (UnfinishedGitOperation::Merge, &["MERGE_HEAD"][..]),
+        (
+            UnfinishedGitOperation::Rebase,
+            &["rebase-apply", "rebase-merge"][..],
+        ),
+        (
+            UnfinishedGitOperation::CherryPick,
+            &["CHERRY_PICK_HEAD"][..],
+        ),
+        (UnfinishedGitOperation::Revert, &["REVERT_HEAD"][..]),
+    ] {
+        let unfinished = markers
+            .iter()
+            .map(|marker| git_path_exists(root, marker))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|exists| exists);
+        if unfinished {
+            operations.push(operation);
+        }
+    }
+    Ok(operations)
+}
+
+fn git_path_exists(root: &Path, marker: &str) -> Result<bool, GitError> {
+    let resolved = run(root, &["rev-parse", "--git-path", marker])?;
+    let path = PathBuf::from(resolved.trim());
+    Ok(if path.is_absolute() {
+        path.exists()
+    } else {
+        root.join(path).exists()
+    })
 }
 
 fn optional(path: &Path, arguments: &[&str]) -> Result<Option<String>, GitError> {

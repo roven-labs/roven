@@ -12,6 +12,8 @@ mod support;
 
 use std::{
     collections::VecDeque,
+    fs,
+    process::Command,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -80,6 +82,38 @@ fn bundle_with_state(state: EvidenceState) -> EvidenceBundle {
             redacted: false,
         }],
     }
+}
+
+fn validated_repository() -> (
+    support::TemporaryDirectory,
+    pmemc::git::ValidatedRepositoryState,
+) {
+    let repository = support::TemporaryDirectory::new();
+    for arguments in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.email", "pmemc-test@example.invalid"],
+        vec!["config", "user.name", "PMEMC Test"],
+    ] {
+        let output = Command::new("git")
+            .args(arguments)
+            .current_dir(repository.path())
+            .output()
+            .expect("git should run");
+        assert!(output.status.success(), "git failed: {output:?}");
+    }
+    fs::write(repository.path().join("src-lib.rs"), "fixture\n")
+        .expect("fixture should be written");
+    for arguments in [vec!["add", "."], vec!["commit", "-m", "fixture"]] {
+        let output = Command::new("git")
+            .args(arguments)
+            .current_dir(repository.path())
+            .output()
+            .expect("git should run");
+        assert!(output.status.success(), "git failed: {output:?}");
+    }
+    let validated = pmemc::git::validate_repository_for_inspection(repository.path())
+        .expect("fixture should validate");
+    (repository, validated)
 }
 
 #[test]
@@ -202,12 +236,12 @@ fn inferred_and_user_confirmed_proposals_can_be_finalized() {
     ] {
         let data_directory = support::TemporaryDirectory::new();
         let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
+        let (_repository, validated) = validated_repository();
         let project = storage::add_project(
             &data_paths,
-            "fixture",
-            data_directory.path().join("repository").as_path(),
+            &validated.root,
             None,
-            None,
+            Some(&validated.head_commit),
         )
         .expect("project should be stored");
         let response = ProviderResponse {
@@ -223,9 +257,14 @@ fn inferred_and_user_confirmed_proposals_can_be_finalized() {
         };
         let provider = FakeProvider::new(response);
 
-        let _attempt_id =
-            pmemc::submit_approved_bundle(&data_paths, project.id, &bundle(), &provider)
-                .expect("fake submission should succeed");
+        let _attempt_id = pmemc::submit_approved_bundle(
+            &data_paths,
+            project.id,
+            &validated,
+            &bundle(),
+            &provider,
+        )
+        .expect("fake submission should succeed");
         storage::record_review_decision(&data_paths, 1, &storage::ReviewDecision::Approve)
             .expect("proposal approval should be recorded");
         storage::finalize_review(&data_paths, project.id)
@@ -246,7 +285,6 @@ fn provider_flags_materially_different_statements_as_conflicts() {
     let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
     let project = storage::add_project(
         &data_paths,
-        "fixture",
         data_directory.path().join("repository").as_path(),
         None,
         None,
@@ -298,7 +336,6 @@ fn provider_results_are_pending_review_with_invocation_metadata() {
     let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
     let project = storage::add_project(
         &data_paths,
-        "fixture",
         data_directory.path().join("repository").as_path(),
         None,
         None,
@@ -576,12 +613,12 @@ fn provider_results_are_pending_review_with_invocation_metadata() {
 fn approved_bundle_submission_uses_the_fake_provider_without_network_access() {
     let data_directory = support::TemporaryDirectory::new();
     let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
+    let (_repository, validated) = validated_repository();
     let project = storage::add_project(
         &data_paths,
-        "fixture",
-        data_directory.path().join("repository").as_path(),
+        &validated.root,
         None,
-        None,
+        Some(&validated.head_commit),
     )
     .expect("project should be stored");
     let response = parse_response(
@@ -601,8 +638,9 @@ fn approved_bundle_submission_uses_the_fake_provider_without_network_access() {
     .expect("response should validate");
     let provider = FakeProvider::new(response);
 
-    let attempt_id = pmemc::submit_approved_bundle(&data_paths, project.id, &bundle(), &provider)
-        .expect("fake submission should succeed");
+    let attempt_id =
+        pmemc::submit_approved_bundle(&data_paths, project.id, &validated, &bundle(), &provider)
+            .expect("fake submission should succeed");
 
     let connection = rusqlite::Connection::open(data_paths.database_path())
         .expect("database should be readable");
@@ -624,12 +662,12 @@ fn approved_bundle_submission_uses_the_fake_provider_without_network_access() {
 fn provider_failure_restores_the_previous_project_lifecycle() {
     let data_directory = support::TemporaryDirectory::new();
     let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
+    let (_repository, validated) = validated_repository();
     let project = storage::add_project(
         &data_paths,
-        "fixture",
-        data_directory.path().join("repository").as_path(),
+        &validated.root,
         None,
-        None,
+        Some(&validated.head_commit),
     )
     .expect("project should be stored");
     let bundle_json = serde_json::to_string(&bundle()).expect("bundle should serialize");
@@ -684,7 +722,6 @@ fn failed_provider_attempt_can_retry_without_losing_invocation_history() {
     let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
     let project = storage::add_project(
         &data_paths,
-        "fixture",
         data_directory.path().join("repository").as_path(),
         None,
         None,
@@ -736,7 +773,6 @@ fn persistence_revalidates_untrusted_provider_response_against_staged_evidence()
     let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
     let project = storage::add_project(
         &data_paths,
-        "fixture",
         data_directory.path().join("repository").as_path(),
         None,
         None,
@@ -863,12 +899,12 @@ fn provider_metadata_records_the_actual_routed_model() {
 fn submitted_provider_invocation_persists_the_actual_routed_model() {
     let data_directory = support::TemporaryDirectory::new();
     let data_paths = storage::DataPaths::from_root(data_directory.path().join("PMEMC"));
+    let (_repository, validated) = validated_repository();
     let project = storage::add_project(
         &data_paths,
-        "fixture",
-        data_directory.path().join("repository").as_path(),
+        &validated.root,
         None,
-        None,
+        Some(&validated.head_commit),
     )
     .expect("project should be stored");
     let transport = ScriptedTransport::new([Ok(json!({
@@ -885,7 +921,7 @@ fn submitted_provider_invocation_persists_the_actual_routed_model() {
         transport,
     );
 
-    pmemc::submit_approved_bundle(&data_paths, project.id, &bundle(), &provider)
+    pmemc::submit_approved_bundle(&data_paths, project.id, &validated, &bundle(), &provider)
         .expect("submission should succeed");
 
     let connection = rusqlite::Connection::open(data_paths.database_path())

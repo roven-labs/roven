@@ -18,23 +18,16 @@ pub(crate) fn run(command: cli::ProjectCommand) -> anyhow::Result<()> {
     match command {
         cli::ProjectCommand::Add { path } => {
             let metadata = git::metadata(&path)?;
-            let name = metadata
-                .root
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("project");
             let project = storage::add_project(
                 &data_paths,
-                name,
                 &metadata.root,
                 metadata.branch.as_deref(),
                 metadata.head_commit.as_deref(),
             )?;
             println!(
-                "registered {} as {} (project-{})",
+                "registered {} as {}",
                 project.canonical_path.display(),
-                project.display_name,
-                project.id
+                project.name,
             );
             Ok(())
         }
@@ -58,9 +51,8 @@ pub(crate) fn run(command: cli::ProjectCommand) -> anyhow::Result<()> {
                 let changes_detected =
                     commits_since_baseline != 0 || baseline::changed_path_count(&status) != 0;
                 println!(
-                    "project-{}\t{}\t{}\t{}\tbranch={}\tlast-approved-inspection={}\tchanges-detected={}",
-                    project.id,
-                    project.display_name,
+                    "{}\t{}\t{}\tbranch={}\tlast-approved-inspection={}\tchanges-detected={}",
+                    project.name,
                     project.canonical_path.display(),
                     project.lifecycle_state,
                     metadata.branch.as_deref().unwrap_or("detached"),
@@ -84,9 +76,8 @@ pub(crate) fn run(command: cli::ProjectCommand) -> anyhow::Result<()> {
             let project = storage::project_by_id(&data_paths, id)?
                 .ok_or_else(|| anyhow::anyhow!("project {project_id} is not registered"))?;
             println!(
-                "project-{}\t{}\t{}\t{}\tbranch={}\thead={}",
-                project.id,
-                project.display_name,
+                "{}\t{}\t{}\tbranch={}\thead={}",
+                project.name,
                 project.canonical_path.display(),
                 project.lifecycle_state,
                 project.current_branch.as_deref().unwrap_or("detached"),
@@ -140,7 +131,7 @@ fn forget(
         .ok_or_else(|| anyhow::anyhow!("project {project_reference} is not registered"))?;
     let memory = storage::project_memory(data_paths, id)?;
     println!("PMEMC project forget preview");
-    println!("project\t{} (project-{})", project.display_name, project.id);
+    println!("project\t{}", project.name);
     println!("repository\t{}", project.canonical_path.display());
     println!("verified-facts\t{}", memory.verified_facts.len());
     println!("evidence\t{}", memory.evidence_count);
@@ -150,13 +141,13 @@ fn forget(
     println!("This permanently removes this project's PMEMC memory and registration.");
 
     let confirmed = match confirm_name {
-        Some(name) => name == project.display_name,
+        Some(name) => name == project.name,
         None => {
-            print!("Type {} to confirm: ", project.display_name);
+            print!("Type {} to confirm: ", project.name);
             io::stdout().flush()?;
             let mut response = String::new();
             io::stdin().read_line(&mut response)?;
-            response.trim() == project.display_name
+            response.trim() == project.name
         }
     };
     if !confirmed {
@@ -166,8 +157,8 @@ fn forget(
 
     let summary = storage::forget_project(data_paths, id)?;
     println!(
-        "PMEMC memory and registration forgotten for {} (project-{})",
-        summary.display_name, summary.project_id
+        "PMEMC memory and registration forgotten for {}",
+        summary.name
     );
     println!(
         "removed\tfacts={} evidence={} proposals={} questions={} decisions={} inspections={}",

@@ -7,12 +7,11 @@ use clap::{Parser, Subcommand};
     name = "pmemc",
     version,
     about = "PMEMC — Project Memory CLI",
-    long_about = None,
-    arg_required_else_help = true
+    long_about = None
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -85,6 +84,6 @@ pub(crate) enum AuthCommand {
     Remove,
 }
 
-pub(crate) fn parse() -> Command {
+pub(crate) fn parse() -> Option<Command> {
     Cli::parse().command
 }
