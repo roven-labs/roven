@@ -1,4 +1,4 @@
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -33,11 +33,4 @@ pub(crate) enum AuthCommand {
 
 pub(crate) fn parse() -> Cli {
     Cli::parse()
-}
-
-pub(crate) fn print_help() -> anyhow::Result<()> {
-    let mut command = Cli::command();
-    command.print_help()?;
-    println!();
-    Ok(())
 }

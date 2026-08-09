@@ -2,13 +2,20 @@
 
 ## 1. Scope
 
-Version 1 is currently reset to a local Windows 11 credential-management
-baseline. It has one Cargo package and no active repository or agent
-capability.
+Version 1 is a native Windows 11 terminal UI preview plus local credential
+management. It has one Cargo package. The UI preview is local only: it has no
+model provider, credential read, external request, repository access, or
+durable session state.
 
 ## 2. Public interface
 
-The only supported command group is:
+Bare `pmemc` opens a full-screen terminal UI preview. The preview presents a
+muted `PMEMC` / `UI Preview` header, a left-aligned transcript, and a
+multi-line composer. A submitted non-empty message appends a `You ›` turn and
+then the fixed local preview reply. It must restore the terminal screen on
+exit.
+
+The supported credential commands are:
 
 ```text
 pmemc auth set
@@ -16,10 +23,23 @@ pmemc auth status
 pmemc auth remove
 ```
 
-Bare `pmemc` must not start a conversational session, inspect the current
-directory, access a repository, or make an external request.
+## 3. UI-preview behavior
 
-## 3. Credential lifecycle
+- `Enter` submits; `Alt+Enter` inserts a newline.
+- The composer grows to four lines and then scrolls internally.
+- Keyboard and mouse-wheel transcript navigation are supported; a scrollbar
+  appears only while away from the newest content.
+- `Ctrl+C` exits immediately.
+- A terminal too small for the layout shows `Resize terminal to continue`.
+- Roles are text-labelled and use restrained semantic colors. Message content
+  is plain wrapped text; no Markdown, spinner, footer hints, or in-chat
+  commands are in scope.
+
+The preview must not read credentials, contact OpenRouter or another service,
+stream model output, persist messages, inspect the working directory, access
+a repository, expose tools, or execute commands.
+
+## 4. Credential lifecycle
 
 `pmemc auth set` accepts a secret without echoing it and stores it in Windows
 Credential Manager. `pmemc auth status` exposes configuration status only.
@@ -28,24 +48,13 @@ Credential Manager. `pmemc auth status` exposes configuration status only.
 The secret must never be written to SQLite or another PMEMC database, logs,
 terminal output, command arguments, repository files, or test fixtures.
 
-## 4. Explicitly absent capabilities
+## 5. Deferred capabilities
 
-The current V1 executable has no database, project registration, repository
-validation, CodeGraph integration, source discovery, model configuration,
-external provider transport, conversational session, or model-visible tool
-catalog. It also has no inspection, evidence, baseline, proposal, review,
-verified-memory, portfolio, resume, filesystem-write, Git-write, MCP,
-plugin, or background-monitoring workflow.
-
-No capability in this list may be reintroduced as a hidden fallback,
-environment-variable side effect, or undocumented command.
-
-## 5. Future changes
-
-A future capability requires a new approved V1 contract before implementation.
-That contract must define its public interface, data ownership, approval
-boundary, failure behavior, and acceptance tests. This specification does not
-authorize implementation or scaffolding of those capabilities.
+Model-provider transport, OpenRouter integration, streaming, conversational
+memory, repository workflows, source discovery, database storage, agent tools,
+MCP, plugins, and background monitoring are deferred. They require a new
+approved contract defining their public interface, data ownership, approval
+boundary, failure behavior, and acceptance tests.
 
 ## 6. Verification
 

@@ -3,6 +3,7 @@
 mod cli;
 mod commands;
 mod credentials;
+mod ui;
 
 /// Run the currently implemented Version 1 command.
 ///
@@ -12,6 +13,6 @@ mod credentials;
 pub fn run() -> anyhow::Result<()> {
     match cli::parse().command {
         Some(command) => commands::run(command),
-        None => cli::print_help(),
+        None => ui::run(),
     }
 }

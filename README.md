@@ -1,8 +1,13 @@
 # PMEMC
 
-PMEMC is a native Windows CLI at a capability-free V1 reset point.
+PMEMC is a native Windows terminal application with a local UI preview and
+local credential management.
 
-The only active command group is local credential management:
+Running bare `pmemc` opens a full-screen UI preview. It lets you compose local
+turns and displays a fixed preview reply; it does not read a credential, make
+an external request, or contact a model provider.
+
+Credential management remains available through:
 
 ```powershell
 pmemc auth set
@@ -15,10 +20,9 @@ pmemc auth remove
 deletes that stored credential. PMEMC does not print the credential, write it
 to a repository, or keep it in a PMEMC database.
 
-PMEMC currently has no conversational session, agent tools, repository
-registration, project database, source discovery, CodeGraph integration,
-model selection, or external request capability. Future capabilities require
-their own approved V1 contract before they are implemented.
+The UI preview has no provider transport, streaming, persistent session,
+agent tools, repository access, source discovery, model selection, or external
+request capability. Those capabilities require their own approved contract.
 
 ## Install
 

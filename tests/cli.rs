@@ -25,20 +25,6 @@ fn help_describes_the_version_one_command_surface() {
 }
 
 #[test]
-fn bare_invocation_displays_local_help_without_starting_a_session() {
-    let output = pmemc(&[]);
-
-    assert!(output.status.success());
-
-    let stdout = String::from_utf8(output.stdout).expect("help should be UTF-8");
-    assert!(stdout.contains("Usage: pmemc [COMMAND]"));
-    assert!(stdout.contains("auth"));
-    assert!(!stdout.contains("session"));
-    assert!(!stdout.contains("pmemc>"));
-    assert!(!stdout.contains("pmemc_prepare_project"));
-}
-
-#[test]
 fn auth_is_the_only_retained_command_surface() {
     let output = pmemc(&["auth", "--help"]);
 

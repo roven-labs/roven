@@ -1,1 +1,4 @@
 /target
+/.codegraph/
+/.tours/
+/docs/superpowers/

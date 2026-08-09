@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.48", features = ["derive"] }
+crossterm = "0.29.0"
 keyring = "4.1.6"
+ratatui = "0.30.2"
 rpassword = "7.3.0"
 thiserror = "2.0.17"
