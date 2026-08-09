@@ -21,9 +21,11 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
+    agent::{self, AgentEvent, AgentMessage},
     credentials,
-    provider::{ChatMessage, ChatRequest, ModelProvider, OpenRouterProvider, StreamEvent},
+    provider::OpenRouterProvider,
     storage::{ConversationEvent, EventKind, ProjectStore, SessionMeta, now_ms},
+    tools::ToolContext,
 };
 
 use super::{
@@ -37,8 +39,11 @@ enum WorkerEvent {
     Text(String),
     Finished,
     Cancelled,
+    Activity(String),
     Error(String),
 }
+
+const TOOL_USE_POLICY: &str = "The current trusted workspace is the project the user means by `this project`, `these projects`, `this workspace`, or an unqualified request to add/register the project. Do not ask for a path in those cases: call `prepare_project` with `{\"path\":\".\"}`. When the user asks for the current workspace path, call `list_directory` with `{\"path\":\".\"}` and report its `workspace_path` value verbatim; never report `.` as the human-facing path. When the user asks to inspect, explain, or diagram the current project's structure, first call `list_directory` with `{\"path\":\".\"}` and base the response only on its returned entries. Call `list_directory` again for a named subdirectory only when needed; it never recurses automatically.";
 
 pub(crate) fn run() -> anyhow::Result<()> {
     let mut guard = TerminalGuard::enter()?;
@@ -199,7 +204,9 @@ fn run_loop() -> anyhow::Result<()> {
                     state.start_agent();
                     let flag = Arc::new(AtomicBool::new(false));
                     cancellation = Some(flag.clone());
-                    spawn_worker(sender.clone(), flag, messages);
+                    let tool_context =
+                        ToolContext::new(std::path::PathBuf::from(&state.project_path))?;
+                    spawn_worker(sender.clone(), flag, messages, tool_context);
                 }
             }
             Event::Key(KeyEvent {
@@ -236,26 +243,31 @@ fn run_loop() -> anyhow::Result<()> {
 fn spawn_worker(
     sender: mpsc::Sender<WorkerEvent>,
     cancelled: Arc<AtomicBool>,
-    messages: Vec<ChatMessage>,
+    messages: Vec<AgentMessage>,
+    tool_context: ToolContext,
 ) {
     thread::spawn(move || {
         let result = match credentials::load_openrouter_api_key() {
-            Ok(Some(key)) => OpenRouterProvider
-                .stream(
-                    &key,
-                    &ChatRequest::new(messages),
-                    &cancelled,
-                    &mut |event| {
-                        let message = match event {
-                            StreamEvent::Thought(thought) => WorkerEvent::Thought(thought),
-                            StreamEvent::Text(text) => WorkerEvent::Text(text),
-                            StreamEvent::Finished => WorkerEvent::Finished,
-                            StreamEvent::Cancelled => WorkerEvent::Cancelled,
-                        };
-                        let _ = sender.send(message);
-                    },
-                )
-                .map_err(|error| error.to_string()),
+            Ok(Some(key)) => agent::run(
+                &OpenRouterProvider,
+                &key,
+                messages,
+                &tool_context,
+                &cancelled,
+                &mut |event| {
+                    let message = match event {
+                        AgentEvent::Thought(thought) => WorkerEvent::Thought(thought),
+                        AgentEvent::Text(text) => WorkerEvent::Text(text),
+                        AgentEvent::ToolResult(result) => {
+                            WorkerEvent::Activity(format!("{} completed", result.name))
+                        }
+                        AgentEvent::Finished => WorkerEvent::Finished,
+                        AgentEvent::Cancelled => WorkerEvent::Cancelled,
+                    };
+                    let _ = sender.send(message);
+                },
+            )
+            .map_err(|error| error.to_string()),
             Ok(None) => Err("OpenRouter key missing. Run `roven auth set`.".to_owned()),
             Err(error) => Err(error.to_string()),
         };
@@ -274,6 +286,7 @@ fn apply_worker_event(
     match event {
         WorkerEvent::Thought(thought) => state.append_thought(thought),
         WorkerEvent::Text(text) => state.append_agent_text(text),
+        WorkerEvent::Activity(message) => state.activity(message),
         WorkerEvent::Finished | WorkerEvent::Cancelled => {
             let stopped = matches!(event, WorkerEvent::Cancelled);
             state.finish_agent();
@@ -343,28 +356,25 @@ fn request_messages(
     store: &ProjectStore,
     session: &SessionMeta,
     project_instructions: &str,
-) -> anyhow::Result<Vec<ChatMessage>> {
-    let mut messages = vec![ChatMessage {
-        role: "system",
+) -> anyhow::Result<Vec<AgentMessage>> {
+    let mut messages = vec![AgentMessage::System {
         content: format!(
-            "You are Roven, a concise read-only project assistant. Rust harness rules are outside your control. Do not claim to edit files or run commands.{}",
+            "You are Roven, a concise project assistant. The Roven harness authorizes and executes tools; do not claim a tool ran unless its result confirms it.\n\n{}{}",
+            TOOL_USE_POLICY,
             if project_instructions.is_empty() {
                 String::new()
             } else {
                 format!("\n\nProject instructions:\n{project_instructions}")
             }
         ),
-        reasoning: None,
     }];
     let mut pending_reasoning: Option<String> = None;
     for event in store.events(&session.id)? {
         match event.kind {
             EventKind::User => {
                 pending_reasoning = None;
-                messages.push(ChatMessage {
-                    role: "user",
+                messages.push(AgentMessage::User {
                     content: event.content,
-                    reasoning: None,
                 });
             }
             EventKind::Thought => {
@@ -377,10 +387,10 @@ fn request_messages(
                 });
             }
             EventKind::Assistant | EventKind::Cancelled => {
-                messages.push(ChatMessage {
-                    role: "assistant",
+                messages.push(AgentMessage::Assistant {
                     content: event.content,
                     reasoning: pending_reasoning.take(),
+                    tool_calls: Vec::new(),
                 });
             }
             EventKind::Tool | EventKind::Error => {}
@@ -499,12 +509,23 @@ mod tests {
 
         let messages = super::request_messages(&store, &session, "").unwrap();
 
-        assert_eq!(messages[2].role, "assistant");
-        assert_eq!(messages[2].content, "The request was rate limited.");
-        assert_eq!(
-            messages[2].reasoning.as_deref(),
-            Some("I should inspect the error.")
-        );
+        assert!(matches!(
+            &messages[0],
+            crate::agent::AgentMessage::System { content }
+                if content.contains("`prepare_project` with `{\"path\":\".\"}`")
+                    && content.contains("`list_directory` with `{\"path\":\".\"}`")
+                    && content.contains("report its `workspace_path` value verbatim")
+        ));
+        assert!(matches!(
+            &messages[2],
+            crate::agent::AgentMessage::Assistant {
+                content,
+                reasoning: Some(reasoning),
+                tool_calls,
+            } if content == "The request was rate limited."
+                && reasoning == "I should inspect the error."
+                && tool_calls.is_empty()
+        ));
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(project).unwrap();
     }

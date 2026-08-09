@@ -1,10 +1,12 @@
 //! Testable application entry points for Roven.
 
+mod agent;
 mod cli;
 mod commands;
 mod credentials;
 mod provider;
 mod storage;
+mod tools;
 mod ui;
 
 /// Run the Roven command.

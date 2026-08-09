@@ -20,12 +20,15 @@ the repository through `ProjectDirs::data_local_dir()`.
 - Before trust, Roven does not read `ROVEN.md` or make a provider request.
 - The only project file Roven currently reads is the optional root
   `ROVEN.md`, after trust.
-- Roven does not edit files, execute arbitrary commands, invoke Git, search
-  files, or invoke CodeGraph.
+- Its `list_directory` tool may read immediate directory-entry names and kinds
+  inside the trusted workspace; it does not read file contents or recurse.
+- Roven does not edit files, execute arbitrary commands, search files, or
+  invoke CodeGraph. Its `prepare_project` tool may run fixed local Git
+  validation commands for the trusted workspace before registering it.
 
 ## Planned, not implemented
 
 Read-only project tools, Rust-enforced file and symlink protections for those
-tools, CodeGraph initialization, Git inspection, context compaction, and
-automatic retry policy remain planned work. They must not be described as
+tools, CodeGraph initialization, broader Git inspection, context compaction,
+and automatic retry policy remain planned work. They must not be described as
 available until their code and tests exist.

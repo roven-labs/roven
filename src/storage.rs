@@ -27,9 +27,107 @@ pub(crate) enum StorageError {
     Json(#[from] serde_json::Error),
 }
 
+/// Minimal durable identity for a project that has passed preparation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ProjectMeta {
+pub(crate) struct ProjectRegistration {
+    pub(crate) id: String,
     pub(crate) canonical_path: String,
+    pub(crate) github_remote: String,
+    pub(crate) baseline_commit: String,
+    pub(crate) registration_state: RegistrationState,
+    pub(crate) created_at_ms: u64,
+    pub(crate) updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RegistrationState {
+    Registered,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyProjectMeta {
+    canonical_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RegistrationLookup {
+    Absent,
+    Legacy,
+    Registered(ProjectRegistration),
+}
+
+/// Registration storage deliberately separate from conversation storage.
+/// It performs no writes until a project has passed all preparation checks.
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectRegistry {
+    data_root: PathBuf,
+}
+
+impl ProjectRegistry {
+    pub(crate) fn for_current_user() -> Result<Self, StorageError> {
+        let project_dirs = ProjectDirs::from(QUALIFIER, "", APPLICATION)
+            .ok_or(StorageError::DataDirectoryUnavailable)?;
+        Ok(Self::for_data_root(project_dirs.data_local_dir()))
+    }
+
+    pub(crate) fn for_data_root(data_root: impl Into<PathBuf>) -> Self {
+        Self {
+            data_root: data_root.into(),
+        }
+    }
+
+    pub(crate) fn lookup(&self, project_root: &Path) -> Result<RegistrationLookup, StorageError> {
+        let path = self.project_file(project_root);
+        if !path.is_file() {
+            return Ok(RegistrationLookup::Absent);
+        }
+        let bytes = fs::read(path)?;
+        if let Ok(registration) = serde_json::from_slice::<ProjectRegistration>(&bytes) {
+            return Ok(RegistrationLookup::Registered(registration));
+        }
+        let legacy: LegacyProjectMeta = serde_json::from_slice(&bytes)?;
+        let _ = legacy.canonical_path;
+        Ok(RegistrationLookup::Legacy)
+    }
+
+    pub(crate) fn register(
+        &self,
+        project_root: &Path,
+        github_remote: String,
+        baseline_commit: String,
+    ) -> Result<ProjectRegistration, StorageError> {
+        let canonical_root = project_root.canonicalize()?;
+        let now = now_ms();
+        let existing = self.lookup(&canonical_root)?;
+        let created_at_ms = match existing {
+            RegistrationLookup::Registered(registration) => registration.created_at_ms,
+            RegistrationLookup::Absent | RegistrationLookup::Legacy => now,
+        };
+        let registration = ProjectRegistration {
+            id: project_id(&canonical_root),
+            canonical_path: canonical_root.to_string_lossy().into_owned(),
+            github_remote,
+            baseline_commit,
+            registration_state: RegistrationState::Registered,
+            created_at_ms,
+            updated_at_ms: now,
+        };
+        let project_dir = self.project_dir(&canonical_root);
+        fs::create_dir_all(&project_dir)?;
+        write_json(&project_dir.join("project.json"), &registration)?;
+        Ok(registration)
+    }
+
+    fn project_dir(&self, project_root: &Path) -> PathBuf {
+        self.data_root
+            .join("projects")
+            .join(project_id(project_root))
+    }
+
+    fn project_file(&self, project_root: &Path) -> PathBuf {
+        self.project_dir(project_root).join("project.json")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,10 +183,6 @@ impl ProjectStore {
         let project_id = project_id(&canonical_root);
         let project_dir = data_root.join("projects").join(&project_id);
         fs::create_dir_all(&project_dir)?;
-        let project_meta = ProjectMeta {
-            canonical_path: canonical_root.to_string_lossy().into_owned(),
-        };
-        write_json(&project_dir.join("project.json"), &project_meta)?;
         Ok(Self {
             project_id,
             project_dir,

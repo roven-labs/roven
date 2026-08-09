@@ -59,11 +59,11 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
                 Line::from(""),
                 Line::from(Span::styled("READ-ONLY ACCESS", MUTED_STYLE)),
                 Line::from(Span::styled(
-                    "Read files · search content · inspect Git and CodeGraph",
+                    "Read ROVEN.md · list directories · validate Git for registration",
                     TRUST_BODY_STYLE,
                 )),
                 Line::from(Span::styled(
-                    "No file edits · no command execution · no external tools",
+                    "No source search · no file edits · no CodeGraph initialization",
                     TRUST_BODY_STYLE,
                 )),
                 Line::from(""),

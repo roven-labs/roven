@@ -13,6 +13,8 @@ streams replies from the fixed OpenRouter model
   OpenRouter key through the operating-system credential store.
 - A trusted chat reads only the optional root `<project>/ROVEN.md` once, then
   sends that text with the conversation.
+- The agent can list immediate directory-entry names and kinds inside the
+  trusted workspace without reading file contents or recursing.
 - Replies stream live. Provider-supplied reasoning appears as a muted
   `Thought` block; the active status changes from working to thinking to
   writing a response.
@@ -21,6 +23,9 @@ streams replies from the fixed OpenRouter model
 - Sessions are stored outside the repository in the operating system's local
   application-data directory, using `meta.json`, `events.jsonl`, and
   `context.json`.
+- After trust, the agent can call `prepare_project` to register the current
+  project only after fixed local Git validation confirms a GitHub remote,
+  baseline commit, and clean worktree.
 
 Roven never asks for or prints the API key in the chat UI, edits project files,
 or runs arbitrary commands.
@@ -29,9 +34,9 @@ See [setup](docs/SETUP.md) to store an OpenRouter API key.
 
 ## Not implemented yet
 
-Roven does not yet offer project file reading or search tools, Git inspection,
-CodeGraph queries or indexing, tool calls, context compaction, or automatic
-provider retries. It therefore sends no source, Git, or CodeGraph output to
+Roven does not yet offer project file reading or search tools, broader Git
+inspection, CodeGraph queries or indexing, context compaction, or automatic
+provider retries. It therefore sends no source code or CodeGraph output to
 OpenRouter.
 
 ## Install
