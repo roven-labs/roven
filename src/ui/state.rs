@@ -4,7 +4,7 @@ use std::time::Instant;
 pub(crate) enum Role {
     User,
     Thought,
-    Pmemc,
+    Roven,
     Activity,
 }
 
@@ -120,13 +120,13 @@ impl AppState {
         if let Some(message) = self
             .messages
             .last_mut()
-            .filter(|message| message.role == Role::Pmemc)
+            .filter(|message| message.role == Role::Roven)
         {
             message.content.push_str(&text);
             return;
         }
         self.messages.push(Message {
-            role: Role::Pmemc,
+            role: Role::Roven,
             content: text,
             duration_ms: None,
         });
@@ -141,7 +141,7 @@ impl AppState {
     pub(crate) fn agent_error(&mut self, message: String) {
         self.finish_agent();
         self.messages.push(Message {
-            role: Role::Pmemc,
+            role: Role::Roven,
             content: format!("Error: {message}"),
             duration_ms: None,
         });
@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(state.messages[0].role, Role::Thought);
         assert_eq!(state.messages[0].content, "Inspect the request.");
         assert!(state.messages[0].duration_ms.is_some());
-        assert_eq!(state.messages[1].role, Role::Pmemc);
+        assert_eq!(state.messages[1].role, Role::Roven);
         assert_eq!(state.messages[1].content, "Hello");
     }
 

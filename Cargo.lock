@@ -1619,26 +1619,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pmemc"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "atomic-write-file",
- "clap",
- "crossterm",
- "directories",
- "keyring",
- "ratatui",
- "rpassword",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.19",
- "ureq",
- "uuid",
-]
-
-[[package]]
 name = "polling"
 version = "3.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1918,6 +1898,26 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "roven"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "atomic-write-file",
+ "clap",
+ "crossterm",
+ "directories",
+ "keyring",
+ "ratatui",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.19",
+ "ureq",
+ "uuid",
 ]
 
 [[package]]

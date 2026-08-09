@@ -1,10 +1,10 @@
-# PMEMC Product Context
+# Roven Product Context
 
 ## Current product boundary
 
-PMEMC is a local terminal client for persistent, project-scoped chat. Bare
-`pmemc` asks whether to trust the canonical current directory for this launch.
-After approval, it loads only the optional root `PMEMC.md`, creates a session
+Roven is a local terminal client for persistent, project-scoped chat. Bare
+`roven` asks whether to trust the canonical current directory for this launch.
+After approval, it loads only the optional root `ROVEN.md`, creates a session
 when the first message is sent, and streams a reply from the fixed OpenRouter
 model `openai/gpt-oss-20b:free`.
 
@@ -17,10 +17,10 @@ the repository through `ProjectDirs::data_local_dir()`.
 
 - OpenRouter credentials stay in the operating-system credential store.
 - Folder trust is requested for every launch and is not persisted.
-- Before trust, PMEMC does not read `PMEMC.md` or make a provider request.
-- The only project file PMEMC currently reads is the optional root
-  `PMEMC.md`, after trust.
-- PMEMC does not edit files, execute arbitrary commands, invoke Git, search
+- Before trust, Roven does not read `ROVEN.md` or make a provider request.
+- The only project file Roven currently reads is the optional root
+  `ROVEN.md`, after trust.
+- Roven does not edit files, execute arbitrary commands, invoke Git, search
   files, or invoke CodeGraph.
 
 ## Planned, not implemented

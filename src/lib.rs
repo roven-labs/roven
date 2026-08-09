@@ -1,4 +1,4 @@
-//! Testable application entry points for PMEMC.
+//! Testable application entry points for Roven.
 
 mod cli;
 mod commands;
@@ -7,7 +7,7 @@ mod provider;
 mod storage;
 mod ui;
 
-/// Run the currently implemented Version 1 command.
+/// Run the Roven command.
 ///
 /// # Errors
 ///

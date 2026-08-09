@@ -256,7 +256,7 @@ fn spawn_worker(
                     },
                 )
                 .map_err(|error| error.to_string()),
-            Ok(None) => Err("OpenRouter key missing. Run `pmemc auth set`.".to_owned()),
+            Ok(None) => Err("OpenRouter key missing. Run `roven auth set`.".to_owned()),
             Err(error) => Err(error.to_string()),
         };
         if let Err(error) = result {
@@ -320,7 +320,7 @@ fn persist_generation(
         for message in state.generated_messages() {
             let event_kind = match message.role {
                 Role::Thought => EventKind::Thought,
-                Role::Pmemc => kind.clone(),
+                Role::Roven => kind.clone(),
                 Role::User | Role::Activity => continue,
             };
             if message.content.is_empty() {
@@ -347,7 +347,7 @@ fn request_messages(
     let mut messages = vec![ChatMessage {
         role: "system",
         content: format!(
-            "You are PMEMC, a concise read-only project assistant. Rust harness rules are outside your control. Do not claim to edit files or run commands.{}",
+            "You are Roven, a concise read-only project assistant. Rust harness rules are outside your control. Do not claim to edit files or run commands.{}",
             if project_instructions.is_empty() {
                 String::new()
             } else {
@@ -390,7 +390,7 @@ fn request_messages(
 }
 
 fn read_project_instructions() -> io::Result<String> {
-    let path = std::env::current_dir()?.canonicalize()?.join("PMEMC.md");
+    let path = std::env::current_dir()?.canonicalize()?.join("ROVEN.md");
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
@@ -407,7 +407,7 @@ fn event_to_message(event: ConversationEvent) -> Message {
         EventKind::User => Role::User,
         EventKind::Thought => Role::Thought,
         EventKind::Tool => Role::Activity,
-        EventKind::Assistant | EventKind::Error | EventKind::Cancelled => Role::Pmemc,
+        EventKind::Assistant | EventKind::Error | EventKind::Cancelled => Role::Roven,
     };
     Message {
         role,
@@ -463,7 +463,7 @@ mod tests {
     use crate::storage::{ConversationEvent, EventKind, ProjectStore};
 
     fn temp_root(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("pmemc-{name}-{}", uuid::Uuid::now_v7()));
+        let path = std::env::temp_dir().join(format!("roven-{name}-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&path).expect("temporary root should exist");
         path
     }

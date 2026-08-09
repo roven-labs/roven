@@ -6,7 +6,9 @@ pub(crate) fn run(command: AuthCommand) -> anyhow::Result<()> {
     match command {
         AuthCommand::Set => {
             credentials::prompt_and_store_openrouter_api_key()?;
-            println!("OpenRouter credential stored in the operating-system credential store");
+            println!(
+                "OpenRouter credential stored for Roven in the operating-system credential store"
+            );
         }
         AuthCommand::Status => {
             let state = if credentials::stored_openrouter_credential()? {
@@ -18,9 +20,9 @@ pub(crate) fn run(command: AuthCommand) -> anyhow::Result<()> {
         }
         AuthCommand::Remove => {
             if credentials::remove_openrouter_api_key()? {
-                println!("OpenRouter credential removed");
+                println!("Roven OpenRouter credential removed");
             } else {
-                println!("OpenRouter credential was already absent");
+                println!("Roven OpenRouter credential was already absent");
             }
         }
     }

@@ -92,7 +92,7 @@ impl ModelProvider for OpenRouterProvider {
         emit: &mut dyn FnMut(StreamEvent),
     ) -> Result<(), ProviderError> {
         let payload = serde_json::to_string(request).map_err(|_| {
-            ProviderError::Request("PMEMC could not encode the OpenRouter request".to_owned())
+            ProviderError::Request("Roven could not encode the OpenRouter request".to_owned())
         })?;
         let mut response = ureq::post(ENDPOINT)
             .header("Authorization", &format!("Bearer {api_key}"))
@@ -131,7 +131,7 @@ fn request_error(error: ureq::Error) -> ProviderError {
             ProviderError::Request(format!("OpenRouter rejected the request (HTTP {status})"))
         }
         _ => ProviderError::Request(
-            "PMEMC could not connect to OpenRouter before streaming began".to_owned(),
+            "Roven could not connect to OpenRouter before streaming began".to_owned(),
         ),
     }
 }

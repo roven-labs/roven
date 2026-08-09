@@ -1,5 +1,5 @@
 fn main() {
-    if let Err(error) = pmemc::run() {
+    if let Err(error) = roven::run() {
         eprintln!("error: {error}");
         std::process::exit(1);
     }

@@ -2,9 +2,9 @@ use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "pmemc",
+    name = "roven",
     version,
-    about = "PMEMC — Project Memory CLI",
+    about = "Roven — Project Memory Assistant",
     long_about = None
 )]
 pub(crate) struct Cli {

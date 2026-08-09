@@ -15,15 +15,15 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const QUALIFIER: &str = "io.github.vishal24p";
-const APPLICATION: &str = "PMEMC";
+const APPLICATION: &str = "Roven";
 
 #[derive(Debug, Error)]
 pub(crate) enum StorageError {
     #[error("the operating-system local data directory is unavailable")]
     DataDirectoryUnavailable,
-    #[error("local PMEMC storage could not be read or written")]
+    #[error("local Roven storage could not be read or written")]
     Io(#[from] std::io::Error),
-    #[error("local PMEMC storage contains invalid structured data")]
+    #[error("local Roven storage contains invalid structured data")]
     Json(#[from] serde_json::Error),
 }
 
@@ -223,7 +223,7 @@ mod tests {
     use super::{ConversationEvent, EventKind, ProjectStore, project_id};
 
     fn temp_root(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("pmemc-{name}-{}", uuid::Uuid::now_v7()));
+        let path = std::env::temp_dir().join(format!("roven-{name}-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&path).expect("temporary root should exist");
         path
     }

@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-const SERVICE_NAME: &str = "pmemc";
+const SERVICE_NAME: &str = "roven";
 const OPENROUTER_ACCOUNT: &str = "openrouter";
 
 /// Errors from local credential management without exposing the credential.
@@ -25,7 +25,7 @@ pub(crate) trait SecretStore {
     fn delete(&self) -> Result<bool, CredentialError>;
 }
 
-/// Native Windows Credential Manager store for PMEMC's OpenRouter key.
+/// Native Windows Credential Manager store for Roven's OpenRouter key.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OsCredentialStore;
 

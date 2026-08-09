@@ -12,7 +12,7 @@ pub(crate) const MINIMUM_WIDTH: u16 = 40;
 pub(crate) const MINIMUM_HEIGHT: u16 = 8;
 
 const USER_STYLE: Style = Style::new().fg(Color::Cyan);
-const PMEMC_STYLE: Style = Style::new().fg(Color::Green);
+const ROVEN_STYLE: Style = Style::new().fg(Color::Green);
 const MUTED_STYLE: Style = Style::new().fg(Color::DarkGray);
 const STATUS_STYLE: Style = Style::new().fg(Color::LightCyan);
 const TRUST_TITLE_STYLE: Style = Style::new().fg(Color::LightBlue);
@@ -48,12 +48,12 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(""),
-                Line::from(Span::styled("PMEMC · WORKSPACE", TRUST_TITLE_STYLE)),
+                Line::from(Span::styled("ROVEN · WORKSPACE", TRUST_TITLE_STYLE)),
                 Line::from(""),
                 Line::from(Span::styled(path, TRUST_PATH_STYLE)),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Trust this workspace? PMEMC accesses it only for this open session.",
+                    "Trust this workspace? Roven accesses it only for this open session.",
                     TRUST_BODY_STYLE,
                 )),
                 Line::from(""),
@@ -78,7 +78,7 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
                     },
                 )),
                 Line::from(Span::styled(
-                    format!("{no_marker} Exit PMEMC"),
+                    format!("{no_marker} Exit Roven"),
                     if state.trust_yes_selected {
                         TRUST_UNSELECTED_STYLE
                     } else {
@@ -180,8 +180,8 @@ fn draw_transcript(frame: &mut Frame, area: Rect, state: &mut AppState) {
             role => {
                 let (label, style) = match role {
                     Role::User => ("You", USER_STYLE),
-                    Role::Pmemc => ("PMEMC", PMEMC_STYLE),
-                    Role::Activity => ("PMEMC", MUTED_STYLE),
+                    Role::Roven => ("Roven", ROVEN_STYLE),
+                    Role::Activity => ("Roven", MUTED_STYLE),
                     Role::Thought => unreachable!("thought is rendered above"),
                 };
                 vec![
@@ -282,15 +282,15 @@ mod tests {
     #[test]
     fn empty_screen_has_header_and_centered_prompt() {
         let mut state = AppState::new();
-        state.project_path = r"\\?\C:\Users\visha\pmemc".to_owned();
+        state.project_path = r"\\?\C:\Users\visha\roven".to_owned();
         let rendered = render(&mut state, 80, 24);
 
         assert!(rendered.contains("Trust this workspace?"));
-        assert!(rendered.contains(r"C:\Users\visha\pmemc"));
-        assert!(!rendered.contains(r"\\?\C:\Users\visha\pmemc"));
+        assert!(rendered.contains(r"C:\Users\visha\roven"));
+        assert!(!rendered.contains(r"\\?\C:\Users\visha\roven"));
         assert!(rendered.contains("READ-ONLY ACCESS"));
         assert!(rendered.contains("Trust and start"));
-        assert!(rendered.contains("Exit PMEMC"));
+        assert!(rendered.contains("Exit Roven"));
     }
 
     #[test]
@@ -305,7 +305,7 @@ mod tests {
         let rendered = render(&mut state, 80, 24);
 
         assert!(rendered.contains("You › Hello"));
-        assert!(!rendered.contains("PMEMC"));
+        assert!(!rendered.contains("Roven"));
         assert!(!rendered.contains("Project agent"));
         assert!(!rendered.contains("The chat UI is ready"));
     }
@@ -321,7 +321,7 @@ mod tests {
 
         assert!(rendered.contains("Thought:"));
         assert!(rendered.contains("Check the request."));
-        assert!(rendered.contains("PMEMC › Here is the answer."));
+        assert!(rendered.contains("Roven › Here is the answer."));
     }
 
     #[test]

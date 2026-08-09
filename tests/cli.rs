@@ -1,20 +1,20 @@
 use std::process::Command;
 
-fn pmemc(arguments: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_pmemc"))
+fn roven(arguments: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_roven"))
         .args(arguments)
         .output()
-        .expect("pmemc binary should run")
+        .expect("roven binary should run")
 }
 
 #[test]
-fn help_describes_the_version_one_command_surface() {
-    let output = pmemc(&["--help"]);
+fn help_describes_the_current_command_surface() {
+    let output = roven(&["--help"]);
 
     assert!(output.status.success());
 
     let stdout = String::from_utf8(output.stdout).expect("help should be UTF-8");
-    assert!(stdout.contains("Project Memory CLI"));
+    assert!(stdout.contains("Roven"));
     assert!(stdout.contains("auth"));
     for legacy_command in ["init", "project", "status", "inspect", "review", "history"] {
         assert!(
@@ -26,7 +26,7 @@ fn help_describes_the_version_one_command_surface() {
 
 #[test]
 fn auth_is_the_only_retained_command_surface() {
-    let output = pmemc(&["auth", "--help"]);
+    let output = roven(&["auth", "--help"]);
 
     assert!(output.status.success());
 
@@ -43,11 +43,11 @@ fn auth_is_the_only_retained_command_surface() {
 }
 
 #[test]
-fn version_identifies_the_pmemc_binary() {
-    let output = pmemc(&["--version"]);
+fn version_identifies_the_roven_binary() {
+    let output = roven(&["--version"]);
 
     assert!(output.status.success());
 
     let stdout = String::from_utf8(output.stdout).expect("version should be UTF-8");
-    assert!(stdout.starts_with("pmemc "));
+    assert!(stdout.starts_with("roven "));
 }
