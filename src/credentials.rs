@@ -109,6 +109,11 @@ pub(crate) fn stored_openrouter_credential() -> Result<bool, CredentialError> {
     credential_is_stored(&OsCredentialStore)
 }
 
+/// Retrieves the credential only for the provider boundary.
+pub(crate) fn load_openrouter_api_key() -> Result<Option<String>, CredentialError> {
+    OsCredentialStore.get()
+}
+
 fn remove_credential(store: &impl SecretStore) -> Result<bool, CredentialError> {
     store.delete()
 }

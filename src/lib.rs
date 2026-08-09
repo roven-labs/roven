@@ -3,6 +3,8 @@
 mod cli;
 mod commands;
 mod credentials;
+mod provider;
+mod storage;
 mod ui;
 
 /// Run the currently implemented Version 1 command.
