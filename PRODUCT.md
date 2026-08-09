@@ -20,6 +20,9 @@ the repository through `ProjectDirs::data_local_dir()`.
 - Before trust, Roven does not read `ROVEN.md` or make a provider request.
 - The only project file Roven currently reads is the optional root
   `ROVEN.md`, after trust.
+- Roven writes append-only runtime diagnostics to `log.md` in its local
+  application-data directory, never into the trusted workspace. The log
+  records operational metadata and errors, not prompts, replies, or keys.
 - Its `list_directory` tool may read immediate directory-entry names and kinds
   inside the trusted workspace; it does not read file contents or recurse.
 - Roven does not edit files, execute arbitrary commands, search files, or

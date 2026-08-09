@@ -2,6 +2,7 @@
 
 use std::sync::atomic::AtomicBool;
 
+use crate::runtime_log::RuntimeLog;
 use crate::tools::{
     RovenToolCall, RovenToolDefinition, RovenToolResult, ToolContext, definitions, dispatch,
 };
@@ -77,29 +78,71 @@ pub(crate) fn run<P: ModelProvider>(
     mut messages: Vec<AgentMessage>,
     context: &ToolContext,
     cancelled: &AtomicBool,
+    runtime_log: Option<&RuntimeLog>,
     emit: &mut dyn FnMut(AgentEvent),
 ) -> Result<(), P::Error> {
     loop {
         let request = AgentRequest::new(messages.clone());
+        record(
+            runtime_log,
+            "model_request_started",
+            &format!(
+                "messages={} tools={}",
+                request.messages.len(),
+                request.tools.len()
+            ),
+        );
         let mut response_content = String::new();
         let mut response_reasoning = String::new();
         let mut tool_calls = None;
         let mut finished = false;
         let mut was_cancelled = false;
 
-        provider.stream(api_key, &request, cancelled, &mut |event| match event {
-            ProviderEvent::Thought(thought) => {
-                response_reasoning.push_str(&thought);
-                emit(AgentEvent::Thought(thought));
-            }
-            ProviderEvent::Text(text) => {
-                response_content.push_str(&text);
-                emit(AgentEvent::Text(text));
-            }
-            ProviderEvent::ToolCalls(calls) => tool_calls = Some(calls),
-            ProviderEvent::Finished => finished = true,
-            ProviderEvent::Cancelled => was_cancelled = true,
-        })?;
+        if let Err(error) =
+            provider.stream(api_key, &request, cancelled, &mut |event| match event {
+                ProviderEvent::Thought(thought) => {
+                    response_reasoning.push_str(&thought);
+                    record(
+                        runtime_log,
+                        "reasoning_received",
+                        &format!("characters={}", thought.chars().count()),
+                    );
+                    emit(AgentEvent::Thought(thought));
+                }
+                ProviderEvent::Text(text) => {
+                    response_content.push_str(&text);
+                    record(
+                        runtime_log,
+                        "text_received",
+                        &format!("characters={}", text.chars().count()),
+                    );
+                    emit(AgentEvent::Text(text));
+                }
+                ProviderEvent::ToolCalls(calls) => {
+                    record(
+                        runtime_log,
+                        "tool_calls_received",
+                        &format!("count={}", calls.len()),
+                    );
+                    tool_calls = Some(calls);
+                }
+                ProviderEvent::Finished => {
+                    record(runtime_log, "model_response_finished", "outcome=finished");
+                    finished = true;
+                }
+                ProviderEvent::Cancelled => {
+                    record(runtime_log, "model_response_cancelled", "outcome=cancelled");
+                    was_cancelled = true;
+                }
+            })
+        {
+            record(
+                runtime_log,
+                "model_request_failed",
+                &format!("error={error}"),
+            );
+            return Err(error);
+        }
 
         if was_cancelled {
             emit(AgentEvent::Cancelled);
@@ -112,7 +155,31 @@ pub(crate) fn run<P: ModelProvider>(
                 tool_calls: tool_calls.clone(),
             });
             for call in tool_calls {
+                record(
+                    runtime_log,
+                    "tool_dispatch_started",
+                    &format!("name={}", call.name),
+                );
                 let result = dispatch(context, call);
+                let status = result
+                    .result
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let reason = result
+                    .result
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str);
+                record(
+                    runtime_log,
+                    "tool_dispatch_finished",
+                    &format!(
+                        "name={} status={}{}",
+                        result.name,
+                        status,
+                        reason.map_or_else(String::new, |reason| format!(" reason={reason}"))
+                    ),
+                );
                 emit(AgentEvent::ToolResult(result.clone()));
                 messages.push(AgentMessage::Tool { result });
             }
@@ -125,11 +192,17 @@ pub(crate) fn run<P: ModelProvider>(
     }
 }
 
+fn record(runtime_log: Option<&RuntimeLog>, event: &str, detail: &str) {
+    if let Some(log) = runtime_log {
+        log.record("agent", event, detail);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, sync::atomic::AtomicBool};
+    use std::{cell::RefCell, fs, sync::atomic::AtomicBool};
 
-    use crate::tools::ToolContext;
+    use crate::{runtime_log::RuntimeLog, tools::ToolContext};
 
     use super::{AgentEvent, AgentMessage, AgentRequest, ModelProvider, ProviderEvent, run};
 
@@ -156,9 +229,10 @@ mod tests {
             _: &AtomicBool,
             emit: &mut dyn FnMut(ProviderEvent),
         ) -> Result<(), Self::Error> {
-            assert_eq!(request.tools.len(), 2);
+            assert_eq!(request.tools.len(), 3);
             assert_eq!(request.tools[0].name, "prepare_project");
             assert_eq!(request.tools[1].name, "list_directory");
+            assert_eq!(request.tools[2].name, "list_tools");
             emit(ProviderEvent::Text("done".to_owned()));
             emit(ProviderEvent::Finished);
             Ok(())
@@ -178,6 +252,7 @@ mod tests {
             }],
             &ToolContext::new(workspace).unwrap(),
             &AtomicBool::new(false),
+            None,
             &mut |event| events.borrow_mut().push(event),
         )
         .unwrap();
@@ -243,6 +318,7 @@ mod tests {
             }],
             &ToolContext::new(workspace).unwrap(),
             &AtomicBool::new(false),
+            None,
             &mut |event| events.borrow_mut().push(event),
         )
         .unwrap();
@@ -253,5 +329,48 @@ mod tests {
             Some(AgentEvent::ToolResult(result)) if result.name == "prepare_project"
         ));
         assert!(matches!(events.borrow().last(), Some(AgentEvent::Finished)));
+    }
+
+    struct FailingProvider;
+
+    impl ModelProvider for FailingProvider {
+        type Error = TestError;
+
+        fn stream(
+            &self,
+            _: &str,
+            _: &AgentRequest,
+            _: &AtomicBool,
+            _: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), Self::Error> {
+            Err(TestError)
+        }
+    }
+
+    #[test]
+    fn provider_failures_are_written_to_the_runtime_log() {
+        let workspace = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let log_path =
+            std::env::temp_dir().join(format!("roven-agent-log-{}.md", uuid::Uuid::now_v7()));
+        let log = RuntimeLog::for_file(&log_path).unwrap();
+
+        let result = run(
+            &FailingProvider,
+            "key",
+            vec![AgentMessage::User {
+                content: "hello".to_owned(),
+            }],
+            &ToolContext::new(workspace).unwrap(),
+            &AtomicBool::new(false),
+            Some(&log),
+            &mut |_| {},
+        );
+
+        assert!(result.is_err());
+        let contents = fs::read_to_string(log_path).unwrap();
+        assert!(contents.contains("component=agent"));
+        assert!(contents.contains("event=model_request_started"));
+        assert!(contents.contains("event=model_request_failed"));
+        assert!(contents.contains("error=test provider error"));
     }
 }

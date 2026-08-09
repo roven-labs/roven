@@ -13,6 +13,7 @@ use crate::storage::{ProjectRegistration, ProjectRegistry, RegistrationLookup};
 
 pub(crate) const PREPARE_PROJECT_DESCRIPTION: &str = "Validate and register the currently trusted project for first-time use with Roven. Use this when the user asks to add/register the current project for future project understanding, resume generation, or portfolio updates. Pass `.` as the path for the current trusted workspace. The tool validates the project path, existing Roven registration, Git repository, GitHub remote, committed baseline, and clean working state, then stores the minimal project registration. It does not inspect source code or initialize code-intelligence systems.";
 pub(crate) const LIST_DIRECTORY_DESCRIPTION: &str = "List the immediate contents of a directory inside the currently trusted Roven workspace. Use this to inspect the workspace structure and locate files or subdirectories before choosing another filesystem tool. Paths are relative to the trusted workspace; use `.` for the workspace root. This tool does not read file contents, search recursively, modify files, register projects, or access paths outside the trusted workspace.";
+pub(crate) const LIST_TOOLS_DESCRIPTION: &str = "List the Roven tools available to you in this turn, with their exact descriptions and input schemas. Use this when you need to check which Roven capabilities are currently available before selecting a tool. This reports the live Roven tool registry and does not access the workspace or modify anything.";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct RovenToolDefinition {
@@ -50,6 +51,15 @@ pub(crate) fn definitions() -> Vec<RovenToolDefinition> {
                     }
                 },
                 "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+        RovenToolDefinition {
+            name: "list_tools",
+            description: LIST_TOOLS_DESCRIPTION,
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
                 "additionalProperties": false
             }),
         },
@@ -100,12 +110,37 @@ pub(crate) fn dispatch(context: &ToolContext, call: RovenToolCall) -> RovenToolR
                 "",
             )),
         },
+        "list_tools" => match serde_json::from_value::<ListToolsInput>(call.arguments) {
+            Ok(_) => serde_json::to_value(ListTools.execute()),
+            Err(_) => serde_json::to_value(ListToolsResult::InvalidInput),
+        },
         _ => serde_json::to_value(PrepareProjectResult::blocked(BlockedReason::InvalidPath)),
     };
     RovenToolResult {
         tool_call_id: call.id,
         name: call.name,
         result: result.expect("tool results are serializable"),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListToolsInput {}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ListToolsResult {
+    Ok { tools: Vec<RovenToolDefinition> },
+    InvalidInput,
+}
+
+struct ListTools;
+
+impl ListTools {
+    fn execute(&self) -> ListToolsResult {
+        ListToolsResult::Ok {
+            tools: definitions(),
+        }
     }
 }
 
@@ -604,7 +639,8 @@ mod tests {
 
     use super::{
         BlockedReason, GitInspector, ListDirectory, ListDirectoryInput, PrepareProject,
-        PrepareProjectInput, PrepareProjectResult, SystemGit, ToolContext,
+        PrepareProjectInput, PrepareProjectResult, RovenToolCall, SystemGit, ToolContext,
+        definitions, dispatch,
     };
 
     #[derive(Default)]
@@ -1084,6 +1120,29 @@ mod tests {
                 "recursive": true
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn list_tools_returns_the_live_registry_with_descriptions_and_schemas() {
+        let workspace = temp_root("list-tools");
+        let expected = serde_json::to_value(definitions()).unwrap();
+
+        let result = dispatch(
+            &context(&workspace),
+            RovenToolCall {
+                id: "call_tools".to_owned(),
+                name: "list_tools".to_owned(),
+                arguments: json!({}),
+            },
+        );
+
+        assert_eq!(
+            result.result,
+            json!({
+                "status": "ok",
+                "tools": expected,
+            })
         );
     }
 

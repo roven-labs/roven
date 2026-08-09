@@ -24,6 +24,7 @@ use crate::{
     agent::{self, AgentEvent, AgentMessage},
     credentials,
     provider::OpenRouterProvider,
+    runtime_log::RuntimeLog,
     storage::{ConversationEvent, EventKind, ProjectStore, SessionMeta, now_ms},
     tools::ToolContext,
 };
@@ -43,18 +44,28 @@ enum WorkerEvent {
     Error(String),
 }
 
-const TOOL_USE_POLICY: &str = "The current trusted workspace is the project the user means by `this project`, `these projects`, `this workspace`, or an unqualified request to add/register the project. Do not ask for a path in those cases: call `prepare_project` with `{\"path\":\".\"}`. When the user asks for the current workspace path, call `list_directory` with `{\"path\":\".\"}` and report its `workspace_path` value verbatim; never report `.` as the human-facing path. When the user asks to inspect, explain, or diagram the current project's structure, first call `list_directory` with `{\"path\":\".\"}` and base the response only on its returned entries. Call `list_directory` again for a named subdirectory only when needed; it never recurses automatically.";
+const TOOL_USE_POLICY: &str = "The current trusted workspace is the project the user means by `this project`, `these projects`, `this workspace`, or an unqualified request to add/register the project. Do not ask for a path in those cases: call `prepare_project` with `{\"path\":\".\"}`. When the user asks which Roven tools or capabilities are available, call `list_tools` with `{}` and rely on its returned names, descriptions, and input schemas. When the user asks for the current workspace path, call `list_directory` with `{\"path\":\".\"}` and report its `workspace_path` value verbatim; never report `.` as the human-facing path. When the user asks to inspect, explain, or diagram the current project's structure, first call `list_directory` with `{\"path\":\".\"}` and base the response only on its returned entries. Call `list_directory` again for a named subdirectory only when needed; it never recurses automatically.";
 
-pub(crate) fn run() -> anyhow::Result<()> {
+pub(crate) fn run(runtime_log: Option<RuntimeLog>) -> anyhow::Result<()> {
+    log_event(runtime_log.as_ref(), "terminal_starting", "outcome=started");
     let mut guard = TerminalGuard::enter()?;
-    let result = run_loop();
+    let result = run_loop(runtime_log.as_ref());
     let restore_result = guard.restore();
+    log_event(
+        runtime_log.as_ref(),
+        "terminal_stopped",
+        if result.is_ok() && restore_result.is_ok() {
+            "outcome=ok"
+        } else {
+            "outcome=error"
+        },
+    );
     result?;
     restore_result?;
     Ok(())
 }
 
-fn run_loop() -> anyhow::Result<()> {
+fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut state = AppState::new();
@@ -62,6 +73,11 @@ fn run_loop() -> anyhow::Result<()> {
         .canonicalize()?
         .to_string_lossy()
         .into_owned();
+    log_event(
+        runtime_log,
+        "workspace_detected",
+        &format!("path={}", state.project_path),
+    );
     let (sender, receiver) = mpsc::channel();
     let mut store: Option<ProjectStore> = None;
     let mut session: Option<SessionMeta> = None;
@@ -70,7 +86,13 @@ fn run_loop() -> anyhow::Result<()> {
 
     loop {
         while let Ok(worker_event) = receiver.try_recv() {
-            apply_worker_event(&mut state, store.as_ref(), session.as_ref(), worker_event);
+            apply_worker_event(
+                &mut state,
+                store.as_ref(),
+                session.as_ref(),
+                runtime_log,
+                worker_event,
+            );
             if !state.running {
                 cancellation = None;
             }
@@ -81,6 +103,7 @@ fn run_loop() -> anyhow::Result<()> {
         }
         let event = event::read()?;
         if is_ctrl_c(&event) {
+            log_event(runtime_log, "application_exit", "reason=ctrl_c");
             return Ok(());
         }
         if !state.trusted {
@@ -95,10 +118,18 @@ fn run_loop() -> anyhow::Result<()> {
                     kind: KeyEventKind::Press | KeyEventKind::Repeat,
                     ..
                 }) if state.trust_yes_selected => {
-                    let initialized = ProjectStore::for_current_directory()?;
+                    let initialized =
+                        ProjectStore::for_current_directory().inspect_err(|error| {
+                            log_event(
+                                runtime_log,
+                                "workspace_storage_failed",
+                                &format!("error={error}"),
+                            );
+                        })?;
                     project_instructions = read_project_instructions().unwrap_or_default();
                     store = Some(initialized);
                     state.trusted = true;
+                    log_event(runtime_log, "workspace_trusted", "outcome=granted");
                 }
                 Event::Key(KeyEvent {
                     code: KeyCode::Enter | KeyCode::Esc,
@@ -151,6 +182,7 @@ fn run_loop() -> anyhow::Result<()> {
             ) {
                 if let Some(flag) = &cancellation {
                     flag.store(true, Ordering::Relaxed);
+                    log_event(runtime_log, "agent_cancellation_requested", "source=escape");
                 }
                 state.status = Some("Stopping agent...".to_owned());
             }
@@ -183,30 +215,65 @@ fn run_loop() -> anyhow::Result<()> {
                         })
                         .collect();
                     state.open_resume(entries);
+                    log_event(runtime_log, "resume_picker_opened", "outcome=ok");
                 } else if state.submit() {
                     let user = state.last_user_message().unwrap_or_default().to_owned();
                     let project_store = store.as_ref().expect("trusted store");
                     if session.is_none() {
-                        session = Some(project_store.create_session(&user)?);
+                        session =
+                            Some(project_store.create_session(&user).inspect_err(|error| {
+                                log_event(
+                                    runtime_log,
+                                    "session_create_failed",
+                                    &format!("error={error}"),
+                                );
+                            })?);
+                        log_event(runtime_log, "session_created", "outcome=ok");
                     }
                     let active_session = session.as_ref().expect("created session");
-                    project_store.append_event(
-                        &active_session.id,
-                        &ConversationEvent {
-                            kind: EventKind::User,
-                            content: user.clone(),
-                            duration_ms: None,
-                            created_at_ms: now_ms(),
-                        },
-                    )?;
+                    project_store
+                        .append_event(
+                            &active_session.id,
+                            &ConversationEvent {
+                                kind: EventKind::User,
+                                content: user.clone(),
+                                duration_ms: None,
+                                created_at_ms: now_ms(),
+                            },
+                        )
+                        .inspect_err(|error| {
+                            log_event(
+                                runtime_log,
+                                "session_event_write_failed",
+                                &format!("error={error}"),
+                            );
+                        })?;
                     let messages =
                         request_messages(project_store, active_session, &project_instructions)?;
                     state.start_agent();
                     let flag = Arc::new(AtomicBool::new(false));
                     cancellation = Some(flag.clone());
                     let tool_context =
-                        ToolContext::new(std::path::PathBuf::from(&state.project_path))?;
-                    spawn_worker(sender.clone(), flag, messages, tool_context);
+                        ToolContext::new(std::path::PathBuf::from(&state.project_path))
+                            .inspect_err(|error| {
+                                log_event(
+                                    runtime_log,
+                                    "tool_context_create_failed",
+                                    &format!("error={error}"),
+                                );
+                            })?;
+                    log_event(
+                        runtime_log,
+                        "agent_turn_started",
+                        &format!("messages={}", messages.len()),
+                    );
+                    spawn_worker(
+                        sender.clone(),
+                        flag,
+                        messages,
+                        tool_context,
+                        runtime_log.cloned(),
+                    );
                 }
             }
             Event::Key(KeyEvent {
@@ -245,8 +312,10 @@ fn spawn_worker(
     cancelled: Arc<AtomicBool>,
     messages: Vec<AgentMessage>,
     tool_context: ToolContext,
+    runtime_log: Option<RuntimeLog>,
 ) {
     thread::spawn(move || {
+        log_event(runtime_log.as_ref(), "worker_started", "outcome=started");
         let result = match credentials::load_openrouter_api_key() {
             Ok(Some(key)) => agent::run(
                 &OpenRouterProvider,
@@ -254,6 +323,7 @@ fn spawn_worker(
                 messages,
                 &tool_context,
                 &cancelled,
+                runtime_log.as_ref(),
                 &mut |event| {
                     let message = match event {
                         AgentEvent::Thought(thought) => WorkerEvent::Thought(thought),
@@ -272,7 +342,14 @@ fn spawn_worker(
             Err(error) => Err(error.to_string()),
         };
         if let Err(error) = result {
+            log_event(
+                runtime_log.as_ref(),
+                "worker_failed",
+                &format!("error={error}"),
+            );
             let _ = sender.send(WorkerEvent::Error(error));
+        } else {
+            log_event(runtime_log.as_ref(), "worker_finished", "outcome=ok");
         }
     });
 }
@@ -281,6 +358,7 @@ fn apply_worker_event(
     state: &mut AppState,
     store: Option<&ProjectStore>,
     session: Option<&SessionMeta>,
+    runtime_log: Option<&RuntimeLog>,
     event: WorkerEvent,
 ) {
     match event {
@@ -303,6 +381,15 @@ fn apply_worker_event(
             if stopped {
                 state.activity("Agent stopped");
             }
+            log_event(
+                runtime_log,
+                "agent_turn_finished",
+                if stopped {
+                    "outcome=cancelled"
+                } else {
+                    "outcome=ok"
+                },
+            );
         }
         WorkerEvent::Error(error) => {
             state.finish_agent();
@@ -319,7 +406,14 @@ fn apply_worker_event(
                 );
             }
             state.agent_error(error);
+            log_event(runtime_log, "agent_turn_finished", "outcome=error");
         }
+    }
+}
+
+fn log_event(runtime_log: Option<&RuntimeLog>, event: &str, detail: &str) {
+    if let Some(log) = runtime_log {
+        log.record("terminal", event, detail);
     }
 }
 

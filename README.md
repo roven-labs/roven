@@ -23,6 +23,9 @@ streams replies from the fixed OpenRouter model
 - Sessions are stored outside the repository in the operating system's local
   application-data directory, using `meta.json`, `events.jsonl`, and
   `context.json`.
+- The same local application-data directory contains append-only `log.md`.
+  It records runtime operations and failures (UI, storage, agent, provider,
+  and tool events), but never prompts, replies, or credentials.
 - After trust, the agent can call `prepare_project` to register the current
   project only after fixed local Git validation confirms a GitHub remote,
   baseline commit, and clean worktree.
