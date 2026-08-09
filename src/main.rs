@@ -1,10 +1,6 @@
 fn main() {
     if let Err(error) = pmemc::run() {
-        if let Some(message) = pmemc::user_error_message(&error) {
-            eprintln!("{message}");
-        } else {
-            eprintln!("error: {error}");
-        }
+        eprintln!("error: {error}");
         std::process::exit(1);
     }
 }

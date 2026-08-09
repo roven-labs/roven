@@ -1,39 +1,22 @@
-# Proposed V1 Contract Amendment — Conversational Study Entry Point
+# Approved V1 Contract Amendment — Capability-Free Reset
 
 ## Status
 
-Proposed. Operator decisions recorded here do not modify `docs/V1_SPEC.md`
-until the amendment and its implementation design are approved.
+Approved by the operator. This amendment supersedes conflicting V1 statements
+about conversational sessions, projects, databases, CodeGraph, models,
+external transport, and agent tools.
 
-## Amendment
+## Contract
 
-After bare `pmemc` successfully completes repository validation, project
-registration, CodeGraph preparation, and provider access, it opens a local
-interactive conversational session for that registered repository.
+PMEMC retains only the local `pmemc auth` credential lifecycle. It accepts,
+checks for, and removes a secret through Windows Credential Manager without
+printing or otherwise persisting the secret in PMEMC application data.
 
-The session accepts slash commands. `/study` is a command within that session;
-it is not a PowerShell command, a top-level `pmemc` subcommand, or an
-`pmemc inspect` flag.
+Bare `pmemc` has no session behavior. PMEMC exposes no model-facing tools and
+does not inspect, register, index, read, or write repositories. It has no
+project or memory database and makes no external request.
 
-Opening the session must not itself read repository content, invoke OpenRouter,
-or alter verified facts, inspection baselines, or the repository. `/study` is
-the first approval-gated LLM workflow in the session.
-
-The final V1 workflow replaces `pmemc inspect`'s static provider submission.
-During the approved demo, the existing implementation remains only as reference
-and regression coverage; it is not an equal user-facing workflow.
-
-## Unresolved Contract Decision
-
-`/study` uses CodeGraph as its source-discovery engine. It must not receive a
-Rust-selected concatenated source bundle.
-
-Rust retains deterministic safety and control only: approved repository root,
-clean-state validation, CodeGraph readiness, ignored-file and secret rules,
-path containment, output limits, operator approval, provider transport, and
-failure handling.
-
-## Consequence for the V1 CLI Surface
-
-The current restriction on new top-level capabilities remains unchanged:
-`/study` exists only after the bare-startup session is open.
+All former repository, source-analysis, agent, model, and external-service
+workflows are removed rather than retained as fallback behavior. Any later
+capability must be proposed and approved as a separate contract before code or
+documentation introduces it.

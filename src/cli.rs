@@ -1,6 +1,4 @@
-use std::path::PathBuf;
-
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -11,66 +9,15 @@ use clap::{Parser, Subcommand};
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
+    pub(crate) command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Initialize PMEMC local storage.
-    Init,
-    /// Register or display projects.
-    Project {
-        #[command(subcommand)]
-        command: ProjectCommand,
-    },
-    /// Show repository changes relative to its approved baseline.
-    Status {
-        /// Registered project identifier. Omit to show every project.
-        project_id: Option<String>,
-    },
-    /// Stage a project inspection for review.
-    Inspect {
-        /// Registered project identifier.
-        project_id: String,
-    },
-    /// Review pending project-fact proposals.
-    Review {
-        /// Registered project identifier. Omit to review every project.
-        project_id: Option<String>,
-    },
-    /// Show a project's inspection and decision history.
-    History {
-        /// Registered project identifier.
-        project_id: String,
-    },
-    /// Manage provider credentials without exposing their values.
+    /// Manage the OpenRouter API key without exposing its value.
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum ProjectCommand {
-    /// Register a local Git working tree.
-    Add {
-        /// Path to the local Git working tree.
-        path: PathBuf,
-    },
-    /// List registered projects.
-    List,
-    /// Show one registered project.
-    Show {
-        /// Registered project identifier.
-        project_id: String,
-    },
-    /// Irreversibly forget one project's PMEMC memory and registration.
-    Forget {
-        /// Registered project identifier.
-        project_id: String,
-        /// Exact display name for non-interactive confirmation.
-        #[arg(long, value_name = "PROJECT_NAME")]
-        confirm_name: Option<String>,
     },
 }
 
@@ -84,6 +31,13 @@ pub(crate) enum AuthCommand {
     Remove,
 }
 
-pub(crate) fn parse() -> Option<Command> {
-    Cli::parse().command
+pub(crate) fn parse() -> Cli {
+    Cli::parse()
+}
+
+pub(crate) fn print_help() -> anyhow::Result<()> {
+    let mut command = Cli::command();
+    command.print_help()?;
+    println!();
+    Ok(())
 }

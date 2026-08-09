@@ -15,14 +15,45 @@ fn help_describes_the_version_one_command_surface() {
 
     let stdout = String::from_utf8(output.stdout).expect("help should be UTF-8");
     assert!(stdout.contains("Project Memory CLI"));
-    for command in [
-        "init", "project", "status", "inspect", "review", "history", "auth",
-    ] {
-        assert!(stdout.contains(command), "help should list `{command}`");
+    assert!(stdout.contains("auth"));
+    for legacy_command in ["init", "project", "status", "inspect", "review", "history"] {
+        assert!(
+            !stdout.contains(legacy_command),
+            "help must not expose legacy `{legacy_command}`"
+        );
     }
-    let project_help = pmemc(&["project", "--help"]);
-    assert!(project_help.status.success());
-    assert!(String::from_utf8_lossy(&project_help.stdout).contains("forget"));
+}
+
+#[test]
+fn bare_invocation_displays_local_help_without_starting_a_session() {
+    let output = pmemc(&[]);
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).expect("help should be UTF-8");
+    assert!(stdout.contains("Usage: pmemc [COMMAND]"));
+    assert!(stdout.contains("auth"));
+    assert!(!stdout.contains("session"));
+    assert!(!stdout.contains("pmemc>"));
+    assert!(!stdout.contains("pmemc_prepare_project"));
+}
+
+#[test]
+fn auth_is_the_only_retained_command_surface() {
+    let output = pmemc(&["auth", "--help"]);
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).expect("help should be UTF-8");
+    for command in ["set", "status", "remove"] {
+        assert!(stdout.contains(command), "auth must expose `{command}`");
+    }
+    for removed_command in ["project", "study", "model", "prepare", "codegraph"] {
+        assert!(
+            !stdout.contains(removed_command),
+            "auth help must not expose `{removed_command}`"
+        );
+    }
 }
 
 #[test]

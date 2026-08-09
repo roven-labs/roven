@@ -1,4 +1,4 @@
-//! Provider credential commands.
+//! OpenRouter API-key credential commands.
 
 use crate::{cli::AuthCommand, credentials};
 
@@ -14,8 +14,7 @@ pub(crate) fn run(command: AuthCommand) -> anyhow::Result<()> {
             } else {
                 "missing"
             };
-            println!("openrouter\t{state}");
-            println!("environment\tOPENROUTER_API_KEY");
+            println!("{}", credential_status_message(state));
         }
         AuthCommand::Remove => {
             if credentials::remove_openrouter_api_key()? {
@@ -28,9 +27,17 @@ pub(crate) fn run(command: AuthCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn first_run_setup() -> anyhow::Result<()> {
-    println!(
-        "OpenRouter setup starts after CodeGraph preparation when you run `pmemc` in a clean Git repository"
-    );
-    Ok(())
+fn credential_status_message(state: &str) -> String {
+    format!("openrouter\t{state}")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn status_message_reports_only_windows_credential_manager_state() {
+        let message = super::credential_status_message("configured");
+
+        assert_eq!(message, "openrouter\tconfigured");
+        assert!(!message.contains("environment"));
+    }
 }

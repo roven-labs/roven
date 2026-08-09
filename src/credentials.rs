@@ -1,6 +1,4 @@
-//! Provider credential storage and resolution.
-
-use std::env;
+//! OpenRouter API-key storage in Windows Credential Manager.
 
 use thiserror::Error;
 
@@ -18,30 +16,21 @@ pub(crate) enum CredentialError {
     ConfirmationMismatch,
     #[error("the password prompt failed")]
     Prompt(#[source] std::io::Error),
-    #[error("no OpenRouter credential is configured")]
-    Missing,
 }
 
-/// The non-secret location that supplied an OpenRouter credential.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OpenRouterCredentialSource {
-    Environment,
-    CredentialManager,
-}
-
-/// Minimal secret-store boundary used by the provider and CLI.
+/// Minimal secret-store boundary used by the auth CLI.
 pub(crate) trait SecretStore {
     fn get(&self) -> Result<Option<String>, CredentialError>;
     fn set(&self, secret: &str) -> Result<(), CredentialError>;
     fn delete(&self) -> Result<bool, CredentialError>;
 }
 
-/// Native operating-system credential store.
-#[derive(Debug, Default, Clone, Copy)]
+/// Native Windows Credential Manager store for PMEMC's OpenRouter key.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct OsCredentialStore;
 
 impl OsCredentialStore {
-    fn entry() -> Result<keyring::Entry, CredentialError> {
+    fn entry(&self) -> Result<keyring::Entry, CredentialError> {
         keyring::Entry::new(SERVICE_NAME, OPENROUTER_ACCOUNT)
             .map_err(|_| CredentialError::StoreUnavailable)
     }
@@ -49,7 +38,7 @@ impl OsCredentialStore {
 
 impl SecretStore for OsCredentialStore {
     fn get(&self) -> Result<Option<String>, CredentialError> {
-        match Self::entry()?.get_password() {
+        match self.entry()?.get_password() {
             Ok(secret) if !secret.trim().is_empty() => Ok(Some(secret)),
             Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
             Err(_) => Err(CredentialError::StoreUnavailable),
@@ -58,13 +47,13 @@ impl SecretStore for OsCredentialStore {
 
     fn set(&self, secret: &str) -> Result<(), CredentialError> {
         validate_secret(secret)?;
-        Self::entry()?
+        self.entry()?
             .set_password(secret)
             .map_err(|_| CredentialError::StoreUnavailable)
     }
 
     fn delete(&self) -> Result<bool, CredentialError> {
-        match Self::entry()?.delete_credential() {
+        match self.entry()?.delete_credential() {
             Ok(()) => Ok(true),
             Err(keyring::Error::NoEntry) => Ok(false),
             Err(_) => Err(CredentialError::StoreUnavailable),
@@ -80,71 +69,29 @@ fn validate_secret(secret: &str) -> Result<(), CredentialError> {
     }
 }
 
-/// Resolve the provider key from the environment first, then Credential Manager.
-pub(crate) fn openrouter_api_key() -> Result<String, CredentialError> {
-    resolve_openrouter_api_key(&OsCredentialStore, |name| env::var(name).ok())
-}
-
-/// Check whether a non-empty OpenRouter credential is already available.
-pub(crate) fn openrouter_credential_source()
--> Result<Option<OpenRouterCredentialSource>, CredentialError> {
-    resolve_openrouter_credential_source(&OsCredentialStore, |name| env::var(name).ok())
-}
-
-pub(crate) fn resolve_openrouter_api_key(
-    store: &impl SecretStore,
-    environment: impl Fn(&str) -> Option<String>,
-) -> Result<String, CredentialError> {
-    if let Some(secret) = environment("OPENROUTER_API_KEY").filter(|value| !value.trim().is_empty())
-    {
-        return Ok(secret);
-    }
-    match store.get() {
-        Ok(Some(secret)) if !secret.trim().is_empty() => Ok(secret),
-        Ok(None) | Ok(Some(_)) => Err(CredentialError::Missing),
-        Err(error) => Err(error),
-    }
-}
-
-pub(crate) fn resolve_openrouter_credential_source(
-    store: &impl SecretStore,
-    environment: impl Fn(&str) -> Option<String>,
-) -> Result<Option<OpenRouterCredentialSource>, CredentialError> {
-    if environment("OPENROUTER_API_KEY").is_some_and(|value| !value.trim().is_empty()) {
-        return Ok(Some(OpenRouterCredentialSource::Environment));
-    }
-    Ok(store
-        .get()?
-        .filter(|secret| !secret.trim().is_empty())
-        .map(|_| OpenRouterCredentialSource::CredentialManager))
-}
-
-pub(crate) fn prompt_for_openrouter_api_key() -> Result<String, CredentialError> {
+/// Prompt for the OpenRouter API key twice and persist it.
+pub(crate) fn prompt_and_store_openrouter_api_key() -> Result<(), CredentialError> {
     let secret =
         rpassword::prompt_password("OpenRouter API key: ").map_err(CredentialError::Prompt)?;
-    if secret.trim().is_empty() {
-        return Err(CredentialError::EmptyValue);
-    }
-    Ok(secret)
-}
-
-pub(crate) fn prompt_and_store_openrouter_api_key() -> Result<(), CredentialError> {
-    let secret = prompt_for_openrouter_api_key()?;
+    validate_secret(&secret)?;
     let confirmation = rpassword::prompt_password("Confirm OpenRouter API key: ")
         .map_err(CredentialError::Prompt)?;
+    store_confirmed_openrouter_api_key(&OsCredentialStore, &secret, &confirmation)
+}
+
+fn store_confirmed_openrouter_api_key(
+    store: &impl SecretStore,
+    secret: &str,
+    confirmation: &str,
+) -> Result<(), CredentialError> {
+    validate_secret(secret)?;
     if secret != confirmation {
         return Err(CredentialError::ConfirmationMismatch);
     }
-    store_openrouter_api_key(&secret)
+    store.set(secret)
 }
 
-/// Read one hidden key entry and store it in Windows Credential Manager.
-pub(crate) fn prompt_and_store_openrouter_api_key_once() -> Result<(), CredentialError> {
-    store_prompted_openrouter_api_key(&OsCredentialStore, || {
-        rpassword::read_password().map_err(CredentialError::Prompt)
-    })
-}
-
+#[cfg(test)]
 fn store_prompted_openrouter_api_key(
     store: &impl SecretStore,
     prompt: impl FnOnce() -> Result<String, CredentialError>,
@@ -154,16 +101,20 @@ fn store_prompted_openrouter_api_key(
     store.set(&secret)
 }
 
-pub(crate) fn store_openrouter_api_key(secret: &str) -> Result<(), CredentialError> {
-    OsCredentialStore.set(secret)
-}
-
 pub(crate) fn remove_openrouter_api_key() -> Result<bool, CredentialError> {
-    OsCredentialStore.delete()
+    remove_credential(&OsCredentialStore)
 }
 
 pub(crate) fn stored_openrouter_credential() -> Result<bool, CredentialError> {
-    Ok(OsCredentialStore.get()?.is_some())
+    credential_is_stored(&OsCredentialStore)
+}
+
+fn remove_credential(store: &impl SecretStore) -> Result<bool, CredentialError> {
+    store.delete()
+}
+
+fn credential_is_stored(store: &impl SecretStore) -> Result<bool, CredentialError> {
+    Ok(store.get()?.is_some())
 }
 
 #[cfg(test)]
@@ -171,8 +122,8 @@ mod tests {
     use std::cell::RefCell;
 
     use super::{
-        CredentialError, OpenRouterCredentialSource, SecretStore, resolve_openrouter_api_key,
-        resolve_openrouter_credential_source, store_prompted_openrouter_api_key,
+        CredentialError, OsCredentialStore, SecretStore, credential_is_stored, remove_credential,
+        store_confirmed_openrouter_api_key, store_prompted_openrouter_api_key,
     };
 
     #[derive(Default)]
@@ -191,73 +142,26 @@ mod tests {
         }
 
         fn set(&self, secret: &str) -> Result<(), CredentialError> {
+            if self.failure {
+                return Err(CredentialError::StoreUnavailable);
+            }
             *self.value.borrow_mut() = Some(secret.to_owned());
             Ok(())
         }
 
         fn delete(&self) -> Result<bool, CredentialError> {
+            if self.failure {
+                return Err(CredentialError::StoreUnavailable);
+            }
             Ok(self.value.borrow_mut().take().is_some())
         }
     }
 
     #[test]
-    fn environment_secret_wins_over_a_stored_credential() {
-        let store = MemoryStore {
-            value: RefCell::new(Some("stored-secret".into())),
-            failure: false,
-        };
-        let result = resolve_openrouter_api_key(&store, |_| Some("environment-secret".into()));
-        assert_eq!(
-            result.expect("environment secret should resolve"),
-            "environment-secret"
-        );
-    }
-
-    #[test]
-    fn missing_store_entry_uses_environment_fallback() {
-        let store = MemoryStore::default();
-        let result = resolve_openrouter_api_key(&store, |name| {
-            (name == "OPENROUTER_API_KEY").then(|| "environment-secret".into())
-        });
-        assert_eq!(
-            result.expect("environment secret should resolve"),
-            "environment-secret"
-        );
-    }
-
-    #[test]
-    fn saved_credential_is_used_when_the_environment_is_missing() {
-        let store = MemoryStore {
-            value: RefCell::new(Some("stored-secret".into())),
-            failure: false,
-        };
-
-        let source = resolve_openrouter_credential_source(&store, |_| None)
-            .expect("stored credential should resolve");
-
-        assert_eq!(source, Some(OpenRouterCredentialSource::CredentialManager));
-    }
-
-    #[test]
-    fn environment_credential_is_reported_without_reading_the_store() {
-        let store = MemoryStore {
-            value: RefCell::new(Some("stored-secret".into())),
-            failure: true,
-        };
-
-        let source = resolve_openrouter_credential_source(&store, |_| Some("env-secret".into()))
-            .expect("environment credential should resolve without the store");
-
-        assert_eq!(source, Some(OpenRouterCredentialSource::Environment));
-    }
-
-    #[test]
     fn prompted_key_is_stored_without_returning_or_printing_it() {
         let store = MemoryStore::default();
-
         store_prompted_openrouter_api_key(&store, || Ok("prompted-secret".into()))
             .expect("prompted credential should store");
-
         assert_eq!(
             store.get().expect("stored credential should read"),
             Some("prompted-secret".into())
@@ -267,7 +171,6 @@ mod tests {
     #[test]
     fn cancelled_or_empty_prompt_does_not_store_a_credential() {
         let store = MemoryStore::default();
-
         let cancelled = store_prompted_openrouter_api_key(&store, || {
             Err(CredentialError::Prompt(std::io::Error::other("cancelled")))
         });
@@ -280,30 +183,76 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_store_still_allows_ci_environment_fallback() {
-        let store = MemoryStore {
-            value: RefCell::new(None),
-            failure: true,
-        };
-        let result = resolve_openrouter_api_key(&store, |_| Some("ci-secret".into()));
-        assert_eq!(result.expect("CI fallback should resolve"), "ci-secret");
-    }
-
-    #[test]
-    fn empty_sources_are_rejected_without_exposing_values() {
-        let store = MemoryStore::default();
-        let error = resolve_openrouter_api_key(&store, |_| Some("  ".into()))
-            .expect_err("empty sources should fail");
-        assert!(matches!(error, CredentialError::Missing));
-        assert!(!error.to_string().contains(" ".repeat(2).as_str()));
-    }
-
-    #[test]
     fn empty_secret_cannot_be_stored() {
-        let store = super::OsCredentialStore;
-        let error = store
+        let error = OsCredentialStore
             .set(" \t")
             .expect_err("empty secret should be rejected");
         assert!(matches!(error, CredentialError::EmptyValue));
+    }
+
+    #[test]
+    fn credential_status_distinguishes_configured_and_missing_entries() {
+        let configured = MemoryStore {
+            value: RefCell::new(Some("stored-secret".into())),
+            failure: false,
+        };
+        let missing = MemoryStore::default();
+
+        assert!(credential_is_stored(&configured).expect("configured store should be readable"));
+        assert!(!credential_is_stored(&missing).expect("missing store should be readable"));
+    }
+
+    #[test]
+    fn removal_distinguishes_present_and_absent_entries() {
+        let present = MemoryStore {
+            value: RefCell::new(Some("stored-secret".into())),
+            failure: false,
+        };
+        let absent = MemoryStore::default();
+
+        assert!(remove_credential(&present).expect("present credential should be removed"));
+        assert!(!remove_credential(&absent).expect("absent credential should not be removed"));
+        assert_eq!(present.get().expect("store should be readable"), None);
+    }
+
+    #[test]
+    fn confirmation_mismatch_preserves_an_existing_credential() {
+        let store = MemoryStore {
+            value: RefCell::new(Some("existing-secret".into())),
+            failure: false,
+        };
+
+        let error = store_confirmed_openrouter_api_key(&store, "new-secret", "different-secret")
+            .expect_err("mismatched confirmation must fail");
+
+        assert!(matches!(error, CredentialError::ConfirmationMismatch));
+        assert_eq!(
+            store.get().expect("store should be readable"),
+            Some("existing-secret".into())
+        );
+    }
+
+    #[test]
+    fn store_failures_return_safe_errors_without_changing_a_retained_credential() {
+        let store = MemoryStore {
+            value: RefCell::new(Some("existing-secret".into())),
+            failure: true,
+        };
+
+        let status = credential_is_stored(&store)
+            .expect_err("an unavailable store must make status fail safely");
+        let replacement = store_confirmed_openrouter_api_key(&store, "new-secret", "new-secret")
+            .expect_err("an unavailable store must reject replacement");
+        let removal =
+            remove_credential(&store).expect_err("an unavailable store must reject removal");
+
+        assert!(matches!(status, CredentialError::StoreUnavailable));
+        assert!(matches!(replacement, CredentialError::StoreUnavailable));
+        assert!(matches!(removal, CredentialError::StoreUnavailable));
+        assert_eq!(
+            store.value.borrow().as_deref(),
+            Some("existing-secret"),
+            "failure must not clear a retained credential"
+        );
     }
 }
