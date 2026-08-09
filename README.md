@@ -1,33 +1,47 @@
 # PMEMC
 
-PMEMC is a native Windows terminal application with a local UI preview and
-local credential management.
+PMEMC is a native terminal chat client for a project directory. It starts a
+new conversation, asks you to trust the current folder for that launch, and
+streams replies from the fixed OpenRouter model
+`openai/gpt-oss-20b:free`.
 
-Running bare `pmemc` opens a full-screen UI preview. It lets you compose local
-turns and displays a fixed preview reply; it does not read a credential, make
-an external request, or contact a model provider.
+## What works today
 
-Credential management remains available through:
+- `pmemc auth set`, `pmemc auth status`, and `pmemc auth remove` manage the
+  OpenRouter key through the operating-system credential store.
+- A trusted chat reads only the optional root `<project>/PMEMC.md` once, then
+  sends that text with the conversation.
+- Replies stream live. Provider-supplied reasoning appears as a muted
+  `Thought` block; the active status changes from working to thinking to
+  writing a response.
+- `Esc` stops the local stream and keeps received text. `/resume` opens a
+  picker for conversations from the current directory only.
+- Sessions are stored outside the repository in the operating system's local
+  application-data directory, using `meta.json`, `events.jsonl`, and
+  `context.json`.
 
-```powershell
-pmemc auth set
-pmemc auth status
-pmemc auth remove
-```
+PMEMC never asks for or prints the API key in the chat UI, edits project files,
+or runs arbitrary commands.
 
-`auth set` stores a secret in Windows Credential Manager without echoing it.
-`auth status` reports only whether a credential is configured. `auth remove`
-deletes that stored credential. PMEMC does not print the credential, write it
-to a repository, or keep it in a PMEMC database.
+See [setup](docs/SETUP.md) to store an OpenRouter API key.
 
-The UI preview has no provider transport, streaming, persistent session,
-agent tools, repository access, source discovery, model selection, or external
-request capability. Those capabilities require their own approved contract.
+## Not implemented yet
+
+PMEMC does not yet offer project file reading or search tools, Git inspection,
+CodeGraph queries or indexing, tool calls, context compaction, or automatic
+provider retries. It therefore sends no source, Git, or CodeGraph output to
+OpenRouter.
 
 ## Install
+
+From this repository in PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
 
-Open a new PowerShell session and run `pmemc` from any directory.
+Open a new PowerShell session, change to the project directory, and run:
+
+```powershell
+pmemc
+```

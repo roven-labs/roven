@@ -2,35 +2,30 @@
 
 ## Current product boundary
 
-PMEMC is a local Windows terminal application with two enabled capabilities:
+PMEMC is a local terminal client for persistent, project-scoped chat. Bare
+`pmemc` asks whether to trust the canonical current directory for this launch.
+After approval, it loads only the optional root `PMEMC.md`, creates a session
+when the first message is sent, and streams a reply from the fixed OpenRouter
+model `openai/gpt-oss-20b:free`.
 
-- a local, full-screen UI preview opened by bare `pmemc`; and
-- the `pmemc auth` credential lifecycle.
+The UI shows real provider reasoning when it is supplied, a live active-status
+line, the final answer, inline errors, and a `/resume` picker. Conversations
+are scoped by a SHA-256 hash of the canonical project path and stored outside
+the repository through `ProjectDirs::data_local_dir()`.
 
-The UI preview accepts local text input and appends a fixed preview reply. It
-does not read a credential or communicate with an agent or provider.
+## Safety boundary implemented today
 
-PMEMC currently does not:
+- OpenRouter credentials stay in the operating-system credential store.
+- Folder trust is requested for every launch and is not persisted.
+- Before trust, PMEMC does not read `PMEMC.md` or make a provider request.
+- The only project file PMEMC currently reads is the optional root
+  `PMEMC.md`, after trust.
+- PMEMC does not edit files, execute arbitrary commands, invoke Git, search
+  files, or invoke CodeGraph.
 
-- contact a model provider or stream model output;
-- expose model tools;
-- inspect, register, index, read, or write a repository;
-- maintain project, memory, model, or other application data in a database;
-- invoke CodeGraph, select source, or send content to an external service; or
-- manage a model, provider, baseline, proposal, review, portfolio, or resume.
+## Planned, not implemented
 
-## Trust and safety boundary
-
-- The operator controls credential setup and removal through `pmemc auth`.
-- Credential input is secret and must be handled only by the local Windows
-  credential store.
-- PMEMC must never print, log, place in a repository, or persist that secret
-  in an application database.
-- Bare `pmemc` must not inspect the current directory, read a credential, or
-  make an external request.
-
-## Product promise
-
-The UI preview establishes a terminal interaction baseline without implying an
-agent or repository workflow. Each future capability must receive an explicit
-contract, safety boundary, and test suite.
+Read-only project tools, Rust-enforced file and symlink protections for those
+tools, CodeGraph initialization, Git inspection, context compaction, and
+automatic retry policy remain planned work. They must not be described as
+available until their code and tests exist.
