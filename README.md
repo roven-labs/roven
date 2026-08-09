@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/roven_logo_primary_white.png">
-    <img src="assets/roven_logo_primary_black.png" alt="Roven" width="320">
-  </picture>
+  <img src="assets/roven-logo-white.png" alt="Roven" width="320">
 </p>
 
 Roven is a native terminal chat client for a project directory. It starts a
