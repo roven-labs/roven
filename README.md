@@ -2,45 +2,74 @@
   <img src="assets/roven-logo-white.png" alt="Roven" width="320">
 </p>
 
-Roven is a native terminal chat client for a project directory. It starts a
-new conversation, asks you to trust the current folder for that launch, and
-streams replies from the fixed OpenRouter model
-`openai/gpt-oss-20b:free`.
+# Roven
 
-## What works today
+Roven is a native terminal project-memory assistant. It keeps conversations
+scoped to the trusted project directory and can register that project for
+future resume and portfolio work.
 
-- `roven auth set`, `roven auth status`, and `roven auth remove` manage the
-  OpenRouter key through the operating-system credential store.
-- A trusted chat reads only the optional root `<project>/ROVEN.md` once, then
-  sends that text with the conversation.
-- The agent can list immediate directory-entry names and kinds inside the
-  trusted workspace without reading file contents or recursing.
-- Replies stream live. Provider-supplied reasoning appears as a muted
-  `Thought` block; the active status changes from working to thinking to
-  writing a response.
-- `Esc` stops the local stream and keeps received text. `/resume` opens a
-  picker for conversations from the current directory only.
-- Sessions are stored outside the repository in the operating system's local
-  application-data directory, using `meta.json`, `events.jsonl`, and
-  `context.json`.
-- The same local application-data directory contains append-only `log.md`.
-  It records runtime operations and failures (UI, storage, agent, provider,
-  and tool events), but never prompts, replies, or credentials.
-- After trust, the agent can call `prepare_project` to register the current
-  project only after fixed local Git validation confirms a GitHub remote,
-  baseline commit, and clean worktree.
+Roven is provider-neutral: each user chooses an OpenAI-compatible HTTPS
+chat-completions endpoint, model, and API key through a named provider profile.
+It does not silently choose a provider, append an endpoint path, read source
+files, or execute arbitrary commands.
 
-Roven never asks for or prints the API key in the chat UI, edits project files,
-or runs arbitrary commands.
+## Current capabilities
 
-See [setup](docs/SETUP.md) to store an OpenRouter API key.
+- `roven auth set` creates a named provider profile.
+- `roven auth list` shows saved names, endpoints, models, and the default marker.
+- `roven auth use` lets you choose the default profile by its displayed number.
+- `roven auth status` reports the selected profile without revealing its key.
+- `roven auth remove <name>` removes a profile and its operating-system credential.
+- Bare `roven` asks whether to trust the canonical current directory for the
+  current launch. Trust is not persisted between launches.
+- After trust, the optional root `ROVEN.md` is loaded as project instructions.
+- `/resume` opens sessions for the current workspace. `Esc` cancels an active
+  provider stream while retaining received content.
 
-## Not implemented yet
+## Agent tools
 
-Roven does not yet offer project file reading or search tools, broader Git
-inspection, CodeGraph queries or indexing, context compaction, or automatic
-provider retries. It therefore sends no source code or CodeGraph output to
-OpenRouter.
+The Rust harness exposes three tools:
+
+| Tool | Capability | Writes data? |
+| --- | --- | --- |
+| `list_directory` | Lists immediate entries inside the trusted workspace. It cannot recurse, read file contents, or escape the workspace. | No |
+| `prepare_project` | Independently canonicalizes and authorizes the requested path, then validates Git/GitHub state and registers the trusted project. | Yes, after validation |
+| `list_tools` | Returns the live tool names, descriptions, and input schemas. | No |
+
+`prepare_project` rejects paths outside the launch-time trusted workspace before
+any Git command, project lookup, or registration write. A successful
+registration is stored as:
+
+```text
+%LOCALAPPDATA%\Roven\data\projects\<project-name>.json
+```
+
+## Local data
+
+Roven stores data in the operating-system application-data directory. On
+Windows the default root is `%LOCALAPPDATA%\Roven\data`:
+
+```text
+provider-profiles.json
+projects\<project-name>.json
+sessions\<workspace-sha256>\<session-uuid>\meta.json
+sessions\<workspace-sha256>\<session-uuid>\context.json
+sessions\<workspace-sha256>\<session-uuid>\events.jsonl
+log.md
+```
+
+API keys are stored only in the operating-system credential store. Session
+`events.jsonl` contains user, assistant, reasoning, error, and structured
+`function_call_output` records with the tool name, input, and output. `log.md`
+contains operational diagnostics only; it does not contain prompts, replies, or
+credentials.
+
+## Current boundaries
+
+Roven does not currently provide project file-reading or search tools, arbitrary
+command execution, CodeGraph queries, automatic provider retries, or automatic
+project-context summarization. The agent only receives data returned by the
+available tools and the optional root `ROVEN.md`.
 
 ## Install
 
@@ -55,3 +84,5 @@ Open a new PowerShell session, change to the project directory, and run:
 ```powershell
 roven
 ```
+
+See [docs/SETUP.md](docs/SETUP.md) for provider profiles and API-key setup.

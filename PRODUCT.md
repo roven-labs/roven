@@ -2,36 +2,65 @@
 
 ## Current product boundary
 
-Roven is a local terminal client for persistent, project-scoped chat. Bare
-`roven` asks whether to trust the canonical current directory for this launch.
-After approval, it loads only the optional root `ROVEN.md`, creates a session
-when the first message is sent, and streams a reply from the fixed OpenRouter
-model `openai/gpt-oss-20b:free`.
+Roven is a local terminal assistant for project-scoped conversations and
+project registration. At startup it canonicalizes the current directory and
+asks the user to trust it for that launch. Trust is runtime-only and is never
+persisted across launches.
 
-The UI shows real provider reasoning when it is supplied, a live active-status
-line, the final answer, inline errors, and a `/resume` picker. Conversations
-are scoped by a SHA-256 hash of the canonical project path and stored outside
-the repository through `ProjectDirs::data_local_dir()`.
+After trust, Roven loads only the optional root `ROVEN.md`, creates a session on
+the first user message, and streams through the selected named
+OpenAI-compatible provider profile. The profile supplies the exact HTTPS
+chat-completions endpoint, model ID, and operating-system-stored API key.
 
-## Safety boundary implemented today
+## User-facing workflow
 
-- OpenRouter credentials stay in the operating-system credential store.
-- Folder trust is requested for every launch and is not persisted.
-- Before trust, Roven does not read `ROVEN.md` or make a provider request.
-- The only project file Roven currently reads is the optional root
-  `ROVEN.md`, after trust.
-- Roven writes append-only runtime diagnostics to `log.md` in its local
-  application-data directory, never into the trusted workspace. The log
-  records operational metadata and errors, not prompts, replies, or keys.
-- Its `list_directory` tool may read immediate directory-entry names and kinds
-  inside the trusted workspace; it does not read file contents or recurse.
-- Roven does not edit files, execute arbitrary commands, search files, or
-  invoke CodeGraph. Its `prepare_project` tool may run fixed local Git
-  validation commands for the trusted workspace before registering it.
+- `roven auth set` creates a named profile from user-provided endpoint, model,
+  and key values.
+- `roven auth list`, `use`, `status`, and `remove` manage profiles and the
+  explicit default without displaying secrets.
+- Bare `roven` opens the trust gate and terminal chat.
+- `/resume` lists sessions for the current canonical workspace.
+- `Esc` requests cancellation of an active provider stream.
 
-## Planned, not implemented
+## Tool boundary
 
-Read-only project tools, Rust-enforced file and symlink protections for those
-tools, CodeGraph initialization, broader Git inspection, context compaction,
-and automatic retry policy remain planned work. They must not be described as
-available until their code and tests exist.
+The Rust harness, rather than the model prompt, enforces filesystem authority:
+
+- `list_directory` lists only immediate entries inside the trusted workspace.
+- `prepare_project` independently canonicalizes and compares its requested path
+  with the trusted workspace before project lookup, Git validation, or writes.
+- `list_tools` reports the live tool registry.
+
+`prepare_project` validates the trusted project’s GitHub remote, committed
+baseline, and clean working state before writing
+`data/projects/<project-name>.json`. A sibling path, traversal path, or symlink
+that resolves outside the trusted workspace is blocked before Git execution.
+
+## Persistent data
+
+Roven uses the operating-system local application-data directory, separate from
+the project repository:
+
+```text
+provider-profiles.json                 non-secret profile metadata
+projects/<project-name>.json           registered project identity and baseline
+sessions/<workspace-sha256>/<uuid>/    conversation sessions
+  meta.json                            session identity and timestamps
+  context.json                         reserved summary state (currently null)
+  events.jsonl                         conversation and tool-call events
+log.md                                 operational diagnostics only
+```
+
+API keys never enter these files. `events.jsonl` records structured
+`function_call_output` events with the tool call ID, tool name, input, and
+output, allowing the live transcript and resumed provider messages to preserve
+tool activity.
+
+## Safety and non-goals
+
+- Folder trust is requested every launch and is not persisted.
+- Filesystem-sensitive tools enforce their own Rust-side workspace boundary.
+- Roven does not edit files, execute arbitrary commands, recurse through a
+  project, or expose API keys.
+- Roven does not currently provide project file-reading/search tools, CodeGraph
+  queries, automatic provider retries, or automatic context summarization.
