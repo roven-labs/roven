@@ -22,6 +22,8 @@ const MAX_COMPLETION_TOKENS: u16 = 4096;
 pub(crate) enum ProviderError {
     #[error("{0}")]
     Request(String),
+    #[error("OpenRouter rate limit reached (HTTP 429){0}")]
+    RateLimited(String),
     #[error("OpenRouter returned an invalid streaming response")]
     Stream,
     #[error("OpenRouter reported an error: {0}")]
@@ -44,12 +46,28 @@ impl ModelProvider for OpenRouterProvider {
         let payload = serde_json::to_string(&OpenRouterRequest::from(request)).map_err(|_| {
             ProviderError::Request("Roven could not encode the OpenRouter request".to_owned())
         })?;
-        let mut response = ureq::post(ENDPOINT)
+        let agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .build(),
+        );
+        let mut response = agent
+            .post(ENDPOINT)
             .header("Authorization", &format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .send(payload)
             .map_err(request_error)?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(response_error(
+                status,
+                response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok()),
+            ));
+        }
         let reader = BufReader::new(response.body_mut().as_reader());
         let mut tool_call_parts = BTreeMap::new();
 
@@ -245,12 +263,25 @@ struct OpenRouterToolCallFunction {
 
 fn request_error(error: ureq::Error) -> ProviderError {
     match error {
-        ureq::Error::StatusCode(status) => {
-            ProviderError::Request(format!("OpenRouter rejected the request (HTTP {status})"))
-        }
+        ureq::Error::StatusCode(status) => response_error(status, None),
         _ => ProviderError::Request(
             "Roven could not connect to OpenRouter before streaming began".to_owned(),
         ),
+    }
+}
+
+fn response_error(status: u16, retry_after: Option<&str>) -> ProviderError {
+    if status == 429 {
+        let detail = retry_after
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("; retry after {value} seconds"))
+            .unwrap_or_else(|| {
+                ". Wait briefly and try again; the configured model or account may have no capacity."
+                    .to_owned()
+            });
+        ProviderError::RateLimited(detail)
+    } else {
+        ProviderError::Request(format!("OpenRouter rejected the request (HTTP {status})"))
     }
 }
 
@@ -400,7 +431,7 @@ mod tests {
         tools::RovenToolCall,
     };
 
-    use super::{MODEL, OpenRouterRequest, parse_sse_line, request_error};
+    use super::{MODEL, OpenRouterRequest, parse_sse_line, request_error, response_error};
 
     type StreamEvent = ProviderEvent;
 
@@ -472,5 +503,17 @@ mod tests {
             "OpenRouter rejected the request (HTTP 401)"
         );
         assert!(!error.to_string().contains("Bearer"));
+    }
+
+    #[test]
+    fn rate_limits_are_actionable_and_include_the_server_retry_delay() {
+        assert_eq!(
+            response_error(429, Some("30")).to_string(),
+            "OpenRouter rate limit reached (HTTP 429); retry after 30 seconds"
+        );
+        assert_eq!(
+            response_error(429, None).to_string(),
+            "OpenRouter rate limit reached (HTTP 429). Wait briefly and try again; the configured model or account may have no capacity."
+        );
     }
 }

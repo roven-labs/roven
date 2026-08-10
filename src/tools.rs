@@ -423,7 +423,7 @@ impl<G: GitInspector> PrepareProject<G> {
         context: &ToolContext,
         input: PrepareProjectInput,
     ) -> PrepareProjectResult {
-        let project_path = match canonical_project_path(&input.path) {
+        let project_path = match canonical_project_path(context, &input.path) {
             Some(path) => path,
             None => return PrepareProjectResult::blocked(BlockedReason::InvalidPath),
         };
@@ -469,9 +469,17 @@ impl<G: GitInspector> PrepareProject<G> {
     }
 }
 
-fn canonical_project_path(path: &str) -> Option<PathBuf> {
-    let path = Path::new(path);
-    let canonical = path.canonicalize().ok()?;
+/// Resolves a registration target against the launch-scoped trusted workspace.
+/// The caller must still require exact equality with that workspace before any
+/// project lookup, Git inspection, or registration write.
+fn canonical_project_path(context: &ToolContext, path: &str) -> Option<PathBuf> {
+    let requested = Path::new(path);
+    let resolved = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        context.trusted_workspace.join(requested)
+    };
+    let canonical = resolved.canonicalize().ok()?;
     canonical.is_dir().then_some(canonical)
 }
 
@@ -674,6 +682,29 @@ mod tests {
         }
     }
 
+    struct PanicGit;
+
+    impl GitInspector for PanicGit {
+        fn is_available(&self) -> bool {
+            panic!("blocked paths must not inspect Git")
+        }
+        fn is_repository(&self, _: &Path) -> bool {
+            panic!("blocked paths must not inspect Git")
+        }
+        fn head_commit(&self, _: &Path) -> Option<String> {
+            panic!("blocked paths must not inspect Git")
+        }
+        fn github_remote(&self, _: &Path) -> Option<String> {
+            panic!("blocked paths must not inspect Git")
+        }
+        fn is_clean(&self, _: &Path) -> bool {
+            panic!("blocked paths must not inspect Git")
+        }
+        fn operation_in_progress(&self, _: &Path) -> bool {
+            panic!("blocked paths must not inspect Git")
+        }
+    }
+
     fn temp_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("roven-{name}-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&path).unwrap();
@@ -687,6 +718,12 @@ mod tests {
     fn input(path: &Path) -> PrepareProjectInput {
         PrepareProjectInput {
             path: path.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn input_value(path: &str) -> PrepareProjectInput {
+        PrepareProjectInput {
+            path: path.to_owned(),
         }
     }
 
@@ -714,14 +751,24 @@ mod tests {
     }
 
     #[test]
-    fn prepare_project_rejects_a_path_outside_the_trusted_workspace() {
+    fn prepare_project_blocks_a_sibling_before_git_or_registration() {
         let data = temp_root("prepare-data");
-        let trusted = temp_root("trusted");
-        let other = temp_root("other");
-        let tool =
-            PrepareProject::with_dependencies(ProjectRegistry::for_data_root(&data), ready_git());
+        let parent = temp_root("project-parent");
+        let trusted = parent.join("project-one");
+        let sibling = parent.join("project-two");
+        fs::create_dir_all(&trusted).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let registry = ProjectRegistry::for_data_root(&data);
+        let existing = registry
+            .register(
+                &sibling,
+                "https://github.com/roven/project-two".to_owned(),
+                "existing-baseline".to_owned(),
+            )
+            .unwrap();
+        let tool = PrepareProject::with_dependencies(registry.clone(), PanicGit);
 
-        let result = tool.execute(&context(&trusted), input(&other));
+        let result = tool.execute(&context(&trusted), input(&sibling));
 
         assert_eq!(
             result,
@@ -729,13 +776,94 @@ mod tests {
                 reason: BlockedReason::PathNotAllowed
             }
         );
+        assert_eq!(
+            registry.lookup(&sibling).unwrap(),
+            RegistrationLookup::Registered(existing)
+        );
         fs::remove_dir_all(data).unwrap();
-        fs::remove_dir_all(trusted).unwrap();
-        fs::remove_dir_all(other).unwrap();
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
-    fn prepare_project_registers_only_a_clean_github_repository() {
+    fn prepare_project_resolves_dot_against_the_trusted_workspace() {
+        let data = temp_root("prepare-data");
+        let trusted = temp_root("trusted");
+        let registry = ProjectRegistry::for_data_root(&data);
+        let tool = PrepareProject::with_dependencies(registry.clone(), ready_git());
+
+        let result = tool.execute(&context(&trusted), input_value("."));
+
+        assert!(matches!(result, PrepareProjectResult::Prepared { .. }));
+        assert!(matches!(
+            registry.lookup(&trusted).unwrap(),
+            RegistrationLookup::Registered(_)
+        ));
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(trusted).unwrap();
+    }
+
+    #[test]
+    fn prepare_project_blocks_parent_directory_escapes_before_git_or_registration() {
+        let data = temp_root("prepare-data");
+        let parent = temp_root("project-parent");
+        let trusted = parent.join("project-one");
+        let sibling = parent.join("project-two");
+        fs::create_dir_all(&trusted).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let tool =
+            PrepareProject::with_dependencies(ProjectRegistry::for_data_root(&data), PanicGit);
+
+        let result = tool.execute(&context(&trusted), input_value("../project-two"));
+
+        assert_eq!(
+            result,
+            PrepareProjectResult::Blocked {
+                reason: BlockedReason::PathNotAllowed
+            }
+        );
+        assert!(!data.join("projects").exists());
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prepare_project_blocks_symlinks_that_resolve_outside_the_trusted_workspace() {
+        use std::os::windows::fs::symlink_dir;
+
+        let data = temp_root("prepare-data");
+        let trusted = temp_root("trusted");
+        let outside = temp_root("outside");
+        let outside_link = trusted.join("outside-link");
+        match symlink_dir(&outside, &outside_link) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                fs::remove_dir_all(data).unwrap();
+                fs::remove_dir_all(trusted).unwrap();
+                fs::remove_dir_all(outside).unwrap();
+                return;
+            }
+            Err(error) => panic!("symlink setup failed: {error}"),
+        }
+        let tool =
+            PrepareProject::with_dependencies(ProjectRegistry::for_data_root(&data), PanicGit);
+
+        let result = tool.execute(&context(&trusted), input(&outside_link));
+
+        assert_eq!(
+            result,
+            PrepareProjectResult::Blocked {
+                reason: BlockedReason::PathNotAllowed
+            }
+        );
+        assert!(!data.join("projects").exists());
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(trusted).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn prepare_project_accepts_the_exact_trusted_workspace_path() {
         let data = temp_root("prepare-data");
         let project = temp_root("project");
         let tool =
