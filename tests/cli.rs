@@ -31,10 +31,10 @@ fn auth_is_the_only_retained_command_surface() {
     assert!(output.status.success());
 
     let stdout = String::from_utf8(output.stdout).expect("help should be UTF-8");
-    for command in ["set", "status", "remove"] {
+    for command in ["set", "list", "use", "status", "remove"] {
         assert!(stdout.contains(command), "auth must expose `{command}`");
     }
-    for removed_command in ["project", "study", "model", "prepare", "codegraph"] {
+    for removed_command in ["project", "study", "prepare", "codegraph"] {
         assert!(
             !stdout.contains(removed_command),
             "auth help must not expose `{removed_command}`"

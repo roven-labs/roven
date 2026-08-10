@@ -22,8 +22,9 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
     agent::{self, AgentEvent, AgentMessage},
-    credentials,
-    provider::OpenRouterProvider,
+    credentials::{self, SecretStore},
+    profiles::ProviderProfiles,
+    provider::OpenAiCompatibleProvider,
     runtime_log::RuntimeLog,
     storage::{ConversationEvent, EventKind, ProjectStore, SessionMeta, now_ms},
     tools::ToolContext,
@@ -316,9 +317,25 @@ fn spawn_worker(
 ) {
     thread::spawn(move || {
         log_event(runtime_log.as_ref(), "worker_started", "outcome=started");
-        let result = match credentials::load_openrouter_api_key() {
-            Ok(Some(key)) => agent::run(
-                &OpenRouterProvider,
+        let result = (|| -> Result<(), String> {
+            let profiles =
+                ProviderProfiles::for_current_user().map_err(|error| error.to_string())?;
+            let profile = profiles
+                .default_profile()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "No default provider profile. Run `roven auth set`.".to_owned())?;
+            let key = credentials::OsCredentialStore::for_profile_id(&profile.id)
+                .get()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "API key missing for provider profile `{}`. Run `roven auth set`.",
+                        profile.name
+                    )
+                })?;
+            let provider = OpenAiCompatibleProvider::new(profile.endpoint, profile.model);
+            agent::run(
+                &provider,
                 &key,
                 messages,
                 &tool_context,
@@ -337,10 +354,8 @@ fn spawn_worker(
                     let _ = sender.send(message);
                 },
             )
-            .map_err(|error| error.to_string()),
-            Ok(None) => Err("OpenRouter key missing. Run `roven auth set`.".to_owned()),
-            Err(error) => Err(error.to_string()),
-        };
+            .map_err(|error| error.to_string())
+        })();
         if let Err(error) = result {
             log_event(
                 runtime_log.as_ref(),

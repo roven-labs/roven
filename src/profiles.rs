@@ -1,0 +1,220 @@
+use std::{fs, io::Write, path::PathBuf};
+
+use atomic_write_file::AtomicWriteFile;
+use directories::ProjectDirs;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use url::Url;
+
+const QUALIFIER: &str = "io.github.vishal24p";
+const APPLICATION: &str = "Roven";
+const PROFILES_FILE: &str = "provider-profiles.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ProviderProfile {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) endpoint: String,
+    pub(crate) model: String,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ProfileError {
+    #[error("the operating-system local data directory is unavailable")]
+    DataDirectoryUnavailable,
+    #[error("provider profile name cannot be empty")]
+    EmptyName,
+    #[error("provider model ID cannot be empty")]
+    EmptyModel,
+    #[error("a provider profile named `{0}` already exists")]
+    DuplicateName(String),
+    #[error("provider profile `{0}` does not exist")]
+    NotFound(String),
+    #[error("provider endpoint must be an HTTPS URL without credentials, query, or fragment")]
+    InvalidEndpoint,
+    #[error("local provider-profile storage could not be read or written")]
+    Io(#[from] std::io::Error),
+    #[error("local provider-profile storage contains invalid structured data")]
+    Json(#[from] serde_json::Error),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderProfiles {
+    path: PathBuf,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ProfileDocument {
+    profiles: Vec<ProviderProfile>,
+    default_profile_id: Option<String>,
+}
+
+impl ProviderProfiles {
+    pub(crate) fn for_current_user() -> Result<Self, ProfileError> {
+        let directories = ProjectDirs::from(QUALIFIER, "", APPLICATION)
+            .ok_or(ProfileError::DataDirectoryUnavailable)?;
+        Ok(Self::for_data_root(
+            directories.data_local_dir().to_path_buf(),
+        ))
+    }
+
+    pub(crate) fn for_data_root(data_root: PathBuf) -> Self {
+        Self {
+            path: data_root.join(PROFILES_FILE),
+        }
+    }
+
+    pub(crate) fn list(&self) -> Result<Vec<ProviderProfile>, ProfileError> {
+        Ok(self.read()?.profiles)
+    }
+
+    pub(crate) fn default_profile(&self) -> Result<Option<ProviderProfile>, ProfileError> {
+        let document = self.read()?;
+        Ok(document.default_profile_id.and_then(|id| {
+            document
+                .profiles
+                .into_iter()
+                .find(|profile| profile.id == id)
+        }))
+    }
+
+    pub(crate) fn create(
+        &self,
+        name: &str,
+        endpoint: &str,
+        model: &str,
+    ) -> Result<ProviderProfile, ProfileError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(ProfileError::EmptyName);
+        }
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(ProfileError::EmptyModel);
+        }
+        let endpoint = normalize_endpoint(endpoint)?;
+        let mut document = self.read()?;
+        if document.profiles.iter().any(|profile| profile.name == name) {
+            return Err(ProfileError::DuplicateName(name.to_owned()));
+        }
+        let profile = ProviderProfile {
+            id: uuid::Uuid::now_v7().to_string(),
+            name: name.to_owned(),
+            endpoint,
+            model: model.to_owned(),
+        };
+        if document.default_profile_id.is_none() {
+            document.default_profile_id = Some(profile.id.clone());
+        }
+        document.profiles.push(profile.clone());
+        self.write(&document)?;
+        Ok(profile)
+    }
+
+    pub(crate) fn set_default(&self, id: &str) -> Result<(), ProfileError> {
+        let mut document = self.read()?;
+        if !document.profiles.iter().any(|profile| profile.id == id) {
+            return Err(ProfileError::NotFound(id.to_owned()));
+        }
+        document.default_profile_id = Some(id.to_owned());
+        self.write(&document)
+    }
+
+    pub(crate) fn remove(&self, id: &str) -> Result<ProviderProfile, ProfileError> {
+        let mut document = self.read()?;
+        let position = document
+            .profiles
+            .iter()
+            .position(|profile| profile.id == id)
+            .ok_or_else(|| ProfileError::NotFound(id.to_owned()))?;
+        let profile = document.profiles.remove(position);
+        if document.default_profile_id.as_deref() == Some(id) {
+            document.default_profile_id = None;
+        }
+        self.write(&document)?;
+        Ok(profile)
+    }
+
+    fn read(&self) -> Result<ProfileDocument, ProfileError> {
+        match fs::read(&self.path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(ProfileDocument::default())
+            }
+            Err(error) => Err(ProfileError::Io(error)),
+        }
+    }
+
+    fn write(&self, document: &ProfileDocument) -> Result<(), ProfileError> {
+        let parent = self
+            .path
+            .parent()
+            .expect("profile file always has a parent");
+        fs::create_dir_all(parent)?;
+        let bytes = serde_json::to_vec_pretty(document)?;
+        let mut file = AtomicWriteFile::options().open(&self.path)?;
+        file.write_all(&bytes)?;
+        file.commit()?;
+        Ok(())
+    }
+}
+
+pub(crate) fn normalize_endpoint(value: &str) -> Result<String, ProfileError> {
+    let endpoint = Url::parse(value.trim()).map_err(|_| ProfileError::InvalidEndpoint)?;
+    if endpoint.scheme() != "https"
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(ProfileError::InvalidEndpoint);
+    }
+    Ok(endpoint.as_str().trim_end_matches('/').to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::{ProviderProfiles, normalize_endpoint};
+
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("roven-{name}-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn creates_a_named_profile_with_a_normalized_endpoint() {
+        let data_root = temp_root("provider-profiles");
+        let profiles = ProviderProfiles::for_data_root(data_root.clone());
+
+        let profile = profiles
+            .create(
+                "personal groq",
+                "https://api.groq.com/openai/v1/",
+                "openai/gpt-oss-20b",
+            )
+            .unwrap();
+
+        assert_eq!(profile.name, "personal groq");
+        assert_eq!(profile.endpoint, "https://api.groq.com/openai/v1");
+        assert_eq!(profiles.list().unwrap(), vec![profile.clone()]);
+        assert_eq!(profiles.default_profile().unwrap(), Some(profile));
+        fs::remove_dir_all(data_root).unwrap();
+    }
+
+    #[test]
+    fn rejects_unsafe_or_incomplete_endpoints() {
+        for endpoint in [
+            "http://example.test/v1",
+            "https://key@example.test/v1",
+            "https://example.test/v1?key=secret",
+            "https://example.test/v1#fragment",
+            "https://",
+        ] {
+            assert!(normalize_endpoint(endpoint).is_err(), "{endpoint}");
+        }
+    }
+}

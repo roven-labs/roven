@@ -14,7 +14,7 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Manage the OpenRouter API key without exposing its value.
+    /// Manage named OpenAI-compatible provider profiles without exposing API keys.
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
@@ -23,12 +23,16 @@ pub(crate) enum Command {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum AuthCommand {
-    /// Store the OpenRouter API key in the operating-system credential store.
+    /// Interactively create a named provider profile and store its API key.
     Set,
-    /// Report whether a stored OpenRouter credential exists.
+    /// List profile names, endpoints, models, and the selected default.
+    List,
+    /// Interactively choose the default provider profile.
+    Use,
+    /// Report the selected default provider profile.
     Status,
-    /// Remove the stored OpenRouter credential.
-    Remove,
+    /// Remove one named provider profile and its API key.
+    Remove { name: String },
 }
 
 pub(crate) fn parse() -> Cli {

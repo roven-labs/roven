@@ -3,7 +3,6 @@
 use thiserror::Error;
 
 const SERVICE_NAME: &str = "roven";
-const OPENROUTER_ACCOUNT: &str = "openrouter";
 
 /// Errors from local credential management without exposing the credential.
 #[derive(Debug, Error)]
@@ -14,8 +13,6 @@ pub(crate) enum CredentialError {
     EmptyValue,
     #[error("the credential confirmation did not match")]
     ConfirmationMismatch,
-    #[error("the password prompt failed")]
-    Prompt(#[source] std::io::Error),
 }
 
 /// Minimal secret-store boundary used by the auth CLI.
@@ -25,13 +22,21 @@ pub(crate) trait SecretStore {
     fn delete(&self) -> Result<bool, CredentialError>;
 }
 
-/// Native Windows Credential Manager store for Roven's OpenRouter key.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct OsCredentialStore;
+/// Native operating-system credential-store entry for one provider profile.
+#[derive(Debug, Clone)]
+pub(crate) struct OsCredentialStore {
+    account: String,
+}
 
 impl OsCredentialStore {
+    pub(crate) fn for_profile_id(profile_id: &str) -> Self {
+        Self {
+            account: credential_account(profile_id),
+        }
+    }
+
     fn entry(&self) -> Result<keyring::Entry, CredentialError> {
-        keyring::Entry::new(SERVICE_NAME, OPENROUTER_ACCOUNT)
+        keyring::Entry::new(SERVICE_NAME, &self.account)
             .map_err(|_| CredentialError::StoreUnavailable)
     }
 }
@@ -69,17 +74,11 @@ fn validate_secret(secret: &str) -> Result<(), CredentialError> {
     }
 }
 
-/// Prompt for the OpenRouter API key twice and persist it.
-pub(crate) fn prompt_and_store_openrouter_api_key() -> Result<(), CredentialError> {
-    let secret =
-        rpassword::prompt_password("OpenRouter API key: ").map_err(CredentialError::Prompt)?;
-    validate_secret(&secret)?;
-    let confirmation = rpassword::prompt_password("Confirm OpenRouter API key: ")
-        .map_err(CredentialError::Prompt)?;
-    store_confirmed_openrouter_api_key(&OsCredentialStore, &secret, &confirmation)
+fn credential_account(profile_id: &str) -> String {
+    format!("provider-profile:{profile_id}")
 }
 
-fn store_confirmed_openrouter_api_key(
+pub(crate) fn store_confirmed_api_key(
     store: &impl SecretStore,
     secret: &str,
     confirmation: &str,
@@ -92,43 +91,12 @@ fn store_confirmed_openrouter_api_key(
 }
 
 #[cfg(test)]
-fn store_prompted_openrouter_api_key(
-    store: &impl SecretStore,
-    prompt: impl FnOnce() -> Result<String, CredentialError>,
-) -> Result<(), CredentialError> {
-    let secret = prompt()?;
-    validate_secret(&secret)?;
-    store.set(&secret)
-}
-
-pub(crate) fn remove_openrouter_api_key() -> Result<bool, CredentialError> {
-    remove_credential(&OsCredentialStore)
-}
-
-pub(crate) fn stored_openrouter_credential() -> Result<bool, CredentialError> {
-    credential_is_stored(&OsCredentialStore)
-}
-
-/// Retrieves the credential only for the provider boundary.
-pub(crate) fn load_openrouter_api_key() -> Result<Option<String>, CredentialError> {
-    OsCredentialStore.get()
-}
-
-fn remove_credential(store: &impl SecretStore) -> Result<bool, CredentialError> {
-    store.delete()
-}
-
-fn credential_is_stored(store: &impl SecretStore) -> Result<bool, CredentialError> {
-    Ok(store.get()?.is_some())
-}
-
-#[cfg(test)]
 mod tests {
     use std::cell::RefCell;
 
     use super::{
-        CredentialError, OsCredentialStore, SecretStore, credential_is_stored, remove_credential,
-        store_confirmed_openrouter_api_key, store_prompted_openrouter_api_key,
+        CredentialError, OsCredentialStore, SecretStore, credential_account,
+        store_confirmed_api_key,
     };
 
     #[derive(Default)]
@@ -163,10 +131,10 @@ mod tests {
     }
 
     #[test]
-    fn prompted_key_is_stored_without_returning_or_printing_it() {
+    fn confirmed_key_is_stored_without_returning_or_printing_it() {
         let store = MemoryStore::default();
-        store_prompted_openrouter_api_key(&store, || Ok("prompted-secret".into()))
-            .expect("prompted credential should store");
+        store_confirmed_api_key(&store, "prompted-secret", "prompted-secret")
+            .expect("confirmed credential should store");
         assert_eq!(
             store.get().expect("stored credential should read"),
             Some("prompted-secret".into())
@@ -174,22 +142,16 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_or_empty_prompt_does_not_store_a_credential() {
+    fn empty_secret_does_not_store_a_credential() {
         let store = MemoryStore::default();
-        let cancelled = store_prompted_openrouter_api_key(&store, || {
-            Err(CredentialError::Prompt(std::io::Error::other("cancelled")))
-        });
-        assert!(matches!(cancelled, Err(CredentialError::Prompt(_))));
-        assert_eq!(store.get().expect("store should remain readable"), None);
-
-        let empty = store_prompted_openrouter_api_key(&store, || Ok(" ".into()));
+        let empty = store_confirmed_api_key(&store, " ", " ");
         assert!(matches!(empty, Err(CredentialError::EmptyValue)));
         assert_eq!(store.get().expect("store should remain empty"), None);
     }
 
     #[test]
     fn empty_secret_cannot_be_stored() {
-        let error = OsCredentialStore
+        let error = OsCredentialStore::for_profile_id("test-profile")
             .set(" \t")
             .expect_err("empty secret should be rejected");
         assert!(matches!(error, CredentialError::EmptyValue));
@@ -203,8 +165,18 @@ mod tests {
         };
         let missing = MemoryStore::default();
 
-        assert!(credential_is_stored(&configured).expect("configured store should be readable"));
-        assert!(!credential_is_stored(&missing).expect("missing store should be readable"));
+        assert!(
+            configured
+                .get()
+                .expect("configured store should be readable")
+                .is_some()
+        );
+        assert!(
+            missing
+                .get()
+                .expect("missing store should be readable")
+                .is_none()
+        );
     }
 
     #[test]
@@ -215,8 +187,16 @@ mod tests {
         };
         let absent = MemoryStore::default();
 
-        assert!(remove_credential(&present).expect("present credential should be removed"));
-        assert!(!remove_credential(&absent).expect("absent credential should not be removed"));
+        assert!(
+            present
+                .delete()
+                .expect("present credential should be removed")
+        );
+        assert!(
+            !absent
+                .delete()
+                .expect("absent credential should not be removed")
+        );
         assert_eq!(present.get().expect("store should be readable"), None);
     }
 
@@ -227,7 +207,7 @@ mod tests {
             failure: false,
         };
 
-        let error = store_confirmed_openrouter_api_key(&store, "new-secret", "different-secret")
+        let error = store_confirmed_api_key(&store, "new-secret", "different-secret")
             .expect_err("mismatched confirmation must fail");
 
         assert!(matches!(error, CredentialError::ConfirmationMismatch));
@@ -238,18 +218,42 @@ mod tests {
     }
 
     #[test]
+    fn profile_keys_use_distinct_credential_accounts() {
+        assert_ne!(
+            credential_account("profile-a"),
+            credential_account("profile-b")
+        );
+    }
+
+    #[test]
+    fn confirmed_profile_key_requires_matching_confirmation() {
+        let store = MemoryStore {
+            value: RefCell::new(Some("existing-secret".into())),
+            failure: false,
+        };
+
+        let error = store_confirmed_api_key(&store, "new-secret", "different-secret")
+            .expect_err("mismatched confirmation must fail");
+
+        assert!(matches!(error, CredentialError::ConfirmationMismatch));
+        assert_eq!(store.get().unwrap().as_deref(), Some("existing-secret"));
+    }
+
+    #[test]
     fn store_failures_return_safe_errors_without_changing_a_retained_credential() {
         let store = MemoryStore {
             value: RefCell::new(Some("existing-secret".into())),
             failure: true,
         };
 
-        let status = credential_is_stored(&store)
+        let status = store
+            .get()
             .expect_err("an unavailable store must make status fail safely");
-        let replacement = store_confirmed_openrouter_api_key(&store, "new-secret", "new-secret")
+        let replacement = store_confirmed_api_key(&store, "new-secret", "new-secret")
             .expect_err("an unavailable store must reject replacement");
-        let removal =
-            remove_credential(&store).expect_err("an unavailable store must reject removal");
+        let removal = store
+            .delete()
+            .expect_err("an unavailable store must reject removal");
 
         assert!(matches!(status, CredentialError::StoreUnavailable));
         assert!(matches!(replacement, CredentialError::StoreUnavailable));

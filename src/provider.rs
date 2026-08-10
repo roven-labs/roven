@@ -1,4 +1,4 @@
-//! OpenRouter wire adapter for Roven's provider-independent agent protocol.
+//! OpenAI-compatible wire adapter for Roven's provider-independent agent protocol.
 
 use std::{
     collections::BTreeMap,
@@ -14,26 +14,37 @@ use crate::{
     tools::{RovenToolCall, RovenToolDefinition},
 };
 
-pub(crate) const MODEL: &str = "openai/gpt-oss-20b:free";
-const ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 const MAX_COMPLETION_TOKENS: u16 = 4096;
 
 #[derive(Debug, Error)]
 pub(crate) enum ProviderError {
     #[error("{0}")]
     Request(String),
-    #[error("OpenRouter rate limit reached (HTTP 429){0}")]
+    #[error("Provider rate limit reached (HTTP 429){0}")]
     RateLimited(String),
-    #[error("OpenRouter returned an invalid streaming response")]
+    #[error("Provider returned an invalid streaming response")]
     Stream,
-    #[error("OpenRouter reported an error: {0}")]
+    #[error("Provider reported an error: {0}")]
     Remote(String),
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct OpenRouterProvider;
+#[derive(Debug, Clone)]
+pub(crate) struct OpenAiCompatibleProvider {
+    endpoint: String,
+    model: String,
+}
 
-impl ModelProvider for OpenRouterProvider {
+impl OpenAiCompatibleProvider {
+    pub(crate) fn new(endpoint: String, model: String) -> Self {
+        Self { endpoint, model }
+    }
+
+    fn request_endpoint(&self) -> &str {
+        &self.endpoint
+    }
+}
+
+impl ModelProvider for OpenAiCompatibleProvider {
     type Error = ProviderError;
 
     fn stream(
@@ -43,16 +54,18 @@ impl ModelProvider for OpenRouterProvider {
         cancelled: &AtomicBool,
         emit: &mut dyn FnMut(ProviderEvent),
     ) -> Result<(), Self::Error> {
-        let payload = serde_json::to_string(&OpenRouterRequest::from(request)).map_err(|_| {
-            ProviderError::Request("Roven could not encode the OpenRouter request".to_owned())
-        })?;
+        let payload =
+            serde_json::to_string(&ChatCompletionsRequest::from_agent(&self.model, request))
+                .map_err(|_| {
+                    ProviderError::Request("Roven could not encode the provider request".to_owned())
+                })?;
         let agent = ureq::Agent::new_with_config(
             ureq::Agent::config_builder()
                 .http_status_as_error(false)
                 .build(),
         );
         let mut response = agent
-            .post(ENDPOINT)
+            .post(self.request_endpoint())
             .header("Authorization", &format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
@@ -102,21 +115,19 @@ impl ModelProvider for OpenRouterProvider {
 }
 
 #[derive(Serialize)]
-struct OpenRouterRequest {
-    model: &'static str,
+struct ChatCompletionsRequest {
+    model: String,
     messages: Vec<OpenRouterMessage>,
     stream: bool,
     max_tokens: u16,
-    parallel_tool_calls: bool,
     tool_choice: &'static str,
     tools: Vec<OpenRouterTool>,
-    reasoning: ReasoningOptions,
 }
 
-impl From<&AgentRequest> for OpenRouterRequest {
-    fn from(request: &AgentRequest) -> Self {
+impl ChatCompletionsRequest {
+    fn from_agent(model: &str, request: &AgentRequest) -> Self {
         Self {
-            model: MODEL,
+            model: model.to_owned(),
             messages: request
                 .messages
                 .iter()
@@ -124,21 +135,10 @@ impl From<&AgentRequest> for OpenRouterRequest {
                 .collect(),
             stream: true,
             max_tokens: MAX_COMPLETION_TOKENS,
-            parallel_tool_calls: false,
             tool_choice: "auto",
             tools: request.tools.iter().map(OpenRouterTool::from).collect(),
-            reasoning: ReasoningOptions {
-                enabled: true,
-                exclude: false,
-            },
         }
     }
-}
-
-#[derive(Serialize)]
-struct ReasoningOptions {
-    enabled: bool,
-    exclude: bool,
 }
 
 #[derive(Serialize)]
@@ -147,14 +147,10 @@ enum OpenRouterMessage {
     Content {
         role: &'static str,
         content: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reasoning: Option<String>,
     },
     AssistantToolCalls {
         role: &'static str,
         content: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reasoning: Option<String>,
         tool_calls: Vec<OpenRouterToolCall>,
     },
     ToolResult {
@@ -170,30 +166,26 @@ impl From<&AgentMessage> for OpenRouterMessage {
             AgentMessage::System { content } => Self::Content {
                 role: "system",
                 content: content.clone(),
-                reasoning: None,
             },
             AgentMessage::User { content } => Self::Content {
                 role: "user",
                 content: content.clone(),
-                reasoning: None,
             },
             AgentMessage::Assistant {
                 content,
-                reasoning,
+                reasoning: _,
                 tool_calls,
             } if tool_calls.is_empty() => Self::Content {
                 role: "assistant",
                 content: content.clone(),
-                reasoning: reasoning.clone(),
             },
             AgentMessage::Assistant {
                 content,
-                reasoning,
+                reasoning: _,
                 tool_calls,
             } => Self::AssistantToolCalls {
                 role: "assistant",
                 content: (!content.is_empty()).then(|| content.clone()),
-                reasoning: reasoning.clone(),
                 tool_calls: tool_calls.iter().map(OpenRouterToolCall::from).collect(),
             },
             AgentMessage::Tool { result } => Self::ToolResult {
@@ -265,7 +257,7 @@ fn request_error(error: ureq::Error) -> ProviderError {
     match error {
         ureq::Error::StatusCode(status) => response_error(status, None),
         _ => ProviderError::Request(
-            "Roven could not connect to OpenRouter before streaming began".to_owned(),
+            "Roven could not connect to the configured provider before streaming began".to_owned(),
         ),
     }
 }
@@ -281,7 +273,7 @@ fn response_error(status: u16, retry_after: Option<&str>) -> ProviderError {
             });
         ProviderError::RateLimited(detail)
     } else {
-        ProviderError::Request(format!("OpenRouter rejected the request (HTTP {status})"))
+        ProviderError::Request(format!("Provider rejected the request (HTTP {status})"))
     }
 }
 
@@ -431,28 +423,41 @@ mod tests {
         tools::RovenToolCall,
     };
 
-    use super::{MODEL, OpenRouterRequest, parse_sse_line, request_error, response_error};
+    use super::{
+        ChatCompletionsRequest, OpenAiCompatibleProvider, parse_sse_line, request_error,
+        response_error,
+    };
 
     type StreamEvent = ProviderEvent;
 
     #[test]
-    fn request_uses_the_fixed_streaming_model_and_exposes_roven_tools() {
+    fn provider_uses_the_configured_endpoint_without_appending_a_path() {
+        let provider = OpenAiCompatibleProvider::new(
+            "https://ollama.com/v1/chat/completions".to_owned(),
+            "gemma4:31b-cloud".to_owned(),
+        );
+
+        assert_eq!(
+            provider.request_endpoint(),
+            "https://ollama.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn request_uses_profile_model_and_standard_openai_fields() {
         let request = AgentRequest::new(vec![AgentMessage::User {
             content: "Hello".to_owned(),
         }]);
-        let request = OpenRouterRequest::from(&request);
+        let request = ChatCompletionsRequest::from_agent("llama-3.3-70b-versatile", &request);
         let value = serde_json::to_value(&request).unwrap();
 
-        assert_eq!(request.model, MODEL);
+        assert_eq!(request.model, "llama-3.3-70b-versatile");
         assert!(request.stream);
         assert_eq!(request.max_tokens, 4096);
-        assert!(!request.parallel_tool_calls);
         assert_eq!(value["tool_choice"], "auto");
         assert_eq!(value["tools"][0]["function"]["name"], "prepare_project");
-        assert_eq!(
-            value["reasoning"],
-            serde_json::json!({ "enabled": true, "exclude": false })
-        );
+        assert!(value.get("reasoning").is_none());
+        assert!(value.get("parallel_tool_calls").is_none());
     }
 
     #[test]
@@ -500,7 +505,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "OpenRouter rejected the request (HTTP 401)"
+            "Provider rejected the request (HTTP 401)"
         );
         assert!(!error.to_string().contains("Bearer"));
     }
@@ -509,11 +514,11 @@ mod tests {
     fn rate_limits_are_actionable_and_include_the_server_retry_delay() {
         assert_eq!(
             response_error(429, Some("30")).to_string(),
-            "OpenRouter rate limit reached (HTTP 429); retry after 30 seconds"
+            "Provider rate limit reached (HTTP 429); retry after 30 seconds"
         );
         assert_eq!(
             response_error(429, None).to_string(),
-            "OpenRouter rate limit reached (HTTP 429). Wait briefly and try again; the configured model or account may have no capacity."
+            "Provider rate limit reached (HTTP 429). Wait briefly and try again; the configured model or account may have no capacity."
         );
     }
 }
