@@ -370,7 +370,7 @@ impl PrepareProjectResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PreparedProject {
-    id: String,
+    name: String,
     path: String,
     github_remote: String,
     baseline_commit: String,
@@ -378,7 +378,7 @@ pub(crate) struct PreparedProject {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ExistingProject {
-    id: String,
+    name: String,
     path: String,
 }
 
@@ -437,10 +437,10 @@ impl<G: GitInspector> PrepareProject<G> {
         match registry.lookup(&project_path) {
             Ok(RegistrationLookup::Registered(registration)) => {
                 return PrepareProjectResult::AlreadyAdded {
-                    project: existing_project(registration),
+                    project: existing_project(*registration),
                 };
             }
-            Ok(RegistrationLookup::Absent | RegistrationLookup::Legacy) => {}
+            Ok(RegistrationLookup::Absent) => {}
             Err(_) => return PrepareProjectResult::blocked(BlockedReason::StorageFailure),
         }
         if !self.git.is_available() {
@@ -485,14 +485,14 @@ fn canonical_project_path(context: &ToolContext, path: &str) -> Option<PathBuf> 
 
 fn existing_project(registration: ProjectRegistration) -> ExistingProject {
     ExistingProject {
-        id: registration.id,
+        name: registration.name,
         path: registration.canonical_path,
     }
 }
 
 fn prepared_project(registration: ProjectRegistration) -> PreparedProject {
     PreparedProject {
-        id: registration.id,
+        name: registration.name,
         path: registration.canonical_path,
         github_remote: registration.github_remote,
         baseline_commit: registration.baseline_commit,
@@ -643,7 +643,7 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::storage::{ProjectRegistry, RegistrationLookup, project_id};
+    use crate::storage::{ProjectRegistry, RegistrationLookup};
 
     use super::{
         BlockedReason, GitInspector, ListDirectory, ListDirectoryInput, PrepareProject,
@@ -778,7 +778,7 @@ mod tests {
         );
         assert_eq!(
             registry.lookup(&sibling).unwrap(),
-            RegistrationLookup::Registered(existing)
+            RegistrationLookup::Registered(Box::new(existing))
         );
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(parent).unwrap();
@@ -996,36 +996,6 @@ mod tests {
             fs::remove_dir_all(data).unwrap();
             fs::remove_dir_all(project).unwrap();
         }
-    }
-
-    #[test]
-    fn legacy_project_record_is_upgraded_in_place_after_validation() {
-        let data = temp_root("prepare-data");
-        let project = temp_root("project");
-        let canonical = project.canonicalize().unwrap();
-        let record_dir = data.join("projects").join(project_id(&canonical));
-        fs::create_dir_all(&record_dir).unwrap();
-        fs::write(
-            record_dir.join("project.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "canonical_path": canonical.to_string_lossy()
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let registry = ProjectRegistry::for_data_root(&data);
-        let tool = PrepareProject::with_dependencies(registry.clone(), ready_git());
-
-        assert!(matches!(
-            tool.execute(&context(&project), input(&project)),
-            PrepareProjectResult::Prepared { .. }
-        ));
-        assert!(matches!(
-            registry.lookup(&project).unwrap(),
-            RegistrationLookup::Registered(_)
-        ));
-        fs::remove_dir_all(data).unwrap();
-        fs::remove_dir_all(project).unwrap();
     }
 
     #[test]

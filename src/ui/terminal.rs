@@ -19,6 +19,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
+use serde_json::Value;
 
 use crate::{
     agent::{self, AgentEvent, AgentMessage},
@@ -26,8 +27,8 @@ use crate::{
     profiles::ProviderProfiles,
     provider::OpenAiCompatibleProvider,
     runtime_log::RuntimeLog,
-    storage::{ConversationEvent, EventKind, ProjectStore, SessionMeta, now_ms},
-    tools::ToolContext,
+    storage::{ConversationEvent, EventKind, ProjectStore, SessionMeta},
+    tools::{RovenToolCall, RovenToolResult, ToolContext},
 };
 
 use super::{
@@ -39,9 +40,12 @@ use super::{
 enum WorkerEvent {
     Thought(String),
     Text(String),
+    FunctionCallOutput {
+        call: RovenToolCall,
+        result: RovenToolResult,
+    },
     Finished,
     Cancelled,
-    Activity(String),
     Error(String),
 }
 
@@ -235,12 +239,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                     project_store
                         .append_event(
                             &active_session.id,
-                            &ConversationEvent {
-                                kind: EventKind::User,
-                                content: user.clone(),
-                                duration_ms: None,
-                                created_at_ms: now_ms(),
-                            },
+                            &ConversationEvent::message(EventKind::User, user.clone(), None),
                         )
                         .inspect_err(|error| {
                             log_event(
@@ -345,8 +344,8 @@ fn spawn_worker(
                     let message = match event {
                         AgentEvent::Thought(thought) => WorkerEvent::Thought(thought),
                         AgentEvent::Text(text) => WorkerEvent::Text(text),
-                        AgentEvent::ToolResult(result) => {
-                            WorkerEvent::Activity(format!("{} completed", result.name))
+                        AgentEvent::ToolResult { call, result } => {
+                            WorkerEvent::FunctionCallOutput { call, result }
                         }
                         AgentEvent::Finished => WorkerEvent::Finished,
                         AgentEvent::Cancelled => WorkerEvent::Cancelled,
@@ -379,7 +378,10 @@ fn apply_worker_event(
     match event {
         WorkerEvent::Thought(thought) => state.append_thought(thought),
         WorkerEvent::Text(text) => state.append_agent_text(text),
-        WorkerEvent::Activity(message) => state.activity(message),
+        WorkerEvent::FunctionCallOutput { call, result } => {
+            persist_function_call_output(store, session, &call, &result);
+            state.activity(format!("{} completed", result.name));
+        }
         WorkerEvent::Finished | WorkerEvent::Cancelled => {
             let stopped = matches!(event, WorkerEvent::Cancelled);
             state.finish_agent();
@@ -412,12 +414,7 @@ fn apply_worker_event(
             if let (Some(project_store), Some(active_session)) = (store, session) {
                 let _ = project_store.append_event(
                     &active_session.id,
-                    &ConversationEvent {
-                        kind: EventKind::Error,
-                        content: error.clone(),
-                        duration_ms: None,
-                        created_at_ms: now_ms(),
-                    },
+                    &ConversationEvent::message(EventKind::Error, error.clone(), None),
                 );
             }
             state.agent_error(error);
@@ -429,6 +426,25 @@ fn apply_worker_event(
 fn log_event(runtime_log: Option<&RuntimeLog>, event: &str, detail: &str) {
     if let Some(log) = runtime_log {
         log.record("terminal", event, detail);
+    }
+}
+
+fn persist_function_call_output(
+    store: Option<&ProjectStore>,
+    session: Option<&SessionMeta>,
+    call: &RovenToolCall,
+    result: &RovenToolResult,
+) {
+    if let (Some(project_store), Some(active_session)) = (store, session) {
+        let _ = project_store.append_event(
+            &active_session.id,
+            &ConversationEvent::function_call_output(
+                call.id.clone(),
+                call.name.clone(),
+                call.arguments.clone(),
+                result.result.clone(),
+            ),
+        );
     }
 }
 
@@ -450,12 +466,11 @@ fn persist_generation(
             }
             let _ = project_store.append_event(
                 &active_session.id,
-                &ConversationEvent {
-                    kind: event_kind,
-                    content: message.content.clone(),
-                    duration_ms: message.duration_ms,
-                    created_at_ms: now_ms(),
-                },
+                &ConversationEvent::message(
+                    event_kind,
+                    message.content.clone(),
+                    message.duration_ms,
+                ),
             );
         }
     }
@@ -478,7 +493,10 @@ fn request_messages(
         ),
     }];
     let mut pending_reasoning: Option<String> = None;
-    for event in store.events(&session.id)? {
+    let events = store.events(&session.id)?;
+    let mut index = 0;
+    while index < events.len() {
+        let event = events[index].clone();
         match event.kind {
             EventKind::User => {
                 pending_reasoning = None;
@@ -502,8 +520,55 @@ fn request_messages(
                     tool_calls: Vec::new(),
                 });
             }
-            EventKind::Tool | EventKind::Error => {}
+            EventKind::FunctionCallOutput => {
+                let mut calls = Vec::new();
+                let mut results = Vec::new();
+                while index < events.len() {
+                    let function_event = events[index].clone();
+                    if function_event.kind != EventKind::FunctionCallOutput {
+                        break;
+                    }
+                    if let (
+                        Some(tool_call_id),
+                        Some(tool_name),
+                        Some(tool_input),
+                        Some(tool_output),
+                    ) = (
+                        function_event.tool_call_id,
+                        function_event.tool_name,
+                        function_event.tool_input,
+                        function_event.tool_output,
+                    ) {
+                        calls.push(RovenToolCall {
+                            id: tool_call_id.clone(),
+                            name: tool_name.clone(),
+                            arguments: tool_input,
+                        });
+                        results.push(RovenToolResult {
+                            tool_call_id,
+                            name: tool_name,
+                            result: tool_output,
+                        });
+                    }
+                    index += 1;
+                }
+                if !calls.is_empty() {
+                    messages.push(AgentMessage::Assistant {
+                        content: String::new(),
+                        reasoning: pending_reasoning.take(),
+                        tool_calls: calls,
+                    });
+                    messages.extend(
+                        results
+                            .into_iter()
+                            .map(|result| AgentMessage::Tool { result }),
+                    );
+                }
+                continue;
+            }
+            EventKind::Error => {}
         }
+        index += 1;
     }
     Ok(messages)
 }
@@ -525,14 +590,32 @@ fn event_to_message(event: ConversationEvent) -> Message {
     let role = match event.kind {
         EventKind::User => Role::User,
         EventKind::Thought => Role::Thought,
-        EventKind::Tool => Role::Activity,
+        EventKind::FunctionCallOutput => Role::Activity,
         EventKind::Assistant | EventKind::Error | EventKind::Cancelled => Role::Roven,
     };
     Message {
         role,
-        content: event.content,
+        content: match event.kind {
+            EventKind::FunctionCallOutput => format_function_call_output(&event),
+            _ => event.content,
+        },
         duration_ms: event.duration_ms,
     }
+}
+
+fn format_function_call_output(event: &ConversationEvent) -> String {
+    let name = event.tool_name.as_deref().unwrap_or("unknown");
+    let input = event
+        .tool_input
+        .as_ref()
+        .map(Value::to_string)
+        .unwrap_or_else(|| "null".to_owned());
+    let output = event
+        .tool_output
+        .as_ref()
+        .map(Value::to_string)
+        .unwrap_or_else(|| "null".to_owned());
+    format!("function_call_output: {name} input={input} output={output}")
 }
 
 fn is_ctrl_c(event: &Event) -> bool {
@@ -579,7 +662,10 @@ impl Drop for TerminalGuard {
 mod tests {
     use std::fs;
 
-    use crate::storage::{ConversationEvent, EventKind, ProjectStore};
+    use crate::{
+        storage::{ConversationEvent, EventKind, ProjectStore},
+        ui::state::Role,
+    };
 
     fn temp_root(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("roven-{name}-{}", uuid::Uuid::now_v7()));
@@ -594,24 +680,17 @@ mod tests {
         let store = ProjectStore::for_project(&data, &project).unwrap();
         let session = store.create_session("Explain the failure").unwrap();
         for event in [
-            ConversationEvent {
-                kind: EventKind::User,
-                content: "Explain the failure".to_owned(),
-                duration_ms: None,
-                created_at_ms: 1,
-            },
-            ConversationEvent {
-                kind: EventKind::Thought,
-                content: "I should inspect the error.".to_owned(),
-                duration_ms: Some(757),
-                created_at_ms: 2,
-            },
-            ConversationEvent {
-                kind: EventKind::Assistant,
-                content: "The request was rate limited.".to_owned(),
-                duration_ms: None,
-                created_at_ms: 3,
-            },
+            ConversationEvent::message(EventKind::User, "Explain the failure".to_owned(), None),
+            ConversationEvent::message(
+                EventKind::Thought,
+                "I should inspect the error.".to_owned(),
+                Some(757),
+            ),
+            ConversationEvent::message(
+                EventKind::Assistant,
+                "The request was rate limited.".to_owned(),
+                None,
+            ),
         ] {
             store.append_event(&session.id, &event).unwrap();
         }
@@ -635,6 +714,95 @@ mod tests {
                 && reasoning == "I should inspect the error."
                 && tool_calls.is_empty()
         ));
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn resumed_history_rebuilds_function_calls_and_outputs() {
+        let data = temp_root("function-data");
+        let project = temp_root("function-project");
+        let store = ProjectStore::for_project(&data, &project).unwrap();
+        let session = store.create_session("Inspect the workspace").unwrap();
+        store
+            .append_event(
+                &session.id,
+                &ConversationEvent::message(
+                    EventKind::User,
+                    "Inspect the workspace".to_owned(),
+                    None,
+                ),
+            )
+            .unwrap();
+        for (id, name, input, output) in [
+            (
+                "call-1",
+                "list_directory",
+                serde_json::json!({"path": "."}),
+                serde_json::json!({"status": "ok"}),
+            ),
+            (
+                "call-2",
+                "list_tools",
+                serde_json::json!({}),
+                serde_json::json!({"status": "ok"}),
+            ),
+        ] {
+            store
+                .append_event(
+                    &session.id,
+                    &ConversationEvent::function_call_output(
+                        id.to_owned(),
+                        name.to_owned(),
+                        input,
+                        output,
+                    ),
+                )
+                .unwrap();
+        }
+
+        let messages = super::request_messages(&store, &session, "").unwrap();
+        assert!(matches!(
+            &messages[2],
+            crate::agent::AgentMessage::Assistant { tool_calls, .. }
+                if tool_calls.len() == 2
+                    && tool_calls[0].name == "list_directory"
+                    && tool_calls[1].name == "list_tools"
+        ));
+        assert!(matches!(
+            &messages[3],
+            crate::agent::AgentMessage::Tool { result }
+                if result.tool_call_id == "call-1" && result.name == "list_directory"
+        ));
+        assert!(matches!(
+            &messages[4],
+            crate::agent::AgentMessage::Tool { result }
+                if result.tool_call_id == "call-2" && result.name == "list_tools"
+        ));
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn resumed_function_call_output_is_visible_in_history() {
+        let data = temp_root("display-data");
+        let project = temp_root("display-project");
+        let store = ProjectStore::for_project(&data, &project).unwrap();
+        let session = store.create_session("Inspect the workspace").unwrap();
+        let event = ConversationEvent::function_call_output(
+            "call-1".to_owned(),
+            "list_directory".to_owned(),
+            serde_json::json!({"path": "."}),
+            serde_json::json!({"status": "ok"}),
+        );
+        store.append_event(&session.id, &event).unwrap();
+
+        let message = super::event_to_message(event);
+        assert_eq!(message.role, Role::Activity);
+        assert!(message.content.contains("function_call_output"));
+        assert!(message.content.contains("list_directory"));
+        assert!(message.content.contains("\"path\":\".\""));
+        assert!(message.content.contains("\"status\":\"ok\""));
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(project).unwrap();
     }

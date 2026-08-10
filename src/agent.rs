@@ -65,7 +65,10 @@ pub(crate) trait ModelProvider {
 pub(crate) enum AgentEvent {
     Thought(String),
     Text(String),
-    ToolResult(RovenToolResult),
+    ToolResult {
+        call: RovenToolCall,
+        result: RovenToolResult,
+    },
     Finished,
     Cancelled,
 }
@@ -160,7 +163,7 @@ pub(crate) fn run<P: ModelProvider>(
                     "tool_dispatch_started",
                     &format!("name={}", call.name),
                 );
-                let result = dispatch(context, call);
+                let result = dispatch(context, call.clone());
                 let status = result
                     .result
                     .get("status")
@@ -180,7 +183,10 @@ pub(crate) fn run<P: ModelProvider>(
                         reason.map_or_else(String::new, |reason| format!(" reason={reason}"))
                     ),
                 );
-                emit(AgentEvent::ToolResult(result.clone()));
+                emit(AgentEvent::ToolResult {
+                    call,
+                    result: result.clone(),
+                });
                 messages.push(AgentMessage::Tool { result });
             }
             continue;
@@ -326,7 +332,7 @@ mod tests {
         assert_eq!(*provider.requests.borrow(), 2);
         assert!(matches!(
             events.borrow().first(),
-            Some(AgentEvent::ToolResult(result)) if result.name == "prepare_project"
+            Some(AgentEvent::ToolResult { result, .. }) if result.name == "prepare_project"
         ));
         assert!(matches!(events.borrow().last(), Some(AgentEvent::Finished)));
     }
