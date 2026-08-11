@@ -593,29 +593,14 @@ fn event_to_message(event: ConversationEvent) -> Message {
         EventKind::FunctionCallOutput => Role::Activity,
         EventKind::Assistant | EventKind::Error | EventKind::Cancelled => Role::Roven,
     };
-    Message {
-        role,
-        content: match event.kind {
-            EventKind::FunctionCallOutput => format_function_call_output(&event),
-            _ => event.content,
-        },
-        duration_ms: event.duration_ms,
+    match event.kind {
+        EventKind::FunctionCallOutput => Message::tool(
+            event.tool_name.unwrap_or_else(|| "unknown".to_owned()),
+            event.tool_input.unwrap_or(Value::Null),
+            event.tool_output.unwrap_or(Value::Null),
+        ),
+        _ => Message::text(role, event.content, event.duration_ms),
     }
-}
-
-fn format_function_call_output(event: &ConversationEvent) -> String {
-    let name = event.tool_name.as_deref().unwrap_or("unknown");
-    let input = event
-        .tool_input
-        .as_ref()
-        .map(Value::to_string)
-        .unwrap_or_else(|| "null".to_owned());
-    let output = event
-        .tool_output
-        .as_ref()
-        .map(Value::to_string)
-        .unwrap_or_else(|| "null".to_owned());
-    format!("function_call_output: {name} input={input} output={output}")
 }
 
 fn is_ctrl_c(event: &Event) -> bool {
@@ -799,10 +784,13 @@ mod tests {
 
         let message = super::event_to_message(event);
         assert_eq!(message.role, Role::Activity);
-        assert!(message.content.contains("function_call_output"));
-        assert!(message.content.contains("list_directory"));
-        assert!(message.content.contains("\"path\":\".\""));
-        assert!(message.content.contains("\"status\":\"ok\""));
+        assert!(matches!(
+            message.kind,
+            crate::ui::state::MessageKind::Tool { ref name, ref input, ref output }
+                if name == "list_directory"
+                    && input["path"] == "."
+                    && output["status"] == "ok"
+        ));
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(project).unwrap();
     }

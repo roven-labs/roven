@@ -1,5 +1,7 @@
 use std::time::Instant;
 
+use serde_json::Value;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Role {
     User,
@@ -8,11 +10,46 @@ pub(crate) enum Role {
     Activity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Message {
     pub(crate) role: Role,
     pub(crate) content: String,
     pub(crate) duration_ms: Option<u64>,
+    pub(crate) kind: MessageKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum MessageKind {
+    Text,
+    Tool {
+        name: String,
+        input: Value,
+        output: Value,
+    },
+}
+
+impl Message {
+    pub(crate) fn text(role: Role, content: String, duration_ms: Option<u64>) -> Self {
+        Self {
+            role,
+            content,
+            duration_ms,
+            kind: MessageKind::Text,
+        }
+    }
+
+    pub(crate) fn tool(name: String, input: Value, output: Value) -> Self {
+        Self {
+            role: Role::Activity,
+            content: String::new(),
+            duration_ms: None,
+            kind: MessageKind::Tool {
+                name,
+                input,
+                output,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,11 +112,7 @@ impl AppState {
         }
 
         let content = std::mem::take(&mut self.input);
-        self.messages.push(Message {
-            role: Role::User,
-            content,
-            duration_ms: None,
-        });
+        self.messages.push(Message::text(Role::User, content, None));
         self.scroll_offset = 0;
         true
     }
@@ -107,11 +140,7 @@ impl AppState {
             message.content.push_str(&text);
             return;
         }
-        self.messages.push(Message {
-            role: Role::Thought,
-            content: text,
-            duration_ms: None,
-        });
+        self.messages.push(Message::text(Role::Thought, text, None));
     }
 
     pub(crate) fn append_agent_text(&mut self, text: String) {
@@ -125,11 +154,7 @@ impl AppState {
             message.content.push_str(&text);
             return;
         }
-        self.messages.push(Message {
-            role: Role::Roven,
-            content: text,
-            duration_ms: None,
-        });
+        self.messages.push(Message::text(Role::Roven, text, None));
     }
 
     pub(crate) fn finish_agent(&mut self) {
@@ -140,19 +165,16 @@ impl AppState {
 
     pub(crate) fn agent_error(&mut self, message: String) {
         self.finish_agent();
-        self.messages.push(Message {
-            role: Role::Roven,
-            content: format!("Error: {message}"),
-            duration_ms: None,
-        });
+        self.messages.push(Message::text(
+            Role::Roven,
+            format!("Error: {message}"),
+            None,
+        ));
     }
 
     pub(crate) fn activity(&mut self, message: impl Into<String>) {
-        self.messages.push(Message {
-            role: Role::Activity,
-            content: message.into(),
-            duration_ms: None,
-        });
+        self.messages
+            .push(Message::text(Role::Activity, message.into(), None));
     }
 
     pub(crate) fn open_resume(&mut self, entries: Vec<ResumeEntry>) {

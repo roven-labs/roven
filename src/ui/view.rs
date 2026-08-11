@@ -6,13 +6,12 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use super::state::{AppState, Role};
+use super::state::AppState;
+use super::transcript::render_message;
 
 pub(crate) const MINIMUM_WIDTH: u16 = 40;
 pub(crate) const MINIMUM_HEIGHT: u16 = 8;
 
-const USER_STYLE: Style = Style::new().fg(Color::Cyan);
-const ROVEN_STYLE: Style = Style::new().fg(Color::Green);
 const MUTED_STYLE: Style = Style::new().fg(Color::DarkGray);
 const STATUS_STYLE: Style = Style::new().fg(Color::LightCyan);
 const TRUST_TITLE_STYLE: Style = Style::new().fg(Color::LightBlue);
@@ -165,45 +164,13 @@ fn draw_transcript(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let lines = state
         .messages
         .iter()
-        .flat_map(|message| match message.role {
-            Role::Thought => vec![
-                Line::from(Span::styled(
-                    match message.duration_ms {
-                        Some(duration_ms) => format!("Thought: {duration_ms}ms"),
-                        None => "Thought".to_owned(),
-                    },
-                    MUTED_STYLE,
-                )),
-                Line::from(Span::styled(message.content.clone(), MUTED_STYLE)),
-                Line::default(),
-            ],
-            role => {
-                let (label, style) = match role {
-                    Role::User => ("You", USER_STYLE),
-                    Role::Roven => ("Roven", ROVEN_STYLE),
-                    Role::Activity => ("Roven", MUTED_STYLE),
-                    Role::Thought => unreachable!("thought is rendered above"),
-                };
-                vec![
-                    Line::from(vec![
-                        Span::styled(format!("{label} › "), style),
-                        Span::raw(message.content.clone()),
-                    ]),
-                    Line::default(),
-                ]
-            }
-        })
-        .collect::<Vec<_>>();
+        .flat_map(|message| render_message(message, area.width as usize))
+        .collect::<Vec<Line<'static>>>();
     let line_count = lines.len().min(u16::MAX as usize) as u16;
     let maximum_scroll = line_count.saturating_sub(area.height);
     state.set_scroll_limit(maximum_scroll);
     let scroll_from_top = maximum_scroll.saturating_sub(state.scroll_offset);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .scroll((scroll_from_top, 0))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).scroll((scroll_from_top, 0)), area);
 
     if state.is_scrolled_away_from_latest() && area.width > 1 {
         let indicator_area = Rect::new(area.x + area.width - 1, area.y, 1, area.height);

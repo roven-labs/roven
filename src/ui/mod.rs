@@ -1,5 +1,6 @@
 mod state;
 mod terminal;
+mod transcript;
 mod view;
 
 use crate::runtime_log::RuntimeLog;
