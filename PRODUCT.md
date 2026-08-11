@@ -30,6 +30,10 @@ The Rust harness, rather than the model prompt, enforces filesystem authority:
 - `prepare_project` independently canonicalizes and compares its requested path
   with the trusted workspace before project lookup, Git validation, or writes.
 - `list_tools` reports the live tool registry.
+- When the CodeGraph stdio MCP server can start, Roven exposes every tool it
+  returns through MCP `tools/list`, including the exact `codegraph_explore`
+  contract, without adding a Roven-side file allowlist. `list_tools` reports
+  whether MCP is connected or unavailable and preserves the startup error.
 
 `prepare_project` validates the trusted project’s GitHub remote, committed
 baseline, and clean working state before writing
@@ -62,5 +66,7 @@ tool activity.
 - Filesystem-sensitive tools enforce their own Rust-side workspace boundary.
 - Roven does not edit files, execute arbitrary commands, recurse through a
   project, or expose API keys.
-- Roven does not currently provide project file-reading/search tools, CodeGraph
-  queries, automatic provider retries, or automatic context summarization.
+- Roven does not currently provide a raw project file-reading tool, automatic
+  provider retries, or automatic context summarization. CodeGraph availability
+  depends on the installed MCP server; useful source exploration also requires
+  that CodeGraph has indexed the workspace.

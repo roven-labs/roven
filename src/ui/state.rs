@@ -70,6 +70,7 @@ pub(crate) struct AppState {
     pub(crate) trust_yes_selected: bool,
     pub(crate) running: bool,
     pub(crate) status: Option<String>,
+    pub(crate) mcp_status: Option<String>,
     generation_start_index: usize,
     generation_started_at: Option<Instant>,
     pub(crate) resume_entries: Option<Vec<ResumeEntry>>,

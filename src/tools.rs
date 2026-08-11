@@ -4,11 +4,13 @@ use std::{
     fs, io,
     path::{Component, Path, PathBuf},
     process::Command,
+    sync::{Arc, Mutex},
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::mcp::{McpClient, McpTool};
 use crate::storage::{ProjectRegistration, ProjectRegistry, RegistrationLookup};
 
 pub(crate) const PREPARE_PROJECT_DESCRIPTION: &str = "Validate and register the currently trusted project for first-time use with Roven. Use this when the user asks to add/register the current project for future project understanding, resume generation, or portfolio updates. Pass `.` as the path for the current trusted workspace. The tool validates the project path, existing Roven registration, Git repository, GitHub remote, committed baseline, and clean working state, then stores the minimal project registration. It does not inspect source code or initialize code-intelligence systems.";
@@ -17,16 +19,16 @@ pub(crate) const LIST_TOOLS_DESCRIPTION: &str = "List the Roven tools available 
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct RovenToolDefinition {
-    pub(crate) name: &'static str,
-    pub(crate) description: &'static str,
+    pub(crate) name: String,
+    pub(crate) description: String,
     pub(crate) input_schema: Value,
 }
 
-pub(crate) fn definitions() -> Vec<RovenToolDefinition> {
-    vec![
+pub(crate) fn definitions(context: &ToolContext) -> Vec<RovenToolDefinition> {
+    let mut tools = vec![
         RovenToolDefinition {
-            name: "prepare_project",
-            description: PREPARE_PROJECT_DESCRIPTION,
+            name: "prepare_project".to_owned(),
+            description: PREPARE_PROJECT_DESCRIPTION.to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -40,8 +42,8 @@ pub(crate) fn definitions() -> Vec<RovenToolDefinition> {
             }),
         },
         RovenToolDefinition {
-            name: "list_directory",
-            description: LIST_DIRECTORY_DESCRIPTION,
+            name: "list_directory".to_owned(),
+            description: LIST_DIRECTORY_DESCRIPTION.to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -55,15 +57,17 @@ pub(crate) fn definitions() -> Vec<RovenToolDefinition> {
             }),
         },
         RovenToolDefinition {
-            name: "list_tools",
-            description: LIST_TOOLS_DESCRIPTION,
+            name: "list_tools".to_owned(),
+            description: LIST_TOOLS_DESCRIPTION.to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {},
                 "additionalProperties": false
             }),
         },
-    ]
+    ];
+    tools.extend(context.mcp_tools());
+    tools
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,12 +87,113 @@ pub(crate) struct RovenToolResult {
 #[derive(Debug, Clone)]
 pub(crate) struct ToolContext {
     trusted_workspace: PathBuf,
+    mcp: Arc<Mutex<McpState>>,
+}
+
+#[derive(Debug)]
+enum McpState {
+    Unknown,
+    Connected(McpClient),
+    Unavailable(String),
 }
 
 impl ToolContext {
     pub(crate) fn new(trusted_workspace: PathBuf) -> io::Result<Self> {
+        let trusted_workspace = trusted_workspace.canonicalize()?;
         Ok(Self {
-            trusted_workspace: trusted_workspace.canonicalize()?,
+            trusted_workspace,
+            mcp: Arc::new(Mutex::new(McpState::Unknown)),
+        })
+    }
+
+    fn mcp_tools(&self) -> Vec<RovenToolDefinition> {
+        let Ok(mut state) = self.mcp.lock() else {
+            return Vec::new();
+        };
+        self.ensure_mcp(&mut state);
+        match &*state {
+            McpState::Connected(client) => client.tools().iter().map(mcp_definition).collect(),
+            McpState::Unknown | McpState::Unavailable(_) => Vec::new(),
+        }
+    }
+
+    fn call_mcp(&self, name: &str, arguments: Value) -> Value {
+        if !self.mcp_path_is_trusted(&arguments) {
+            return mcp_error("MCP projectPath must stay inside the trusted workspace");
+        }
+        let Ok(mut state) = self.mcp.lock() else {
+            return mcp_error("MCP client lock is unavailable");
+        };
+        self.ensure_mcp(&mut state);
+        match &mut *state {
+            McpState::Connected(client) if client.tools().iter().any(|tool| tool.name == name) => {
+                client
+                    .call(name, arguments)
+                    .unwrap_or_else(|error| mcp_error(&error.to_string()))
+            }
+            McpState::Connected(_) => mcp_error("MCP tool was not advertised by the server"),
+            McpState::Unknown | McpState::Unavailable(_) => {
+                mcp_error("MCP server is unavailable for this workspace")
+            }
+        }
+    }
+
+    fn mcp_status(&self) -> McpStatus {
+        let Ok(mut state) = self.mcp.lock() else {
+            return McpStatus::Unavailable {
+                reason: "MCP client lock is unavailable".to_owned(),
+            };
+        };
+        self.ensure_mcp(&mut state);
+        match &*state {
+            McpState::Connected(client) => McpStatus::Connected {
+                tool_count: client.tools().len(),
+            },
+            McpState::Unavailable(reason) => McpStatus::Unavailable {
+                reason: reason.clone(),
+            },
+            McpState::Unknown => McpStatus::Unavailable {
+                reason: "MCP server has not been initialized".to_owned(),
+            },
+        }
+    }
+
+    pub(crate) fn mcp_status_summary(&self) -> String {
+        match self.mcp_status() {
+            McpStatus::Connected { tool_count } => format!(
+                "CodeGraph MCP: connected ({tool_count} {})",
+                if tool_count == 1 { "tool" } else { "tools" }
+            ),
+            McpStatus::Unavailable { reason } => {
+                format!("CodeGraph MCP: unavailable — {reason}")
+            }
+        }
+    }
+
+    fn ensure_mcp(&self, state: &mut McpState) {
+        if matches!(state, McpState::Unknown) {
+            *state = match McpClient::connect(&self.trusted_workspace) {
+                Ok(client) => McpState::Connected(client),
+                Err(error) => McpState::Unavailable(error.to_string()),
+            };
+        }
+    }
+
+    fn mcp_path_is_trusted(&self, arguments: &Value) -> bool {
+        let Some(project_path) = arguments.get("projectPath") else {
+            return true;
+        };
+        let Some(project_path) = project_path.as_str() else {
+            return false;
+        };
+        let path = PathBuf::from(project_path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            self.trusted_workspace.join(path)
+        };
+        path.canonicalize().ok().is_some_and(|path| {
+            path == self.trusted_workspace || path.starts_with(&self.trusted_workspace)
         })
     }
 }
@@ -111,15 +216,23 @@ pub(crate) fn dispatch(context: &ToolContext, call: RovenToolCall) -> RovenToolR
             )),
         },
         "list_tools" => match serde_json::from_value::<ListToolsInput>(call.arguments) {
-            Ok(_) => serde_json::to_value(ListTools.execute()),
+            Ok(_) => serde_json::to_value(ListTools.execute(context)),
             Err(_) => serde_json::to_value(ListToolsResult::InvalidInput),
         },
-        _ => serde_json::to_value(PrepareProjectResult::blocked(BlockedReason::InvalidPath)),
+        _ => Ok(context.call_mcp(&call.name, call.arguments)),
     };
     RovenToolResult {
         tool_call_id: call.id,
         name: call.name,
         result: result.expect("tool results are serializable"),
+    }
+}
+
+fn mcp_definition(tool: &McpTool) -> RovenToolDefinition {
+    RovenToolDefinition {
+        name: tool.name.clone(),
+        description: tool.description.clone(),
+        input_schema: tool.input_schema.clone(),
     }
 }
 
@@ -129,19 +242,37 @@ struct ListToolsInput {}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+enum McpStatus {
+    Connected { tool_count: usize },
+    Unavailable { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 enum ListToolsResult {
-    Ok { tools: Vec<RovenToolDefinition> },
+    Ok {
+        tools: Vec<RovenToolDefinition>,
+        mcp_status: McpStatus,
+    },
     InvalidInput,
 }
 
 struct ListTools;
 
 impl ListTools {
-    fn execute(&self) -> ListToolsResult {
+    fn execute(&self, context: &ToolContext) -> ListToolsResult {
         ListToolsResult::Ok {
-            tools: definitions(),
+            tools: definitions(context),
+            mcp_status: context.mcp_status(),
         }
     }
+}
+
+fn mcp_error(message: &str) -> Value {
+    json!({
+        "content": [{"type": "text", "text": message}],
+        "isError": true
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -646,7 +777,7 @@ mod tests {
     use crate::storage::{ProjectRegistry, RegistrationLookup};
 
     use super::{
-        BlockedReason, GitInspector, ListDirectory, ListDirectoryInput, PrepareProject,
+        BlockedReason, GitInspector, ListDirectory, ListDirectoryInput, ListTools, PrepareProject,
         PrepareProjectInput, PrepareProjectResult, RovenToolCall, SystemGit, ToolContext,
         definitions, dispatch,
     };
@@ -736,6 +867,73 @@ mod tests {
             clean: true,
             operation: false,
         }
+    }
+
+    #[test]
+    fn list_tools_reports_mcp_status() {
+        let workspace = temp_root("list-tools-status");
+        let context = context(&workspace);
+        let result = ListTools.execute(&context);
+        let serialized = serde_json::to_value(result).unwrap();
+
+        assert!(
+            serialized.get("mcp_status").is_some(),
+            "list_tools must report MCP status: {serialized}"
+        );
+        drop(context);
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn list_tools_preserves_mcp_failure_reason() {
+        let workspace = temp_root("list-tools-failure");
+        let context = context(&workspace);
+        *context.mcp.lock().unwrap() =
+            super::McpState::Unavailable("CodeGraph MCP executable was not found".to_owned());
+
+        let serialized = serde_json::to_value(ListTools.execute(&context)).unwrap();
+
+        assert_eq!(serialized["mcp_status"]["status"], "unavailable");
+        assert_eq!(
+            serialized["mcp_status"]["reason"],
+            "CodeGraph MCP executable was not found"
+        );
+        assert_eq!(serialized["tools"].as_array().unwrap().len(), 3);
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn mcp_status_summary_reports_the_live_unavailable_reason() {
+        let workspace = temp_root("mcp-status-summary");
+        let context = context(&workspace);
+        *context.mcp.lock().unwrap() = super::McpState::Unavailable("program not found".to_owned());
+
+        assert_eq!(
+            context.mcp_status_summary(),
+            "CodeGraph MCP: unavailable — program not found"
+        );
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn list_tools_includes_the_installed_mcp_tool() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        if !workspace.join(".codegraph").is_dir()
+            || Command::new("codegraph").arg("--version").status().is_err()
+        {
+            return;
+        }
+
+        let result = ListTools.execute(&context(workspace));
+        let serialized = serde_json::to_value(result).unwrap();
+        let names = serialized["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"codegraph_explore"), "tools: {names:?}");
     }
 
     fn git(project: &Path, arguments: &[&str]) {
@@ -1224,10 +1422,12 @@ mod tests {
     #[test]
     fn list_tools_returns_the_live_registry_with_descriptions_and_schemas() {
         let workspace = temp_root("list-tools");
-        let expected = serde_json::to_value(definitions()).unwrap();
+        let trusted = context(&workspace);
+        let expected = serde_json::to_value(definitions(&trusted)).unwrap();
+        let expected_mcp_status = serde_json::to_value(trusted.mcp_status()).unwrap();
 
         let result = dispatch(
-            &context(&workspace),
+            &trusted,
             RovenToolCall {
                 id: "call_tools".to_owned(),
                 name: "list_tools".to_owned(),
@@ -1240,6 +1440,7 @@ mod tests {
             json!({
                 "status": "ok",
                 "tools": expected,
+                "mcp_status": expected_mcp_status,
             })
         );
     }

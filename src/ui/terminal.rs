@@ -49,7 +49,7 @@ enum WorkerEvent {
     Error(String),
 }
 
-const TOOL_USE_POLICY: &str = "The current trusted workspace is the project the user means by `this project`, `these projects`, `this workspace`, or an unqualified request to add/register the project. Do not ask for a path in those cases: call `prepare_project` with `{\"path\":\".\"}`. When the user asks which Roven tools or capabilities are available, call `list_tools` with `{}` and rely on its returned names, descriptions, and input schemas. When the user asks for the current workspace path, call `list_directory` with `{\"path\":\".\"}` and report its `workspace_path` value verbatim; never report `.` as the human-facing path. When the user asks to inspect, explain, or diagram the current project's structure, first call `list_directory` with `{\"path\":\".\"}` and base the response only on its returned entries. Call `list_directory` again for a named subdirectory only when needed; it never recurses automatically.";
+const TOOL_USE_POLICY: &str = "The current trusted workspace is the project the user means by `this project`, `these projects`, `this workspace`, or an unqualified request to add/register the project. Do not ask for a path in those cases: call `prepare_project` with `{\"path\":\".\"}`. When the user asks which Roven tools or capabilities are available, call `list_tools` with `{}` and rely on its returned names, descriptions, and input schemas. When the user asks for the current workspace path, call `list_directory` with `{\"path\":\".\"}` and report its `workspace_path` value verbatim; never report `.` as the human-facing path. When the user asks to inspect, explain, or diagram the current project's structure, use the live `codegraph_explore` tool when it is available and query the relevant files, symbols, or flow in one focused request. CodeGraph is read-only and can explore every file in its index; do not invent a file-type restriction. If `codegraph_explore` is not present in the live tool list, do not claim to have inspected source code; use `list_directory` only for the structure it actually returns and state the limitation.";
 
 pub(crate) fn run(runtime_log: Option<RuntimeLog>) -> anyhow::Result<()> {
     log_event(runtime_log.as_ref(), "terminal_starting", "outcome=started");
@@ -88,6 +88,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
     let mut session: Option<SessionMeta> = None;
     let mut project_instructions = String::new();
     let mut cancellation: Option<Arc<AtomicBool>> = None;
+    let mut tool_context: Option<ToolContext> = None;
 
     loop {
         while let Ok(worker_event) = receiver.try_recv() {
@@ -133,6 +134,16 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                         })?;
                     project_instructions = read_project_instructions().unwrap_or_default();
                     store = Some(initialized);
+                    let context = ToolContext::new(std::path::PathBuf::from(&state.project_path))
+                        .inspect_err(|error| {
+                        log_event(
+                            runtime_log,
+                            "tool_context_create_failed",
+                            &format!("error={error}"),
+                        );
+                    })?;
+                    state.mcp_status = Some(context.mcp_status_summary());
+                    tool_context = Some(context);
                     state.trusted = true;
                     log_event(runtime_log, "workspace_trusted", "outcome=granted");
                 }
@@ -253,15 +264,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                     state.start_agent();
                     let flag = Arc::new(AtomicBool::new(false));
                     cancellation = Some(flag.clone());
-                    let tool_context =
-                        ToolContext::new(std::path::PathBuf::from(&state.project_path))
-                            .inspect_err(|error| {
-                                log_event(
-                                    runtime_log,
-                                    "tool_context_create_failed",
-                                    &format!("error={error}"),
-                                );
-                            })?;
+                    let tool_context = tool_context.as_ref().expect("trusted tool context").clone();
                     log_event(
                         runtime_log,
                         "agent_turn_started",

@@ -18,14 +18,30 @@ const MAX_COMPLETION_TOKENS: u16 = 4096;
 
 #[derive(Debug, Error)]
 pub(crate) enum ProviderError {
-    #[error("{0}")]
-    Request(String),
+    #[error("Provider {stage} failed ({category}): {detail}")]
+    Diagnostic {
+        stage: &'static str,
+        category: &'static str,
+        detail: String,
+    },
     #[error("Provider rate limit reached (HTTP 429){0}")]
     RateLimited(String),
-    #[error("Provider returned an invalid streaming response")]
-    Stream,
-    #[error("Provider reported an error: {0}")]
-    Remote(String),
+    #[error("Provider rejected the request (HTTP {status})")]
+    HttpStatus { status: u16 },
+}
+
+impl ProviderError {
+    fn diagnostic(
+        stage: &'static str,
+        category: &'static str,
+        detail: impl std::fmt::Display,
+    ) -> Self {
+        Self::Diagnostic {
+            stage,
+            category,
+            detail: sanitize_diagnostic(&detail.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -56,8 +72,12 @@ impl ModelProvider for OpenAiCompatibleProvider {
     ) -> Result<(), Self::Error> {
         let payload =
             serde_json::to_string(&ChatCompletionsRequest::from_agent(&self.model, request))
-                .map_err(|_| {
-                    ProviderError::Request("Roven could not encode the provider request".to_owned())
+                .map_err(|error| {
+                    ProviderError::diagnostic(
+                        "encode",
+                        "json",
+                        format!("could not encode the provider request: {error}"),
+                    )
                 })?;
         let agent = ureq::Agent::new_with_config(
             ureq::Agent::config_builder()
@@ -89,7 +109,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 emit(ProviderEvent::Cancelled);
                 return Ok(());
             }
-            let line = line.map_err(|_| ProviderError::Stream)?;
+            let line = line.map_err(stream_read_error)?;
             append_tool_call_deltas(&line, &mut tool_call_parts)?;
             for event in parse_sse_line(&line)? {
                 if matches!(event, ProviderEvent::Finished) {
@@ -109,7 +129,11 @@ impl ModelProvider for OpenAiCompatibleProvider {
             emit(ProviderEvent::Cancelled);
             Ok(())
         } else {
-            Err(ProviderError::Stream)
+            Err(ProviderError::diagnostic(
+                "stream",
+                "unexpected_eof",
+                "provider closed the stream before signalling completion",
+            ))
         }
     }
 }
@@ -210,8 +234,8 @@ impl From<&RovenToolDefinition> for OpenRouterTool {
         Self {
             kind: "function",
             function: OpenRouterToolFunction {
-                name: tool.name,
-                description: tool.description,
+                name: tool.name.clone(),
+                description: tool.description.clone(),
                 parameters: tool.input_schema.clone(),
             },
         }
@@ -220,8 +244,8 @@ impl From<&RovenToolDefinition> for OpenRouterTool {
 
 #[derive(Serialize)]
 struct OpenRouterToolFunction {
-    name: &'static str,
-    description: &'static str,
+    name: String,
+    description: String,
     parameters: serde_json::Value,
 }
 
@@ -254,11 +278,25 @@ struct OpenRouterToolCallFunction {
 }
 
 fn request_error(error: ureq::Error) -> ProviderError {
-    match error {
-        ureq::Error::StatusCode(status) => response_error(status, None),
-        _ => ProviderError::Request(
-            "Roven could not connect to the configured provider before streaming began".to_owned(),
-        ),
+    match &error {
+        ureq::Error::StatusCode(status) => response_error(*status, None),
+        ureq::Error::HostNotFound => ProviderError::diagnostic("request", "dns", "host not found"),
+        ureq::Error::Timeout(_) => ProviderError::diagnostic("request", "timeout", error),
+        ureq::Error::Tls(_) => ProviderError::diagnostic("request", "tls", error),
+        ureq::Error::InvalidProxyUrl | ureq::Error::ConnectProxyFailed(_) => {
+            ProviderError::diagnostic("request", "proxy", error)
+        }
+        ureq::Error::ConnectionFailed => {
+            ProviderError::diagnostic("request", "connection", "connection failed")
+        }
+        ureq::Error::Io(error) => io_error("request", error),
+        ureq::Error::Protocol(_) | ureq::Error::Http(_) => {
+            ProviderError::diagnostic("request", "protocol", error)
+        }
+        ureq::Error::RedirectFailed | ureq::Error::TooManyRedirects => {
+            ProviderError::diagnostic("request", "redirect", error)
+        }
+        _ => ProviderError::diagnostic("request", "transport", error),
     }
 }
 
@@ -273,8 +311,62 @@ fn response_error(status: u16, retry_after: Option<&str>) -> ProviderError {
             });
         ProviderError::RateLimited(detail)
     } else {
-        ProviderError::Request(format!("Provider rejected the request (HTTP {status})"))
+        ProviderError::HttpStatus { status }
     }
+}
+
+fn stream_read_error(error: std::io::Error) -> ProviderError {
+    io_error("stream", &error)
+}
+
+fn io_error(stage: &'static str, error: &std::io::Error) -> ProviderError {
+    ProviderError::diagnostic(
+        stage,
+        "io",
+        format!(
+            "kind={} detail={error}",
+            normalized_error_kind(error.kind())
+        ),
+    )
+}
+
+fn normalized_error_kind(kind: std::io::ErrorKind) -> String {
+    let mut normalized = String::new();
+    for (index, character) in format!("{kind:?}").chars().enumerate() {
+        if index > 0 && character.is_ascii_uppercase() {
+            normalized.push('_');
+        }
+        normalized.push(character.to_ascii_lowercase());
+    }
+    normalized
+}
+
+fn sanitize_diagnostic(detail: &str) -> String {
+    let detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut safe = String::new();
+    let mut remainder = detail.as_str();
+
+    loop {
+        let lower = remainder.to_ascii_lowercase();
+        let Some(offset) = lower.find("bearer ") else {
+            safe.push_str(remainder);
+            break;
+        };
+        let token_start = offset + "bearer ".len();
+        safe.push_str(&remainder[..token_start]);
+        safe.push_str("[redacted]");
+        let token_length = remainder[token_start..]
+            .find(char::is_whitespace)
+            .unwrap_or(remainder[token_start..].len());
+        remainder = &remainder[token_start + token_length..];
+    }
+
+    const MAX_DIAGNOSTIC_CHARS: usize = 512;
+    let mut truncated = safe.chars().take(MAX_DIAGNOSTIC_CHARS).collect::<String>();
+    if safe.chars().count() > MAX_DIAGNOSTIC_CHARS {
+        truncated.push_str("…");
+    }
+    truncated
 }
 
 fn parse_sse_line(line: &str) -> Result<Vec<ProviderEvent>, ProviderError> {
@@ -284,14 +376,18 @@ fn parse_sse_line(line: &str) -> Result<Vec<ProviderEvent>, ProviderError> {
     if data == "[DONE]" {
         return Ok(vec![ProviderEvent::Finished]);
     }
-    let value: serde_json::Value = serde_json::from_str(data).map_err(|_| ProviderError::Stream)?;
+    let value: serde_json::Value = serde_json::from_str(data)
+        .map_err(|_| ProviderError::diagnostic("stream", "json", "invalid JSON stream event"))?;
     if let Some(error) = value.get("error") {
-        let message = error
-            .get("message")
+        let code = error
+            .get("code")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown provider error")
-            .to_owned();
-        return Err(ProviderError::Remote(message));
+            .unwrap_or("unspecified");
+        return Err(ProviderError::diagnostic(
+            "stream",
+            "remote_error",
+            format!("provider reported a stream error code={code}"),
+        ));
     }
     let choice = value.get("choices").and_then(|choices| choices.get(0));
     let delta = choice.and_then(|choice| choice.get("delta"));
@@ -332,7 +428,9 @@ fn append_tool_call_deltas(
     if data == "[DONE]" {
         return Ok(());
     }
-    let value: serde_json::Value = serde_json::from_str(data).map_err(|_| ProviderError::Stream)?;
+    let value: serde_json::Value = serde_json::from_str(data).map_err(|_| {
+        ProviderError::diagnostic("tool_calls", "json", "invalid JSON tool-call event")
+    })?;
     let calls = value
         .get("choices")
         .and_then(|choices| choices.get(0))
@@ -346,7 +444,13 @@ fn append_tool_call_deltas(
         let index = call
             .get("index")
             .and_then(serde_json::Value::as_u64)
-            .ok_or(ProviderError::Stream)? as usize;
+            .ok_or_else(|| {
+                ProviderError::diagnostic(
+                    "tool_calls",
+                    "invalid_tool_call",
+                    "tool call has no index",
+                )
+            })? as usize;
         let parts = tool_call_parts.entry(index).or_default();
         if let Some(id) = call.get("id").and_then(serde_json::Value::as_str) {
             parts.id = id.to_owned();
@@ -376,10 +480,19 @@ fn finish_tool_calls(
         .into_values()
         .map(|parts| {
             if parts.id.is_empty() || parts.name.is_empty() {
-                return Err(ProviderError::Stream);
+                return Err(ProviderError::diagnostic(
+                    "tool_calls",
+                    "invalid_tool_call",
+                    "tool call is missing an ID or function name",
+                ));
             }
-            let arguments =
-                serde_json::from_str(&parts.arguments).map_err(|_| ProviderError::Stream)?;
+            let arguments = serde_json::from_str(&parts.arguments).map_err(|_| {
+                ProviderError::diagnostic(
+                    "tool_calls",
+                    "invalid_arguments",
+                    "tool call arguments are not valid JSON",
+                )
+            })?;
             Ok(RovenToolCall {
                 id: parts.id,
                 name: parts.name,
@@ -418,9 +531,11 @@ fn reasoning_from_delta(delta: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use crate::{
         agent::{AgentMessage, AgentRequest, ProviderEvent},
-        tools::RovenToolCall,
+        tools::{RovenToolCall, ToolContext},
     };
 
     use super::{
@@ -445,9 +560,13 @@ mod tests {
 
     #[test]
     fn request_uses_profile_model_and_standard_openai_fields() {
-        let request = AgentRequest::new(vec![AgentMessage::User {
-            content: "Hello".to_owned(),
-        }]);
+        let context = ToolContext::new(std::env::temp_dir()).unwrap();
+        let request = AgentRequest::new(
+            vec![AgentMessage::User {
+                content: "Hello".to_owned(),
+            }],
+            &context,
+        );
         let request = ChatCompletionsRequest::from_agent("llama-3.3-70b-versatile", &request);
         let value = serde_json::to_value(&request).unwrap();
 
@@ -508,6 +627,76 @@ mod tests {
             "Provider rejected the request (HTTP 401)"
         );
         assert!(!error.to_string().contains("Bearer"));
+    }
+
+    #[test]
+    fn request_errors_preserve_the_transport_failure_category() {
+        assert_eq!(
+            request_error(ureq::Error::HostNotFound).to_string(),
+            "Provider request failed (dns): host not found"
+        );
+        assert_eq!(
+            request_error(ureq::Error::ConnectionFailed).to_string(),
+            "Provider request failed (connection): connection failed"
+        );
+        assert_eq!(
+            request_error(ureq::Error::Io(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "connection refused by provider",
+            )))
+            .to_string(),
+            "Provider request failed (io): kind=connection_refused detail=connection refused by provider"
+        );
+        assert_eq!(
+            request_error(ureq::Error::BodyExceedsLimit(42)).to_string(),
+            "Provider request failed (transport): the response body is larger than request limit: 42"
+        );
+    }
+
+    #[test]
+    fn streamed_data_errors_report_the_stage_that_failed() {
+        assert_eq!(
+            parse_sse_line("data: not-json").unwrap_err().to_string(),
+            "Provider stream failed (json): invalid JSON stream event"
+        );
+        assert_eq!(
+            super::finish_tool_calls(std::collections::BTreeMap::new())
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let error = super::stream_read_error(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "provider stopped responding",
+        ));
+        assert_eq!(
+            error.to_string(),
+            "Provider stream failed (io): kind=timed_out detail=provider stopped responding"
+        );
+    }
+
+    #[test]
+    fn diagnostic_detail_removes_bearer_tokens_and_line_breaks() {
+        assert_eq!(
+            super::sanitize_diagnostic("Authorization: Bearer secret-value\nrequest failed"),
+            "Authorization: Bearer [redacted] request failed"
+        );
+    }
+
+    #[test]
+    fn provider_stream_errors_expose_a_code_without_logging_the_response_message() {
+        let error = parse_sse_line(
+            r#"data: {"error":{"code":"model_unavailable","message":"Bearer secret-value"}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(
+            error,
+            "Provider stream failed (remote_error): provider reported a stream error code=model_unavailable"
+        );
+        assert!(!error.contains("secret-value"));
     }
 
     #[test]

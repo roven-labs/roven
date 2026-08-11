@@ -32,10 +32,10 @@ pub(crate) struct AgentRequest {
 }
 
 impl AgentRequest {
-    pub(crate) fn new(messages: Vec<AgentMessage>) -> Self {
+    pub(crate) fn new(messages: Vec<AgentMessage>, context: &ToolContext) -> Self {
         Self {
             messages,
-            tools: definitions(),
+            tools: definitions(context),
         }
     }
 }
@@ -85,7 +85,7 @@ pub(crate) fn run<P: ModelProvider>(
     emit: &mut dyn FnMut(AgentEvent),
 ) -> Result<(), P::Error> {
     loop {
-        let request = AgentRequest::new(messages.clone());
+        let request = AgentRequest::new(messages.clone(), context);
         record(
             runtime_log,
             "model_request_started",
@@ -235,7 +235,7 @@ mod tests {
             _: &AtomicBool,
             emit: &mut dyn FnMut(ProviderEvent),
         ) -> Result<(), Self::Error> {
-            assert_eq!(request.tools.len(), 3);
+            assert!(request.tools.len() >= 3);
             assert_eq!(request.tools[0].name, "prepare_project");
             assert_eq!(request.tools[1].name, "list_directory");
             assert_eq!(request.tools[2].name, "list_tools");

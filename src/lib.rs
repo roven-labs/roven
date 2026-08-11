@@ -4,6 +4,7 @@ mod agent;
 mod cli;
 mod commands;
 mod credentials;
+mod mcp;
 mod profiles;
 mod provider;
 mod runtime_log;
