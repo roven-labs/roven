@@ -10,7 +10,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
-    agent::{AgentMessage, AgentRequest, ModelProvider, ProviderEvent},
+    agent::{AgentMessage, AgentRequest, ProviderEvent},
     tools::{RovenToolCall, RovenToolDefinition},
 };
 
@@ -60,16 +60,14 @@ impl OpenAiCompatibleProvider {
     }
 }
 
-impl ModelProvider for OpenAiCompatibleProvider {
-    type Error = ProviderError;
-
-    fn stream(
+impl OpenAiCompatibleProvider {
+    pub(crate) fn stream(
         &self,
         api_key: &str,
         request: &AgentRequest,
         cancelled: &AtomicBool,
         emit: &mut dyn FnMut(ProviderEvent),
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), ProviderError> {
         let payload =
             serde_json::to_string(&ChatCompletionsRequest::from_agent(&self.model, request))
                 .map_err(|error| {
@@ -141,11 +139,11 @@ impl ModelProvider for OpenAiCompatibleProvider {
 #[derive(Serialize)]
 struct ChatCompletionsRequest {
     model: String,
-    messages: Vec<OpenRouterMessage>,
+    messages: Vec<ChatCompletionMessage>,
     stream: bool,
     max_tokens: u16,
     tool_choice: &'static str,
-    tools: Vec<OpenRouterTool>,
+    tools: Vec<ChatCompletionTool>,
 }
 
 impl ChatCompletionsRequest {
@@ -155,19 +153,19 @@ impl ChatCompletionsRequest {
             messages: request
                 .messages
                 .iter()
-                .map(OpenRouterMessage::from)
+                .map(ChatCompletionMessage::from)
                 .collect(),
             stream: true,
             max_tokens: MAX_COMPLETION_TOKENS,
             tool_choice: "auto",
-            tools: request.tools.iter().map(OpenRouterTool::from).collect(),
+            tools: request.tools.iter().map(ChatCompletionTool::from).collect(),
         }
     }
 }
 
 #[derive(Serialize)]
 #[serde(untagged)]
-enum OpenRouterMessage {
+enum ChatCompletionMessage {
     Content {
         role: &'static str,
         content: String,
@@ -175,7 +173,7 @@ enum OpenRouterMessage {
     AssistantToolCalls {
         role: &'static str,
         content: Option<String>,
-        tool_calls: Vec<OpenRouterToolCall>,
+        tool_calls: Vec<ChatCompletionToolCall>,
     },
     ToolResult {
         role: &'static str,
@@ -184,7 +182,7 @@ enum OpenRouterMessage {
     },
 }
 
-impl From<&AgentMessage> for OpenRouterMessage {
+impl From<&AgentMessage> for ChatCompletionMessage {
     fn from(message: &AgentMessage) -> Self {
         match message {
             AgentMessage::System { content } => Self::Content {
@@ -210,7 +208,10 @@ impl From<&AgentMessage> for OpenRouterMessage {
             } => Self::AssistantToolCalls {
                 role: "assistant",
                 content: (!content.is_empty()).then(|| content.clone()),
-                tool_calls: tool_calls.iter().map(OpenRouterToolCall::from).collect(),
+                tool_calls: tool_calls
+                    .iter()
+                    .map(ChatCompletionToolCall::from)
+                    .collect(),
             },
             AgentMessage::Tool { result } => Self::ToolResult {
                 role: "tool",
@@ -223,17 +224,17 @@ impl From<&AgentMessage> for OpenRouterMessage {
 }
 
 #[derive(Serialize)]
-struct OpenRouterTool {
+struct ChatCompletionTool {
     #[serde(rename = "type")]
     kind: &'static str,
-    function: OpenRouterToolFunction,
+    function: ChatCompletionToolFunction,
 }
 
-impl From<&RovenToolDefinition> for OpenRouterTool {
+impl From<&RovenToolDefinition> for ChatCompletionTool {
     fn from(tool: &RovenToolDefinition) -> Self {
         Self {
             kind: "function",
-            function: OpenRouterToolFunction {
+            function: ChatCompletionToolFunction {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
                 parameters: tool.input_schema.clone(),
@@ -243,26 +244,26 @@ impl From<&RovenToolDefinition> for OpenRouterTool {
 }
 
 #[derive(Serialize)]
-struct OpenRouterToolFunction {
+struct ChatCompletionToolFunction {
     name: String,
     description: String,
     parameters: serde_json::Value,
 }
 
 #[derive(Serialize)]
-struct OpenRouterToolCall {
+struct ChatCompletionToolCall {
     id: String,
     #[serde(rename = "type")]
     kind: &'static str,
-    function: OpenRouterToolCallFunction,
+    function: ChatCompletionToolCallFunction,
 }
 
-impl From<&RovenToolCall> for OpenRouterToolCall {
+impl From<&RovenToolCall> for ChatCompletionToolCall {
     fn from(call: &RovenToolCall) -> Self {
         Self {
             id: call.id.clone(),
             kind: "function",
-            function: OpenRouterToolCallFunction {
+            function: ChatCompletionToolCallFunction {
                 name: call.name.clone(),
                 arguments: serde_json::to_string(&call.arguments)
                     .expect("tool arguments are JSON serializable"),
@@ -272,7 +273,7 @@ impl From<&RovenToolCall> for OpenRouterToolCall {
 }
 
 #[derive(Serialize)]
-struct OpenRouterToolCallFunction {
+struct ChatCompletionToolCallFunction {
     name: String,
     arguments: String,
 }
@@ -364,7 +365,7 @@ fn sanitize_diagnostic(detail: &str) -> String {
     const MAX_DIAGNOSTIC_CHARS: usize = 512;
     let mut truncated = safe.chars().take(MAX_DIAGNOSTIC_CHARS).collect::<String>();
     if safe.chars().count() > MAX_DIAGNOSTIC_CHARS {
-        truncated.push_str("…");
+        truncated.push('…');
     }
     truncated
 }
@@ -530,6 +531,76 @@ fn reasoning_from_delta(delta: &serde_json::Value) -> Option<String> {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::{TcpListener, TcpStream},
+        thread::{self, JoinHandle},
+    };
+
+    pub(crate) fn response(status: &str, headers: &[(&str, &str)], body: &str) -> String {
+        let headers = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
+        format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    pub(crate) fn sse(body: &str) -> String {
+        response("200 OK", &[("Content-Type", "text/event-stream")], body)
+    }
+
+    pub(crate) fn serve(responses: Vec<String>) -> (String, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            responses
+                .into_iter()
+                .map(|response| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request = read_request(&stream);
+                    stream.write_all(response.as_bytes()).unwrap();
+                    stream.flush().unwrap();
+                    request
+                })
+                .collect()
+        });
+        (endpoint, handle)
+    }
+
+    fn read_request(stream: &TcpStream) -> String {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            headers.push_str(&line);
+        }
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .or_else(|| {
+                headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+            })
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body).unwrap();
+        String::from_utf8(body).unwrap()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::io;
 
@@ -569,6 +640,24 @@ mod tests {
         assert_eq!(request.model, "llama-3.3-70b-versatile");
         assert!(request.stream);
         assert_eq!(request.max_tokens, 4096);
+        assert_eq!(
+            value.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec![
+                "max_tokens",
+                "messages",
+                "model",
+                "stream",
+                "tool_choice",
+                "tools"
+            ]
+        );
+        assert_eq!(
+            value["messages"],
+            serde_json::json!([{
+                "role": "user",
+                "content": "Hello"
+            }])
+        );
         assert_eq!(value["tool_choice"], "auto");
         assert_eq!(value["tools"][0]["function"]["name"], "prepare_project");
         assert!(value.get("reasoning").is_none());
@@ -705,5 +794,49 @@ mod tests {
             response_error(429, None).to_string(),
             "Provider rate limit reached (HTTP 429). Wait briefly and try again; the configured model or account may have no capacity."
         );
+    }
+
+    #[test]
+    fn stream_reports_real_http_rate_limits_and_unexpected_eof() {
+        let request = AgentRequest::new(vec![AgentMessage::User {
+            content: "Hello".to_owned(),
+        }]);
+        let (endpoint, server) = super::test_support::serve(vec![super::test_support::response(
+            "429 Too Many Requests",
+            &[("retry-after", "7")],
+            "",
+        )]);
+        let provider = OpenAiCompatibleProvider::new(endpoint, "test-model".to_owned());
+        let error = provider
+            .stream(
+                "key",
+                &request,
+                &std::sync::atomic::AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Provider rate limit reached (HTTP 429); retry after 7 seconds"
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+
+        let (endpoint, server) = super::test_support::serve(vec![super::test_support::sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+        )]);
+        let provider = OpenAiCompatibleProvider::new(endpoint, "test-model".to_owned());
+        let error = provider
+            .stream(
+                "key",
+                &request,
+                &std::sync::atomic::AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Provider stream failed (unexpected_eof): provider closed the stream before signalling completion"
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 }

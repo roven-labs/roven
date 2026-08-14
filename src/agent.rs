@@ -2,9 +2,12 @@
 
 use std::sync::atomic::AtomicBool;
 
-use crate::runtime_log::RuntimeLog;
 use crate::tools::{
     RovenToolCall, RovenToolDefinition, RovenToolResult, ToolContext, definitions, dispatch,
+};
+use crate::{
+    provider::{OpenAiCompatibleProvider, ProviderError},
+    runtime_log::RuntimeLog,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,18 +52,6 @@ pub(crate) enum ProviderEvent {
     Cancelled,
 }
 
-pub(crate) trait ModelProvider {
-    type Error: std::error::Error;
-
-    fn stream(
-        &self,
-        api_key: &str,
-        request: &AgentRequest,
-        cancelled: &AtomicBool,
-        emit: &mut dyn FnMut(ProviderEvent),
-    ) -> Result<(), Self::Error>;
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AgentEvent {
     Thought(String),
@@ -75,15 +66,15 @@ pub(crate) enum AgentEvent {
 
 /// Continue the same user turn until the provider produces a final response.
 /// Tool execution and authorization stay here; adapters only transport events.
-pub(crate) fn run<P: ModelProvider>(
-    provider: &P,
+pub(crate) fn run(
+    provider: &OpenAiCompatibleProvider,
     api_key: &str,
     mut messages: Vec<AgentMessage>,
     context: &ToolContext,
     cancelled: &AtomicBool,
     runtime_log: Option<&RuntimeLog>,
     emit: &mut dyn FnMut(AgentEvent),
-) -> Result<(), P::Error> {
+) -> Result<(), ProviderError> {
     loop {
         let request = AgentRequest::new(messages.clone());
         record(
@@ -208,55 +199,33 @@ fn record(runtime_log: Option<&RuntimeLog>, event: &str, detail: &str) {
 mod tests {
     use std::{cell::RefCell, fs, sync::atomic::AtomicBool};
 
-    use crate::{runtime_log::RuntimeLog, tools::ToolContext};
+    use crate::{
+        provider::{OpenAiCompatibleProvider, ProviderError, test_support},
+        runtime_log::RuntimeLog,
+        tools::ToolContext,
+    };
 
-    use super::{AgentEvent, AgentMessage, AgentRequest, ModelProvider, ProviderEvent, run};
+    use super::{AgentEvent, AgentMessage, run};
 
-    #[derive(Debug)]
-    struct TestError;
-
-    impl std::fmt::Display for TestError {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("test provider error")
-        }
-    }
-
-    impl std::error::Error for TestError {}
-
-    struct FinalProvider;
-
-    impl ModelProvider for FinalProvider {
-        type Error = TestError;
-
-        fn stream(
-            &self,
-            _: &str,
-            request: &AgentRequest,
-            _: &AtomicBool,
-            emit: &mut dyn FnMut(ProviderEvent),
-        ) -> Result<(), Self::Error> {
-            assert!(request.tools.len() >= 3);
-            assert_eq!(request.tools[0].name, "prepare_project");
-            assert_eq!(request.tools[1].name, "list_directory");
-            assert_eq!(request.tools[2].name, "list_tools");
-            emit(ProviderEvent::Text("done".to_owned()));
-            emit(ProviderEvent::Finished);
-            Ok(())
-        }
+    fn workspace() -> std::path::PathBuf {
+        std::env::current_dir().unwrap().canonicalize().unwrap()
     }
 
     #[test]
-    fn final_provider_response_ends_the_turn_without_a_tool_cycle_limit() {
-        let workspace = std::env::current_dir().unwrap().canonicalize().unwrap();
+    fn final_response_streams_every_chunk_and_finishes() {
+        let (endpoint, server) = test_support::serve(vec![test_support::sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done \"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"now\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+        )]);
+        let provider = OpenAiCompatibleProvider::new(endpoint, "test-model".to_owned());
         let events = RefCell::new(Vec::new());
 
         run(
-            &FinalProvider,
+            &provider,
             "key",
             vec![AgentMessage::User {
                 content: "hello".to_owned(),
             }],
-            &ToolContext::new(workspace).unwrap(),
+            &ToolContext::new(workspace()).unwrap(),
             &AtomicBool::new(false),
             None,
             &mut |event| events.borrow_mut().push(event),
@@ -265,55 +234,30 @@ mod tests {
 
         assert_eq!(
             events.into_inner(),
-            vec![AgentEvent::Text("done".to_owned()), AgentEvent::Finished]
+            vec![
+                AgentEvent::Text("done ".to_owned()),
+                AgentEvent::Text("now".to_owned()),
+                AgentEvent::Finished,
+            ]
         );
-    }
-
-    struct ToolThenFinalProvider {
-        requests: RefCell<usize>,
-    }
-
-    impl ModelProvider for ToolThenFinalProvider {
-        type Error = TestError;
-
-        fn stream(
-            &self,
-            _: &str,
-            request: &AgentRequest,
-            _: &AtomicBool,
-            emit: &mut dyn FnMut(ProviderEvent),
-        ) -> Result<(), Self::Error> {
-            let request_number = *self.requests.borrow();
-            *self.requests.borrow_mut() += 1;
-            if request_number == 0 {
-                emit(ProviderEvent::ToolCalls(vec![
-                    crate::tools::RovenToolCall {
-                        id: "call_prepare".to_owned(),
-                        name: "prepare_project".to_owned(),
-                        arguments: serde_json::json!({ "path": "does-not-exist" }),
-                    },
-                ]));
-            } else {
-                assert!(matches!(
-                    request.messages.last(),
-                    Some(AgentMessage::Tool { result })
-                        if result.result["reason"] == "invalid_path"
-                ));
-                emit(ProviderEvent::Text(
-                    "registration needs a valid path".to_owned(),
-                ));
-                emit(ProviderEvent::Finished);
-            }
-            Ok(())
-        }
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("\"model\":\"test-model\""));
     }
 
     #[test]
-    fn tool_results_return_to_the_generic_agent_loop_before_final_response() {
-        let workspace = std::env::current_dir().unwrap().canonicalize().unwrap();
-        let provider = ToolThenFinalProvider {
-            requests: RefCell::new(0),
-        };
+    fn tool_calls_round_trip_through_the_real_provider() {
+        let (endpoint, server) = test_support::serve(vec![
+            test_support::sse(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_prepare","function":{"name":"prepare_project","arguments":"{\"path\":\"does-not-exist\"}"}}]},"finish_reason":"tool_calls"}]}
+
+"#,
+            ),
+            test_support::sse(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"registration needs a valid path\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let provider = OpenAiCompatibleProvider::new(endpoint, "test-model".to_owned());
         let events = RefCell::new(Vec::new());
 
         run(
@@ -322,61 +266,76 @@ mod tests {
             vec![AgentMessage::User {
                 content: "register this".to_owned(),
             }],
-            &ToolContext::new(workspace).unwrap(),
+            &ToolContext::new(workspace()).unwrap(),
             &AtomicBool::new(false),
             None,
             &mut |event| events.borrow_mut().push(event),
         )
         .unwrap();
 
-        assert_eq!(*provider.requests.borrow(), 2);
         assert!(matches!(
             events.borrow().first(),
-            Some(AgentEvent::ToolResult { result, .. }) if result.name == "prepare_project"
+            Some(AgentEvent::ToolResult { result, .. }) if result.result["reason"] == "invalid_path"
         ));
         assert!(matches!(events.borrow().last(), Some(AgentEvent::Finished)));
-    }
-
-    struct FailingProvider;
-
-    impl ModelProvider for FailingProvider {
-        type Error = TestError;
-
-        fn stream(
-            &self,
-            _: &str,
-            _: &AgentRequest,
-            _: &AtomicBool,
-            _: &mut dyn FnMut(ProviderEvent),
-        ) -> Result<(), Self::Error> {
-            Err(TestError)
-        }
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("\"tool_call_id\":\"call_prepare\""));
     }
 
     #[test]
-    fn provider_failures_are_written_to_the_runtime_log() {
-        let workspace = std::env::current_dir().unwrap().canonicalize().unwrap();
+    fn provider_failures_are_logged_and_cancellation_is_reported() {
+        let (endpoint, server) = test_support::serve(vec![test_support::response(
+            "500 Internal Server Error",
+            &[],
+            "",
+        )]);
+        let provider = OpenAiCompatibleProvider::new(endpoint, "test-model".to_owned());
         let log_path =
             std::env::temp_dir().join(format!("roven-agent-log-{}.md", uuid::Uuid::now_v7()));
         let log = RuntimeLog::for_file(&log_path).unwrap();
 
         let result = run(
-            &FailingProvider,
+            &provider,
             "key",
             vec![AgentMessage::User {
                 content: "hello".to_owned(),
             }],
-            &ToolContext::new(workspace).unwrap(),
+            &ToolContext::new(workspace()).unwrap(),
             &AtomicBool::new(false),
             Some(&log),
             &mut |_| {},
         );
 
-        assert!(result.is_err());
-        let contents = fs::read_to_string(log_path).unwrap();
-        assert!(contents.contains("component=agent"));
-        assert!(contents.contains("event=model_request_started"));
-        assert!(contents.contains("event=model_request_failed"));
-        assert!(contents.contains("error=test provider error"));
+        assert!(matches!(
+            result,
+            Err(ProviderError::HttpStatus { status: 500 })
+        ));
+        assert!(
+            fs::read_to_string(log_path)
+                .unwrap()
+                .contains("event=model_request_failed")
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+
+        let (endpoint, server) = test_support::serve(vec![test_support::sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ignored\"},\"finish_reason\":null}]}\n\n",
+        )]);
+        let provider = OpenAiCompatibleProvider::new(endpoint, "test-model".to_owned());
+        let events = RefCell::new(Vec::new());
+        run(
+            &provider,
+            "key",
+            vec![AgentMessage::User {
+                content: "cancel".to_owned(),
+            }],
+            &ToolContext::new(workspace()).unwrap(),
+            &AtomicBool::new(true),
+            None,
+            &mut |event| events.borrow_mut().push(event),
+        )
+        .unwrap();
+        assert_eq!(events.into_inner(), vec![AgentEvent::Cancelled]);
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 }

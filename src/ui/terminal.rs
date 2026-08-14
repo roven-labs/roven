@@ -651,8 +651,10 @@ mod tests {
 
     use crate::{
         storage::{ConversationEvent, EventKind, ProjectStore},
-        ui::state::Role,
+        ui::state::{AppState, Role},
     };
+
+    use super::{WorkerEvent, apply_worker_event};
 
     fn temp_root(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("roven-{name}-{}", uuid::Uuid::now_v7()));
@@ -793,6 +795,68 @@ mod tests {
                     && input["path"] == "."
                     && output["status"] == "ok"
         ));
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn worker_errors_and_cancellation_update_the_ui_and_persist_outcomes() {
+        let data = temp_root("worker-events-data");
+        let project = temp_root("worker-events-project");
+        let store = ProjectStore::for_project(&data, &project).unwrap();
+        let session = store.create_session("Inspect the workspace").unwrap();
+        let mut state = AppState::new();
+
+        state.input = "Inspect the workspace".to_owned();
+        assert!(state.submit());
+        state.start_agent();
+        state.append_agent_text("partial response".to_owned());
+        apply_worker_event(
+            &mut state,
+            Some(&store),
+            Some(&session),
+            None,
+            WorkerEvent::Error("provider failed".to_owned()),
+        );
+        assert!(!state.running);
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| message.content == "Error: provider failed")
+        );
+
+        state.input = "Cancel the request".to_owned();
+        assert!(state.submit());
+        state.start_agent();
+        state.append_agent_text("stopped response".to_owned());
+        apply_worker_event(
+            &mut state,
+            Some(&store),
+            Some(&session),
+            None,
+            WorkerEvent::Cancelled,
+        );
+        assert!(!state.running);
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| message.content == "Agent stopped")
+        );
+
+        let events = store.events(&session.id).unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == EventKind::Assistant && event.content == "partial response"
+        }));
+        assert!(
+            events.iter().any(|event| {
+                event.kind == EventKind::Error && event.content == "provider failed"
+            })
+        );
+        assert!(events.iter().any(|event| {
+            event.kind == EventKind::Cancelled && event.content == "stopped response"
+        }));
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(project).unwrap();
     }

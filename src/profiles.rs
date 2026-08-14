@@ -177,7 +177,7 @@ pub(crate) fn normalize_endpoint(value: &str) -> Result<String, ProfileError> {
 mod tests {
     use std::fs;
 
-    use super::{ProviderProfiles, normalize_endpoint};
+    use super::{PROFILES_FILE, ProfileError, ProviderProfiles, normalize_endpoint};
 
     fn temp_root(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("roven-{name}-{}", uuid::Uuid::now_v7()));
@@ -216,5 +216,44 @@ mod tests {
         ] {
             assert!(normalize_endpoint(endpoint).is_err(), "{endpoint}");
         }
+    }
+
+    #[test]
+    fn profile_storage_rejects_invalid_input_and_tracks_default_removal() {
+        let data_root = temp_root("provider-profile-validation");
+        let profiles = ProviderProfiles::for_data_root(data_root.clone());
+        assert!(matches!(
+            profiles.create(" ", "https://example.test/v1", "model"),
+            Err(ProfileError::EmptyName)
+        ));
+        assert!(matches!(
+            profiles.create("profile", "https://example.test/v1", " "),
+            Err(ProfileError::EmptyModel)
+        ));
+
+        let first = profiles
+            .create("first", "https://example.test/v1", "model-one")
+            .unwrap();
+        assert!(matches!(
+            profiles.create("first", "https://example.test/v1", "model-two"),
+            Err(ProfileError::DuplicateName(name)) if name == "first"
+        ));
+        let second = profiles
+            .create("second", "https://example.test/v1", "model-two")
+            .unwrap();
+        profiles.set_default(&second.id).unwrap();
+        assert_eq!(profiles.default_profile().unwrap(), Some(second.clone()));
+        assert_eq!(profiles.remove(&second.id).unwrap(), second);
+        assert_eq!(profiles.default_profile().unwrap(), None);
+        assert!(matches!(
+            profiles.remove("missing"),
+            Err(ProfileError::NotFound(_))
+        ));
+        assert_eq!(profiles.remove(&first.id).unwrap(), first);
+        assert!(profiles.list().unwrap().is_empty());
+
+        fs::write(data_root.join(PROFILES_FILE), b"not json").unwrap();
+        assert!(profiles.list().is_err());
+        fs::remove_dir_all(data_root).unwrap();
     }
 }

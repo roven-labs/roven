@@ -30,8 +30,8 @@ pub(crate) enum StorageError {
 
 /// Minimal durable identity for a project that has passed preparation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProjectRegistration {
-    #[serde(default)]
     pub(crate) name: String,
     pub(crate) canonical_path: String,
     pub(crate) github_remote: String,
@@ -113,11 +113,8 @@ impl ProjectRegistry {
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
-            let mut registration: ProjectRegistration = read_json(&path)?;
+            let registration: ProjectRegistration = read_json(&path)?;
             if registration.canonical_path == canonical_path {
-                if registration.name.is_empty() {
-                    registration.name = project_name(project_root);
-                }
                 return Ok(Some(registration));
             }
         }
@@ -167,7 +164,6 @@ pub(crate) enum EventKind {
     User,
     Thought,
     Assistant,
-    #[serde(alias = "tool")]
     FunctionCallOutput,
     Error,
     Cancelled,
@@ -438,25 +434,63 @@ mod tests {
         assert!(value.get("updated_at_ms").is_none());
         assert_eq!(value["name"], registration.name);
         assert_eq!(value["canonical_path"], registration.canonical_path);
-        assert!(value.get("project_context").is_none());
-        assert!(value.get("registration_state").is_none());
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(project).unwrap();
     }
 
     #[test]
-    fn legacy_registration_fields_are_ignored_when_reading() {
-        let registration: ProjectRegistration = serde_json::from_value(serde_json::json!({
+    fn registration_requires_the_current_shape() {
+        let registration = serde_json::json!({
             "name": "project",
             "canonical_path": "C:\\\\work\\\\project",
             "github_remote": "https://github.com/roven/project.git",
-            "baseline_commit": "abc123",
-            "registration_state": "registered",
-            "project_context": {"summary": "unused"}
-        }))
-        .unwrap();
+            "baseline_commit": "abc123"
+        });
+        let parsed = serde_json::from_value::<ProjectRegistration>(registration.clone()).unwrap();
+        assert_eq!(parsed.name, "project");
+        for required in ["name", "canonical_path", "github_remote", "baseline_commit"] {
+            let mut incomplete = registration.clone();
+            incomplete.as_object_mut().unwrap().remove(required);
+            assert!(serde_json::from_value::<ProjectRegistration>(incomplete).is_err());
+        }
+        assert!(
+            serde_json::from_value::<ProjectRegistration>(serde_json::json!({
+                "name": "project",
+                "canonical_path": "C:\\\\work\\\\project",
+                "github_remote": "https://github.com/roven/project.git",
+                "baseline_commit": "abc123",
+                "unexpected": true
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::from_value::<EventKind>(serde_json::json!("function_call_output")).unwrap(),
+            EventKind::FunctionCallOutput
+        );
+    }
 
-        assert_eq!(registration.name, "project");
+    #[test]
+    fn registry_reader_rejects_unknown_registration_fields() {
+        let data = temp_root("strict-reader-data");
+        let project = temp_root("strict-reader-project");
+        let registry = ProjectRegistry::for_data_root(&data);
+        let projects = data.join("projects");
+        fs::create_dir_all(&projects).unwrap();
+        fs::write(
+            projects.join("invalid.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "project",
+                "canonical_path": project.canonicalize().unwrap().to_string_lossy(),
+                "github_remote": "https://github.com/roven/project.git",
+                "baseline_commit": "abc123",
+                "unexpected": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(registry.lookup(&project).is_err());
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(project).unwrap();
     }
 
     #[test]

@@ -110,7 +110,9 @@ pub(crate) fn dispatch(context: &ToolContext, call: RovenToolCall) -> RovenToolR
             )),
         },
         "list_tools" => match serde_json::from_value::<ListToolsInput>(call.arguments) {
-            Ok(_) => serde_json::to_value(ListTools.execute()),
+            Ok(_) => serde_json::to_value(ListToolsResult::Ok {
+                tools: definitions(),
+            }),
             Err(_) => serde_json::to_value(ListToolsResult::InvalidInput),
         },
         _ => Ok(json!({ "status": "error", "reason": "unknown_tool" })),
@@ -131,16 +133,6 @@ struct ListToolsInput {}
 enum ListToolsResult {
     Ok { tools: Vec<RovenToolDefinition> },
     InvalidInput,
-}
-
-struct ListTools;
-
-impl ListTools {
-    fn execute(&self) -> ListToolsResult {
-        ListToolsResult::Ok {
-            tools: definitions(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -394,26 +386,21 @@ pub(crate) enum BlockedReason {
     StorageFailure,
 }
 
-pub(crate) struct PrepareProject<G = SystemGit> {
+pub(crate) struct PrepareProject {
     registry: Result<ProjectRegistry, ()>,
-    git: G,
 }
 
-impl PrepareProject<SystemGit> {
+impl PrepareProject {
     pub(crate) fn for_current_user() -> Self {
         Self {
             registry: ProjectRegistry::for_current_user().map_err(|_| ()),
-            git: SystemGit,
         }
     }
-}
 
-impl<G: GitInspector> PrepareProject<G> {
     #[cfg(test)]
-    fn with_dependencies(registry: ProjectRegistry, git: G) -> Self {
+    fn for_data_root(data_root: &Path) -> Self {
         Self {
-            registry: Ok(registry),
-            git,
+            registry: Ok(ProjectRegistry::for_data_root(data_root)),
         }
     }
 
@@ -442,21 +429,21 @@ impl<G: GitInspector> PrepareProject<G> {
             Ok(RegistrationLookup::Absent) => {}
             Err(_) => return PrepareProjectResult::blocked(BlockedReason::StorageFailure),
         }
-        if !self.git.is_available() {
+        if !git_available() {
             return PrepareProjectResult::blocked(BlockedReason::GitUnavailable);
         }
-        if !self.git.is_repository(&project_path) {
+        if !git_is_repository(&project_path) {
             return PrepareProjectResult::blocked(BlockedReason::NotGitRepository);
         }
-        let baseline_commit = match self.git.head_commit(&project_path) {
+        let baseline_commit = match git_head_commit(&project_path) {
             Some(commit) => commit,
             None => return PrepareProjectResult::blocked(BlockedReason::NoCommitBaseline),
         };
-        let github_remote = match self.git.github_remote(&project_path) {
+        let github_remote = match git_github_remote(&project_path) {
             Some(remote) => remote,
             None => return PrepareProjectResult::blocked(BlockedReason::NoGithubRemote),
         };
-        if !self.git.is_clean(&project_path) || self.git.operation_in_progress(&project_path) {
+        if !git_is_clean(&project_path) || git_operation_in_progress(&project_path) {
             return PrepareProjectResult::blocked(BlockedReason::RepositoryNotClean);
         }
         match registry.register(&project_path, github_remote, baseline_commit) {
@@ -498,82 +485,68 @@ fn prepared_project(registration: ProjectRegistration) -> PreparedProject {
     }
 }
 
-pub(crate) trait GitInspector {
-    fn is_available(&self) -> bool;
-    fn is_repository(&self, project_path: &Path) -> bool;
-    fn head_commit(&self, project_path: &Path) -> Option<String>;
-    fn github_remote(&self, project_path: &Path) -> Option<String>;
-    fn is_clean(&self, project_path: &Path) -> bool;
-    fn operation_in_progress(&self, project_path: &Path) -> bool;
+fn git_available() -> bool {
+    git_output(None, &["--version"]).is_some()
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct SystemGit;
+fn git_is_repository(project_path: &Path) -> bool {
+    git_output(Some(project_path), &["rev-parse", "--is-inside-work-tree"])
+        .is_some_and(|output| output.trim() == "true")
+}
 
-impl GitInspector for SystemGit {
-    fn is_available(&self) -> bool {
-        git_output(None, &["--version"]).is_some()
+fn git_head_commit(project_path: &Path) -> Option<String> {
+    git_output(
+        Some(project_path),
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+    )
+    .map(|output| output.trim().to_owned())
+    .filter(|output| !output.is_empty())
+}
+
+fn git_github_remote(project_path: &Path) -> Option<String> {
+    let remotes = git_output(Some(project_path), &["remote"])?;
+    let remotes = remotes
+        .lines()
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    if let Some(origin) = remotes.iter().find(|name| **name == "origin") {
+        candidates.push(*origin);
     }
-
-    fn is_repository(&self, project_path: &Path) -> bool {
-        git_output(Some(project_path), &["rev-parse", "--is-inside-work-tree"])
-            .is_some_and(|output| output.trim() == "true")
-    }
-
-    fn head_commit(&self, project_path: &Path) -> Option<String> {
-        git_output(
-            Some(project_path),
-            &["rev-parse", "--verify", "HEAD^{commit}"],
-        )
-        .map(|output| output.trim().to_owned())
-        .filter(|output| !output.is_empty())
-    }
-
-    fn github_remote(&self, project_path: &Path) -> Option<String> {
-        let remotes = git_output(Some(project_path), &["remote"])?;
-        let remotes = remotes
-            .lines()
-            .filter(|name| !name.is_empty())
-            .collect::<Vec<_>>();
-        let mut candidates = Vec::new();
-        if let Some(origin) = remotes.iter().find(|name| **name == "origin") {
-            candidates.push(*origin);
+    candidates.extend(remotes.into_iter().filter(|name| *name != "origin"));
+    for remote in candidates {
+        let fetch = git_output(Some(project_path), &["remote", "get-url", remote]);
+        let push = git_output(Some(project_path), &["remote", "get-url", "--push", remote]);
+        if let Some(url) = fetch.filter(|url| is_github_url(url.trim())) {
+            return Some(url.trim().to_owned());
         }
-        candidates.extend(remotes.into_iter().filter(|name| *name != "origin"));
-        for remote in candidates {
-            let fetch = git_output(Some(project_path), &["remote", "get-url", remote]);
-            let push = git_output(Some(project_path), &["remote", "get-url", "--push", remote]);
-            if let Some(url) = fetch.filter(|url| is_github_url(url.trim())) {
-                return Some(url.trim().to_owned());
-            }
-            if let Some(url) = push.filter(|url| is_github_url(url.trim())) {
-                return Some(url.trim().to_owned());
-            }
+        if let Some(url) = push.filter(|url| is_github_url(url.trim())) {
+            return Some(url.trim().to_owned());
         }
-        None
     }
+    None
+}
 
-    fn is_clean(&self, project_path: &Path) -> bool {
-        git_output(
-            Some(project_path),
-            &["status", "--porcelain=v1", "--untracked-files=all"],
-        )
-        .is_some_and(|output| !has_blocking_status(&output))
-    }
+fn git_is_clean(project_path: &Path) -> bool {
+    git_output(
+        Some(project_path),
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )
+    .is_some_and(|output| !has_blocking_status(&output))
+}
 
-    fn operation_in_progress(&self, project_path: &Path) -> bool {
-        [
-            "MERGE_HEAD",
-            "CHERRY_PICK_HEAD",
-            "REVERT_HEAD",
-            "REBASE_HEAD",
-            "BISECT_LOG",
-            "rebase-apply",
-            "rebase-merge",
-        ]
-        .iter()
-        .any(|marker| git_path_exists(project_path, marker))
-    }
+fn git_operation_in_progress(project_path: &Path) -> bool {
+    [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "REBASE_HEAD",
+        "BISECT_LOG",
+        "rebase-apply",
+        "rebase-merge",
+    ]
+    .iter()
+    .any(|marker| git_path_exists(project_path, marker))
 }
 
 fn git_output(project_path: Option<&Path>, arguments: &[&str]) -> Option<String> {
@@ -636,64 +609,9 @@ mod tests {
     use crate::storage::{ProjectRegistry, RegistrationLookup};
 
     use super::{
-        BlockedReason, GitInspector, ListDirectory, ListDirectoryInput, PrepareProject,
-        PrepareProjectInput, PrepareProjectResult, RovenToolCall, SystemGit, ToolContext,
-        definitions, dispatch,
+        BlockedReason, ListDirectory, ListDirectoryInput, PrepareProject, PrepareProjectInput,
+        PrepareProjectResult, RovenToolCall, ToolContext, definitions, dispatch,
     };
-
-    #[derive(Default)]
-    struct FakeGit {
-        available: bool,
-        repository: bool,
-        head: Option<String>,
-        remote: Option<String>,
-        clean: bool,
-        operation: bool,
-    }
-
-    impl GitInspector for FakeGit {
-        fn is_available(&self) -> bool {
-            self.available
-        }
-        fn is_repository(&self, _: &Path) -> bool {
-            self.repository
-        }
-        fn head_commit(&self, _: &Path) -> Option<String> {
-            self.head.clone()
-        }
-        fn github_remote(&self, _: &Path) -> Option<String> {
-            self.remote.clone()
-        }
-        fn is_clean(&self, _: &Path) -> bool {
-            self.clean
-        }
-        fn operation_in_progress(&self, _: &Path) -> bool {
-            self.operation
-        }
-    }
-
-    struct PanicGit;
-
-    impl GitInspector for PanicGit {
-        fn is_available(&self) -> bool {
-            panic!("blocked paths must not inspect Git")
-        }
-        fn is_repository(&self, _: &Path) -> bool {
-            panic!("blocked paths must not inspect Git")
-        }
-        fn head_commit(&self, _: &Path) -> Option<String> {
-            panic!("blocked paths must not inspect Git")
-        }
-        fn github_remote(&self, _: &Path) -> Option<String> {
-            panic!("blocked paths must not inspect Git")
-        }
-        fn is_clean(&self, _: &Path) -> bool {
-            panic!("blocked paths must not inspect Git")
-        }
-        fn operation_in_progress(&self, _: &Path) -> bool {
-            panic!("blocked paths must not inspect Git")
-        }
-    }
 
     fn temp_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("roven-{name}-{}", uuid::Uuid::now_v7()));
@@ -717,17 +635,6 @@ mod tests {
         }
     }
 
-    fn ready_git() -> FakeGit {
-        FakeGit {
-            available: true,
-            repository: true,
-            head: Some("abc123".to_owned()),
-            remote: Some("git@github.com:roven/example.git".to_owned()),
-            clean: true,
-            operation: false,
-        }
-    }
-
     fn git(project: &Path, arguments: &[&str]) {
         let status = Command::new("git")
             .arg("-C")
@@ -738,6 +645,34 @@ mod tests {
             .status()
             .expect("git should start");
         assert!(status.success(), "git {arguments:?} should succeed");
+    }
+
+    fn ready_project(name: &str) -> PathBuf {
+        let project = temp_root(name);
+        git(&project, &["init"]);
+        git(
+            &project,
+            &[
+                "-c",
+                "user.name=Roven Test",
+                "-c",
+                "user.email=roven@example.test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        git(
+            &project,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:roven/example.git",
+            ],
+        );
+        project
     }
 
     #[test]
@@ -756,7 +691,7 @@ mod tests {
                 "existing-baseline".to_owned(),
             )
             .unwrap();
-        let tool = PrepareProject::with_dependencies(registry.clone(), PanicGit);
+        let tool = PrepareProject::for_data_root(&data);
 
         let result = tool.execute(&context(&trusted), input(&sibling));
 
@@ -777,9 +712,9 @@ mod tests {
     #[test]
     fn prepare_project_resolves_dot_against_the_trusted_workspace() {
         let data = temp_root("prepare-data");
-        let trusted = temp_root("trusted");
+        let trusted = ready_project("trusted");
         let registry = ProjectRegistry::for_data_root(&data);
-        let tool = PrepareProject::with_dependencies(registry.clone(), ready_git());
+        let tool = PrepareProject::for_data_root(&data);
 
         let result = tool.execute(&context(&trusted), input_value("."));
 
@@ -800,8 +735,7 @@ mod tests {
         let sibling = parent.join("project-two");
         fs::create_dir_all(&trusted).unwrap();
         fs::create_dir_all(&sibling).unwrap();
-        let tool =
-            PrepareProject::with_dependencies(ProjectRegistry::for_data_root(&data), PanicGit);
+        let tool = PrepareProject::for_data_root(&data);
 
         let result = tool.execute(&context(&trusted), input_value("../project-two"));
 
@@ -835,8 +769,7 @@ mod tests {
             }
             Err(error) => panic!("symlink setup failed: {error}"),
         }
-        let tool =
-            PrepareProject::with_dependencies(ProjectRegistry::for_data_root(&data), PanicGit);
+        let tool = PrepareProject::for_data_root(&data);
 
         let result = tool.execute(&context(&trusted), input(&outside_link));
 
@@ -855,9 +788,8 @@ mod tests {
     #[test]
     fn prepare_project_accepts_the_exact_trusted_workspace_path() {
         let data = temp_root("prepare-data");
-        let project = temp_root("project");
-        let tool =
-            PrepareProject::with_dependencies(ProjectRegistry::for_data_root(&data), ready_git());
+        let project = ready_project("project");
+        let tool = PrepareProject::for_data_root(&data);
 
         let result = tool.execute(&context(&project), input(&project));
         let value = serde_json::to_value(result).unwrap();
@@ -871,7 +803,11 @@ mod tests {
             value["project"]["github_remote"],
             "git@github.com:roven/example.git"
         );
-        assert_eq!(value["project"]["baseline_commit"], "abc123");
+        assert!(
+            value["project"]["baseline_commit"]
+                .as_str()
+                .is_some_and(|commit| !commit.is_empty())
+        );
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(project).unwrap();
     }
@@ -888,7 +824,7 @@ mod tests {
                 "abc123".to_owned(),
             )
             .unwrap();
-        let tool = PrepareProject::with_dependencies(registry, FakeGit::default());
+        let tool = PrepareProject::for_data_root(&data);
 
         let result = tool.execute(&context(&project), input(&project));
 
@@ -903,10 +839,9 @@ mod tests {
     #[test]
     fn repository_state_blocks_registration() {
         let data = temp_root("prepare-data");
-        let project = temp_root("project");
-        let mut git = ready_git();
-        git.clean = false;
-        let tool = PrepareProject::with_dependencies(ProjectRegistry::for_data_root(&data), git);
+        let project = ready_project("project");
+        fs::write(project.join("untracked.txt"), "untracked").unwrap();
+        let tool = PrepareProject::for_data_root(&data);
 
         let result = tool.execute(&context(&project), input(&project));
 
@@ -933,59 +868,60 @@ mod tests {
     }
 
     #[test]
-    fn validation_reports_each_git_precondition_without_registering() {
-        let cases = [
-            (FakeGit::default(), BlockedReason::GitUnavailable),
-            (
-                FakeGit {
-                    available: true,
-                    ..FakeGit::default()
-                },
-                BlockedReason::NotGitRepository,
-            ),
-            (
-                FakeGit {
-                    available: true,
-                    repository: true,
-                    ..FakeGit::default()
-                },
-                BlockedReason::NoCommitBaseline,
-            ),
-            (
-                FakeGit {
-                    remote: None,
-                    ..ready_git()
-                },
-                BlockedReason::NoGithubRemote,
-            ),
-            (
-                FakeGit {
-                    operation: true,
-                    ..ready_git()
-                },
-                BlockedReason::RepositoryNotClean,
-            ),
-        ];
+    fn preparation_requires_a_committed_repository_with_a_github_remote() {
+        let data = temp_root("prepare-data");
+        let tool = PrepareProject::for_data_root(&data);
+        let plain_project = temp_root("plain-project");
+        assert_eq!(
+            tool.execute(&context(&plain_project), input(&plain_project)),
+            PrepareProjectResult::Blocked {
+                reason: BlockedReason::NotGitRepository
+            }
+        );
 
-        for (git, reason) in cases {
-            let data = temp_root("prepare-data");
-            let project = temp_root("project");
-            let tool =
-                PrepareProject::with_dependencies(ProjectRegistry::for_data_root(&data), git);
+        let uncommitted_project = temp_root("uncommitted-project");
+        git(&uncommitted_project, &["init"]);
+        assert_eq!(
+            tool.execute(&context(&uncommitted_project), input(&uncommitted_project)),
+            PrepareProjectResult::Blocked {
+                reason: BlockedReason::NoCommitBaseline
+            }
+        );
 
-            assert_eq!(
-                tool.execute(&context(&project), input(&project)),
-                PrepareProjectResult::Blocked { reason }
-            );
+        let no_remote_project = temp_root("no-remote-project");
+        git(&no_remote_project, &["init"]);
+        git(
+            &no_remote_project,
+            &[
+                "-c",
+                "user.name=Roven Test",
+                "-c",
+                "user.email=roven@example.test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        assert_eq!(
+            tool.execute(&context(&no_remote_project), input(&no_remote_project)),
+            PrepareProjectResult::Blocked {
+                reason: BlockedReason::NoGithubRemote
+            }
+        );
+
+        for project in [&plain_project, &uncommitted_project, &no_remote_project] {
             assert!(matches!(
                 ProjectRegistry::for_data_root(&data)
-                    .lookup(&project)
+                    .lookup(project)
                     .unwrap(),
                 RegistrationLookup::Absent
             ));
-            fs::remove_dir_all(data).unwrap();
-            fs::remove_dir_all(project).unwrap();
         }
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(plain_project).unwrap();
+        fs::remove_dir_all(uncommitted_project).unwrap();
+        fs::remove_dir_all(no_remote_project).unwrap();
     }
 
     #[test]
@@ -1012,7 +948,7 @@ mod tests {
         );
 
         assert_eq!(
-            SystemGit.github_remote(&project),
+            super::git_github_remote(&project),
             Some("https://github.com/roven/example.git".to_owned())
         );
         git(
@@ -1026,7 +962,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            SystemGit.github_remote(&project),
+            super::git_github_remote(&project),
             Some("git@github.com:roven/origin-push.git".to_owned())
         );
         git(
@@ -1039,7 +975,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            SystemGit.github_remote(&project),
+            super::git_github_remote(&project),
             Some("git@github.com:roven/origin.git".to_owned())
         );
         fs::remove_dir_all(project).unwrap();
@@ -1053,7 +989,7 @@ mod tests {
         fs::write(project.join("ignored.txt"), "ignored").unwrap();
 
         assert!(
-            !SystemGit.is_clean(&project),
+            !super::git_is_clean(&project),
             "the untracked .gitignore blocks preparation"
         );
         git(&project, &["add", ".gitignore"]);
@@ -1069,9 +1005,9 @@ mod tests {
                 "ignore",
             ],
         );
-        assert!(SystemGit.is_clean(&project));
+        assert!(super::git_is_clean(&project));
         fs::write(project.join("untracked.txt"), "untracked").unwrap();
-        assert!(!SystemGit.is_clean(&project));
+        assert!(!super::git_is_clean(&project));
         fs::remove_dir_all(project).unwrap();
     }
 
@@ -1229,6 +1165,16 @@ mod tests {
                 "tools": expected,
             })
         );
+        let invalid = dispatch(
+            &trusted,
+            RovenToolCall {
+                id: "call_invalid_tools".to_owned(),
+                name: "list_tools".to_owned(),
+                arguments: json!({ "unexpected": true }),
+            },
+        );
+        assert_eq!(invalid.result, json!({ "status": "invalid_input" }));
+        fs::remove_dir_all(workspace).unwrap();
     }
 
     #[cfg(windows)]
