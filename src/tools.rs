@@ -13,6 +13,7 @@ use crate::storage::{ProjectRegistration, ProjectRegistry, RegistrationLookup};
 
 pub(crate) const PREPARE_PROJECT_DESCRIPTION: &str = "Validate and register the currently trusted project for first-time use with Roven. Use this when the user asks to add/register the current project for future project understanding, resume generation, or portfolio updates. Pass `.` as the path for the current trusted workspace. The tool validates the project path, existing Roven registration, Git repository, GitHub remote, committed baseline, and clean working state, then stores the minimal project registration. It does not inspect source code or initialize code-intelligence systems.";
 pub(crate) const LIST_DIRECTORY_DESCRIPTION: &str = "List the immediate contents of a directory inside the currently trusted Roven workspace. Use this to inspect the workspace structure and locate files or subdirectories before choosing another filesystem tool. Paths are relative to the trusted workspace; use `.` for the workspace root. This tool does not read file contents, search recursively, modify files, register projects, or access paths outside the trusted workspace.";
+pub(crate) const READ_FILE_DESCRIPTION: &str = "Read a known workspace-relative text file after locating it with `list_directory`. Paths are relative to the trusted workspace. This tool reads only regular UTF-8 text files up to 50 KiB and does not modify files or access paths outside the trusted workspace.";
 pub(crate) const LIST_TOOLS_DESCRIPTION: &str = "List the Roven tools available to you in this turn, with their exact descriptions and input schemas. Use this when you need to check which Roven capabilities are currently available before selecting a tool. This reports the live Roven tool registry and does not access the workspace or modify anything.";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -48,6 +49,21 @@ pub(crate) fn definitions() -> Vec<RovenToolDefinition> {
                     "path": {
                         "type": "string",
                         "description": "Workspace-relative directory path; use `.` for the workspace root."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+        RovenToolDefinition {
+            name: "read_file".to_owned(),
+            description: READ_FILE_DESCRIPTION.to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative text file path."
                     }
                 },
                 "required": ["path"],
@@ -109,6 +125,12 @@ pub(crate) fn dispatch(context: &ToolContext, call: RovenToolCall) -> RovenToolR
                 "",
             )),
         },
+        "read_file" => match serde_json::from_value::<ReadFileInput>(call.arguments) {
+            Ok(input) => serde_json::to_value(ReadFile.execute(context, input)),
+            Err(_) => {
+                serde_json::to_value(ReadFileResult::error(ReadFileErrorReason::InvalidPath, ""))
+            }
+        },
         "list_tools" => match serde_json::from_value::<ListToolsInput>(call.arguments) {
             Ok(_) => serde_json::to_value(ListToolsResult::Ok {
                 tools: definitions(),
@@ -142,11 +164,81 @@ pub(crate) struct PrepareProjectInput {
 }
 
 const DIRECTORY_LIST_LIMIT: usize = 100;
+const READ_FILE_SIZE_LIMIT: u64 = 50 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ListDirectoryInput {
     pub(crate) path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReadFileInput {
+    pub(crate) path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum ReadFileResult {
+    Ok {
+        path: String,
+        content: String,
+    },
+    Error {
+        reason: ReadFileErrorReason,
+        path: String,
+    },
+}
+
+impl ReadFileResult {
+    fn error(reason: ReadFileErrorReason, path: impl Into<String>) -> Self {
+        Self::Error {
+            reason,
+            path: path.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReadFileErrorReason {
+    InvalidPath,
+    PathNotAllowed,
+    NotFile,
+    FileTooLarge,
+    NotText,
+    PermissionDenied,
+    IoError,
+}
+
+pub(crate) struct ReadFile;
+
+impl ReadFile {
+    pub(crate) fn execute(&self, context: &ToolContext, input: ReadFileInput) -> ReadFileResult {
+        let target = match resolve_workspace_file(context, &input.path) {
+            Ok(path) => path,
+            Err(reason) => return ReadFileResult::error(reason, input.path),
+        };
+        let path = workspace_relative_path(&context.trusted_workspace, &target);
+        let metadata = match fs::metadata(&target) {
+            Ok(metadata) => metadata,
+            Err(error) => return ReadFileResult::error(read_file_io_reason(&error), path),
+        };
+        if !metadata.is_file() {
+            return ReadFileResult::error(ReadFileErrorReason::NotFile, path);
+        }
+        if metadata.len() > READ_FILE_SIZE_LIMIT {
+            return ReadFileResult::error(ReadFileErrorReason::FileTooLarge, path);
+        }
+        match fs::read_to_string(&target) {
+            Ok(content) => ReadFileResult::Ok { path, content },
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                ReadFileResult::error(ReadFileErrorReason::NotText, path)
+            }
+            Err(error) => ReadFileResult::error(read_file_io_reason(&error), path),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -292,6 +384,40 @@ fn resolve_workspace_directory(
         .ok_or(ListDirectoryErrorReason::NotDirectory)
 }
 
+fn resolve_workspace_file(
+    context: &ToolContext,
+    path: &str,
+) -> Result<PathBuf, ReadFileErrorReason> {
+    let relative = Path::new(path);
+    if relative
+        .components()
+        .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+    {
+        return Err(ReadFileErrorReason::InvalidPath);
+    }
+    if relative
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(ReadFileErrorReason::PathNotAllowed);
+    }
+    if relative
+        .components()
+        .any(|component| matches!(component, Component::Normal(name) if name.to_string_lossy().contains(':')))
+    {
+        return Err(ReadFileErrorReason::InvalidPath);
+    }
+    let target = context
+        .trusted_workspace
+        .join(relative)
+        .canonicalize()
+        .map_err(|error| read_file_io_reason(&error))?;
+    if !target.starts_with(&context.trusted_workspace) {
+        return Err(ReadFileErrorReason::PathNotAllowed);
+    }
+    Ok(target)
+}
+
 fn workspace_relative_path(root: &Path, path: &Path) -> String {
     let relative = path
         .strip_prefix(root)
@@ -342,6 +468,14 @@ fn io_reason(error: &io::Error) -> ListDirectoryErrorReason {
         io::ErrorKind::PermissionDenied => ListDirectoryErrorReason::PermissionDenied,
         io::ErrorKind::NotFound => ListDirectoryErrorReason::InvalidPath,
         _ => ListDirectoryErrorReason::IoError,
+    }
+}
+
+fn read_file_io_reason(error: &io::Error) -> ReadFileErrorReason {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => ReadFileErrorReason::PermissionDenied,
+        io::ErrorKind::NotFound => ReadFileErrorReason::InvalidPath,
+        _ => ReadFileErrorReason::IoError,
     }
 }
 
