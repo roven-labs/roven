@@ -10,8 +10,8 @@ future resume and portfolio work.
 
 Roven is provider-neutral: each user chooses an OpenAI-compatible HTTPS
 chat-completions endpoint, model, and API key through a named provider profile.
-It does not silently choose a provider, append an endpoint path, read source
-files, or execute arbitrary commands.
+It does not silently choose a provider, append an endpoint path, or execute
+arbitrary commands.
 
 ## Current capabilities
 
@@ -28,11 +28,12 @@ files, or execute arbitrary commands.
 
 ## Agent tools
 
-The Rust harness exposes three local tools:
+The Rust harness exposes four local tools:
 
 | Tool | Capability | Writes data? |
 | --- | --- | --- |
 | `list_directory` | Lists immediate entries inside the trusted workspace. It cannot recurse, read file contents, or escape the workspace. | No |
+| `read_file` | Reads a regular UTF-8 text file up to 50 KiB using a workspace-relative path inside the trusted workspace. | No |
 | `prepare_project` | Independently canonicalizes and authorizes the requested path, then validates Git/GitHub state and registers the trusted project. | Yes, after validation |
 | `list_tools` | Returns the available tool names, descriptions, and input schemas. | No |
 
@@ -65,10 +66,11 @@ credentials.
 
 ## Current boundaries
 
-Roven does not currently provide a raw project file-reading tool, arbitrary
-command execution, automatic provider retries, or automatic project-context
-summarization. The agent only receives data returned by the available tools and
-the optional root `ROVEN.md`.
+Roven reads only regular UTF-8 project files up to 50 KiB through
+`read_file`, using workspace-relative paths inside the trusted workspace. It
+does not provide arbitrary command execution, automatic provider retries, or
+automatic project-context summarization. The agent only receives data returned
+by the available tools and the optional root `ROVEN.md`.
 
 ## Install
 

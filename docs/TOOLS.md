@@ -9,6 +9,7 @@ workflow definition.
 | Tool | Main purpose | Writes data |
 | --- | --- | --- |
 | `list_directory` | List immediate entries in the trusted workspace | No |
+| `read_file` | Read a small UTF-8 text file in the trusted workspace | No |
 | `prepare_project` | Validate and register the trusted project | Yes, after validation |
 | `list_tools` | Return the live tool catalog | No |
 
@@ -41,6 +42,27 @@ Results are capped at 100 entries and include:
 
 Possible errors include `invalid_path`, `path_not_allowed`, `not_directory`,
 `permission_denied`, and `io_error`.
+
+## `read_file`
+
+Reads a known workspace-relative file after it has been located with
+`list_directory`. It reads only regular UTF-8 text files at most 50 KiB inside
+the trusted workspace and does not modify files or access paths outside it.
+
+Input:
+
+```json
+{ "path": "src/main.rs" }
+```
+
+Successful result:
+
+```json
+{ "status": "ok", "path": "src/main.rs", "content": "..." }
+```
+
+Possible errors include `invalid_path`, `path_not_allowed`, `not_file`,
+`file_too_large`, `not_text`, `permission_denied`, and `io_error`.
 
 ## `prepare_project`
 
