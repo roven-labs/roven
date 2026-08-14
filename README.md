@@ -28,15 +28,13 @@ files, or execute arbitrary commands.
 
 ## Agent tools
 
-The Rust harness exposes three local tools and, when CodeGraph MCP is available
-for the trusted workspace, the server's raw `codegraph_explore` tool:
+The Rust harness exposes three local tools:
 
 | Tool | Capability | Writes data? |
 | --- | --- | --- |
 | `list_directory` | Lists immediate entries inside the trusted workspace. It cannot recurse, read file contents, or escape the workspace. | No |
 | `prepare_project` | Independently canonicalizes and authorizes the requested path, then validates Git/GitHub state and registers the trusted project. | Yes, after validation |
-| `list_tools` | Returns the live tool names, descriptions, input schemas, and MCP connection status. | No |
-| CodeGraph MCP tools | Every tool returned by CodeGraph MCP, including `codegraph_explore` when advertised. Roven forwards each server-provided schema, arguments, and result. | No |
+| `list_tools` | Returns the available tool names, descriptions, and input schemas. | No |
 
 `prepare_project` rejects paths outside the launch-time trusted workspace before
 any Git command, project lookup, or registration write. A successful
@@ -70,10 +68,8 @@ credentials.
 
 Roven does not currently provide a raw project file-reading tool, arbitrary
 command execution, automatic provider retries, or automatic project-context
-summarization. CodeGraph tools are available when the installed CodeGraph MCP
-server can start; the server may return an index-related error when the
-workspace has not been indexed yet. The agent only receives data returned by
-the available tools and the optional root `ROVEN.md`.
+summarization. The agent only receives data returned by the available tools and
+the optional root `ROVEN.md`.
 
 ## Install
 

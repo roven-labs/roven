@@ -62,7 +62,7 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
                     TRUST_BODY_STYLE,
                 )),
                 Line::from(Span::styled(
-                    "No source search · no file edits · no CodeGraph initialization",
+                    "No source search or file edits",
                     TRUST_BODY_STYLE,
                 )),
                 Line::from(""),
@@ -129,7 +129,7 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
     }
 
     let composer_height = composer_height(&state.input);
-    let status_height = u16::from(state.status.is_some() || state.mcp_status.is_some());
+    let status_height = u16::from(state.status.is_some());
     let [transcript_area, status_area, composer_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(status_height),
@@ -179,14 +179,9 @@ fn draw_transcript(frame: &mut Frame, area: Rect, state: &mut AppState) {
 }
 
 fn draw_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
-    let status = [state.mcp_status.as_deref(), state.status.as_deref()]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" | ");
-    if status.is_empty() {
+    let Some(status) = state.status.as_deref() else {
         return;
-    }
+    };
     frame.render_widget(Paragraph::new(Span::styled(status, STATUS_STYLE)), area);
 }
 
@@ -308,20 +303,6 @@ mod tests {
 
         state.finish_agent();
         assert!(!render(&mut state, 80, 24).contains("Thinking..."));
-    }
-
-    #[test]
-    fn status_bar_shows_mcp_availability_when_idle_and_active() {
-        let mut state = AppState::new();
-        state.trusted = true;
-        state.mcp_status = Some("CodeGraph MCP: connected (1 tool)".to_owned());
-
-        assert!(render(&mut state, 80, 24).contains("CodeGraph MCP: connected (1 tool)"));
-
-        state.start_agent();
-        let rendered = render(&mut state, 80, 24);
-        assert!(rendered.contains("CodeGraph MCP: connected (1 tool)"));
-        assert!(rendered.contains("Agent working..."));
     }
 
     #[test]
