@@ -53,7 +53,6 @@ Windows the default root is `%LOCALAPPDATA%\Roven\data`:
 provider-profiles.json
 projects\<project-name>.json
 sessions\<workspace-sha256>\<session-uuid>\meta.json
-sessions\<workspace-sha256>\<session-uuid>\context.json
 sessions\<workspace-sha256>\<session-uuid>\events.jsonl
 log.md
 ```

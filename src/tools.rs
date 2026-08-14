@@ -22,7 +22,7 @@ pub(crate) struct RovenToolDefinition {
     pub(crate) input_schema: Value,
 }
 
-pub(crate) fn definitions(_: &ToolContext) -> Vec<RovenToolDefinition> {
+pub(crate) fn definitions() -> Vec<RovenToolDefinition> {
     vec![
         RovenToolDefinition {
             name: "prepare_project".to_owned(),
@@ -110,7 +110,7 @@ pub(crate) fn dispatch(context: &ToolContext, call: RovenToolCall) -> RovenToolR
             )),
         },
         "list_tools" => match serde_json::from_value::<ListToolsInput>(call.arguments) {
-            Ok(_) => serde_json::to_value(ListTools.execute(context)),
+            Ok(_) => serde_json::to_value(ListTools.execute()),
             Err(_) => serde_json::to_value(ListToolsResult::InvalidInput),
         },
         _ => Ok(json!({ "status": "error", "reason": "unknown_tool" })),
@@ -136,9 +136,9 @@ enum ListToolsResult {
 struct ListTools;
 
 impl ListTools {
-    fn execute(&self, context: &ToolContext) -> ListToolsResult {
+    fn execute(&self) -> ListToolsResult {
         ListToolsResult::Ok {
-            tools: definitions(context),
+            tools: definitions(),
         }
     }
 }
@@ -1211,7 +1211,7 @@ mod tests {
     fn list_tools_returns_the_live_registry_with_descriptions_and_schemas() {
         let workspace = temp_root("list-tools");
         let trusted = context(&workspace);
-        let expected = serde_json::to_value(definitions(&trusted)).unwrap();
+        let expected = serde_json::to_value(definitions()).unwrap();
 
         let result = dispatch(
             &trusted,

@@ -32,10 +32,10 @@ pub(crate) struct AgentRequest {
 }
 
 impl AgentRequest {
-    pub(crate) fn new(messages: Vec<AgentMessage>, context: &ToolContext) -> Self {
+    pub(crate) fn new(messages: Vec<AgentMessage>) -> Self {
         Self {
             messages,
-            tools: definitions(context),
+            tools: definitions(),
         }
     }
 }
@@ -85,7 +85,7 @@ pub(crate) fn run<P: ModelProvider>(
     emit: &mut dyn FnMut(AgentEvent),
 ) -> Result<(), P::Error> {
     loop {
-        let request = AgentRequest::new(messages.clone(), context);
+        let request = AgentRequest::new(messages.clone());
         record(
             runtime_log,
             "model_request_started",

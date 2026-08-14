@@ -81,7 +81,7 @@ On Windows, Roven uses:
 %LOCALAPPDATA%\Roven\data\sessions\<workspace-sha256>\<session-uuid>\
 ```
 
-Each session directory may contain `meta.json`, `context.json`, and
+Each session directory contains `meta.json` and
 `events.jsonl`. Tool calls are persisted in `events.jsonl` as structured
 `function_call_output` records containing the tool name, input, and output.
 

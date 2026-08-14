@@ -36,35 +36,6 @@ pub(crate) struct ProjectRegistration {
     pub(crate) canonical_path: String,
     pub(crate) github_remote: String,
     pub(crate) baseline_commit: String,
-    pub(crate) registration_state: RegistrationState,
-    #[serde(default)]
-    pub(crate) project_context: ProjectContext,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ProjectContext {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) summary: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) problem_solved: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) role_and_responsibilities: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) tech_stack: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) architecture: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) key_features: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) technical_challenges: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) outcomes: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RegistrationState {
-    Registered,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,8 +85,6 @@ impl ProjectRegistry {
             canonical_path: canonical_root.to_string_lossy().into_owned(),
             github_remote,
             baseline_commit,
-            registration_state: RegistrationState::Registered,
-            project_context: ProjectContext::default(),
         };
         let project_dir = self.projects_dir();
         fs::create_dir_all(&project_dir)?;
@@ -187,7 +156,6 @@ impl ProjectRegistry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SessionMeta {
     pub(crate) id: String,
-    pub(crate) project_id: String,
     pub(crate) title: String,
     pub(crate) created_at_ms: u64,
     pub(crate) updated_at_ms: u64,
@@ -256,14 +224,8 @@ impl ConversationEvent {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub(crate) struct ContextState {
-    pub(crate) summary: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct ProjectStore {
-    project_id: String,
     session_root: PathBuf,
 }
 
@@ -277,12 +239,8 @@ impl ProjectStore {
 
     pub(crate) fn for_project(data_root: &Path, project_root: &Path) -> Result<Self, StorageError> {
         let canonical_root = project_root.canonicalize()?;
-        let project_id = project_id(&canonical_root);
-        let session_root = data_root.join("sessions").join(&project_id);
-        Ok(Self {
-            project_id,
-            session_root,
-        })
+        let session_root = data_root.join("sessions").join(project_id(&canonical_root));
+        Ok(Self { session_root })
     }
 
     pub(crate) fn create_session(&self, first_message: &str) -> Result<SessionMeta, StorageError> {
@@ -292,13 +250,11 @@ impl ProjectStore {
         fs::create_dir_all(&session_dir)?;
         let meta = SessionMeta {
             id,
-            project_id: self.project_id.clone(),
             title: title_from(first_message),
             created_at_ms,
             updated_at_ms: created_at_ms,
         };
         write_json(&session_dir.join("meta.json"), &meta)?;
-        write_json(&session_dir.join("context.json"), &ContextState::default())?;
         Ok(meta)
     }
 
@@ -440,7 +396,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        ConversationEvent, EventKind, ProjectRegistry, ProjectStore, RegistrationLookup, project_id,
+        ConversationEvent, EventKind, ProjectRegistration, ProjectRegistry, ProjectStore,
+        RegistrationLookup, project_id,
     };
 
     fn temp_root(name: &str) -> std::path::PathBuf {
@@ -481,9 +438,25 @@ mod tests {
         assert!(value.get("updated_at_ms").is_none());
         assert_eq!(value["name"], registration.name);
         assert_eq!(value["canonical_path"], registration.canonical_path);
-        assert_eq!(value["project_context"], serde_json::json!({}));
+        assert!(value.get("project_context").is_none());
+        assert!(value.get("registration_state").is_none());
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn legacy_registration_fields_are_ignored_when_reading() {
+        let registration: ProjectRegistration = serde_json::from_value(serde_json::json!({
+            "name": "project",
+            "canonical_path": "C:\\\\work\\\\project",
+            "github_remote": "https://github.com/roven/project.git",
+            "baseline_commit": "abc123",
+            "registration_state": "registered",
+            "project_context": {"summary": "unused"}
+        }))
+        .unwrap();
+
+        assert_eq!(registration.name, "project");
     }
 
     #[test]
@@ -616,6 +589,14 @@ mod tests {
                 .join(&session.id)
                 .is_dir()
         );
+        let session_dir = data
+            .join("sessions")
+            .join(project_id(&project))
+            .join(&session.id);
+        let meta: Value =
+            serde_json::from_slice(&fs::read(session_dir.join("meta.json")).unwrap()).unwrap();
+        assert!(meta.get("project_id").is_none());
+        assert!(!session_dir.join("context.json").exists());
         let event =
             ConversationEvent::message(EventKind::User, "Investigate the build".to_owned(), None);
         store.append_event(&session.id, &event).unwrap();

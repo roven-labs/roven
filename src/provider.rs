@@ -535,7 +535,7 @@ mod tests {
 
     use crate::{
         agent::{AgentMessage, AgentRequest, ProviderEvent},
-        tools::{RovenToolCall, ToolContext},
+        tools::RovenToolCall,
     };
 
     use super::{
@@ -560,13 +560,9 @@ mod tests {
 
     #[test]
     fn request_uses_profile_model_and_standard_openai_fields() {
-        let context = ToolContext::new(std::env::temp_dir()).unwrap();
-        let request = AgentRequest::new(
-            vec![AgentMessage::User {
-                content: "Hello".to_owned(),
-            }],
-            &context,
-        );
+        let request = AgentRequest::new(vec![AgentMessage::User {
+            content: "Hello".to_owned(),
+        }]);
         let request = ChatCompletionsRequest::from_agent("llama-3.3-70b-versatile", &request);
         let value = serde_json::to_value(&request).unwrap();
 

@@ -46,7 +46,6 @@ provider-profiles.json                 non-secret profile metadata
 projects/<project-name>.json           registered project identity and baseline
 sessions/<workspace-sha256>/<uuid>/    conversation sessions
   meta.json                            session identity and timestamps
-  context.json                         reserved summary state (currently null)
   events.jsonl                         conversation and tool-call events
 log.md                                 operational diagnostics only
 ```
