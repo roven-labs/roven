@@ -610,7 +610,8 @@ mod tests {
 
     use super::{
         BlockedReason, ListDirectory, ListDirectoryInput, PrepareProject, PrepareProjectInput,
-        PrepareProjectResult, RovenToolCall, ToolContext, definitions, dispatch,
+        PrepareProjectResult, ReadFile, ReadFileInput, RovenToolCall, ToolContext, definitions,
+        dispatch,
     };
 
     fn temp_root(name: &str) -> PathBuf {
@@ -1137,6 +1138,90 @@ mod tests {
         assert!(
             serde_json::from_value::<ListDirectoryInput>(serde_json::json!({
                 "path": ".",
+                "recursive": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn read_file_returns_utf8_contents_from_the_trusted_workspace() {
+        let workspace = temp_root("read-file");
+        fs::write(workspace.join("notes.txt"), "first line\nsecond line\n").unwrap();
+
+        let result = ReadFile.execute(
+            &context(&workspace),
+            ReadFileInput {
+                path: "notes.txt".to_owned(),
+            },
+        );
+
+        assert_eq!(serde_json::to_value(result).unwrap(), json!({
+            "status": "ok",
+            "path": "notes.txt",
+            "content": "first line\nsecond line\n"
+        }));
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn read_file_rejects_path_escapes_directories_large_files_and_non_utf8_content() {
+        let workspace = temp_root("read-file");
+        let sibling = temp_root("read-file-sibling");
+        fs::create_dir_all(workspace.join("folder")).unwrap();
+        fs::write(workspace.join("large.txt"), vec![b'x'; 50 * 1024 + 1]).unwrap();
+        fs::write(workspace.join("binary.dat"), [0xff]).unwrap();
+
+        for (path, reason) in [
+            (sibling.to_string_lossy().into_owned(), "invalid_path"),
+            ("../read-file-sibling".to_owned(), "path_not_allowed"),
+            ("folder".to_owned(), "not_file"),
+            ("large.txt".to_owned(), "file_too_large"),
+            ("binary.dat".to_owned(), "not_text"),
+        ] {
+            let value = serde_json::to_value(ReadFile.execute(
+                &context(&workspace),
+                ReadFileInput { path: path.clone() },
+            ))
+            .unwrap();
+            assert_eq!(value["status"], "error");
+            assert_eq!(value["reason"], reason);
+            assert_eq!(value["path"], path);
+        }
+        fs::remove_dir_all(workspace).unwrap();
+        fs::remove_dir_all(sibling).unwrap();
+    }
+
+    #[test]
+    fn dispatch_reads_file_contents_from_the_trusted_workspace() {
+        let workspace = temp_root("read-file-dispatch");
+        fs::write(workspace.join("notes.txt"), "dispatch contents\n").unwrap();
+
+        let result = dispatch(
+            &context(&workspace),
+            RovenToolCall {
+                id: "call_read_file".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: json!({ "path": "notes.txt" }),
+            },
+        );
+
+        assert_eq!(
+            result.result,
+            json!({
+                "status": "ok",
+                "path": "notes.txt",
+                "content": "dispatch contents\n"
+            })
+        );
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn read_file_input_rejects_extra_fields() {
+        assert!(
+            serde_json::from_value::<ReadFileInput>(json!({
+                "path": "notes.txt",
                 "recursive": true
             }))
             .is_err()
