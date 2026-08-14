@@ -599,7 +599,7 @@ fn is_github_url(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        fs, io,
         path::{Path, PathBuf},
         process::{Command, Stdio},
     };
@@ -1156,11 +1156,38 @@ mod tests {
             },
         );
 
-        assert_eq!(serde_json::to_value(result).unwrap(), json!({
-            "status": "ok",
-            "path": "notes.txt",
-            "content": "first line\nsecond line\n"
-        }));
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            json!({
+                "status": "ok",
+                "path": "notes.txt",
+                "content": "first line\nsecond line\n"
+            })
+        );
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn read_file_accepts_a_file_exactly_at_the_fifty_kibibyte_limit() {
+        let workspace = temp_root("read-file-limit");
+        let content = "x".repeat(50 * 1024);
+        fs::write(workspace.join("limit.txt"), &content).unwrap();
+
+        let result = ReadFile.execute(
+            &context(&workspace),
+            ReadFileInput {
+                path: "limit.txt".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            json!({
+                "status": "ok",
+                "path": "limit.txt",
+                "content": content
+            })
+        );
         fs::remove_dir_all(workspace).unwrap();
     }
 
@@ -1179,10 +1206,9 @@ mod tests {
             ("large.txt".to_owned(), "file_too_large"),
             ("binary.dat".to_owned(), "not_text"),
         ] {
-            let value = serde_json::to_value(ReadFile.execute(
-                &context(&workspace),
-                ReadFileInput { path: path.clone() },
-            ))
+            let value = serde_json::to_value(
+                ReadFile.execute(&context(&workspace), ReadFileInput { path: path.clone() }),
+            )
             .unwrap();
             assert_eq!(value["status"], "error");
             assert_eq!(value["reason"], reason);
@@ -1225,6 +1251,18 @@ mod tests {
                 "recursive": true
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn read_file_io_reason_classifies_permission_and_other_errors() {
+        assert_eq!(
+            super::read_file_io_reason(&io::Error::from(io::ErrorKind::PermissionDenied)),
+            super::ReadFileErrorReason::PermissionDenied
+        );
+        assert_eq!(
+            super::read_file_io_reason(&io::Error::from(io::ErrorKind::Other)),
+            super::ReadFileErrorReason::IoError
         );
     }
 
@@ -1309,6 +1347,41 @@ mod tests {
                 .iter()
                 .any(|entry| { entry["name"] == "internal-link" && entry["kind"] == "symlink" })
         );
+        fs::remove_dir_all(workspace).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_file_blocks_symlink_escapes() {
+        use std::os::windows::fs::symlink_file;
+
+        let workspace = temp_root("read-file-workspace");
+        let outside = temp_root("read-file-outside");
+        let outside_file = outside.join("outside.txt");
+        let outside_link = workspace.join("outside-link.txt");
+        fs::write(&outside_file, "outside").unwrap();
+        match symlink_file(&outside_file, &outside_link) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                fs::remove_dir_all(workspace).unwrap();
+                fs::remove_dir_all(outside).unwrap();
+                return;
+            }
+            Err(error) => panic!("symlink setup failed: {error}"),
+        }
+
+        let value = serde_json::to_value(ReadFile.execute(
+            &context(&workspace),
+            ReadFileInput {
+                path: "outside-link.txt".to_owned(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["reason"], "path_not_allowed");
+        assert_eq!(value["path"], "outside-link.txt");
+
         fs::remove_dir_all(workspace).unwrap();
         fs::remove_dir_all(outside).unwrap();
     }
