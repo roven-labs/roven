@@ -70,6 +70,7 @@ pub(crate) struct AppState {
     pub(crate) trust_yes_selected: bool,
     pub(crate) running: bool,
     pub(crate) status: Option<String>,
+    pub(crate) provider_model: Option<String>,
     generation_start_index: usize,
     generation_started_at: Option<Instant>,
     pub(crate) resume_entries: Option<Vec<ResumeEntry>>,
@@ -89,19 +90,19 @@ impl AppState {
     }
 
     pub(crate) fn insert_char(&mut self, character: char) {
-        if !self.running && self.resume_entries.is_none() {
+        if self.resume_entries.is_none() {
             self.input.push(character);
         }
     }
 
     pub(crate) fn backspace(&mut self) {
-        if !self.running && self.resume_entries.is_none() {
+        if self.resume_entries.is_none() {
             self.input.pop();
         }
     }
 
     pub(crate) fn insert_newline(&mut self) {
-        if !self.running && self.resume_entries.is_none() {
+        if self.resume_entries.is_none() {
             self.input.push('\n');
         }
     }
@@ -177,6 +178,10 @@ impl AppState {
             .push(Message::text(Role::Activity, message.into(), None));
     }
 
+    pub(crate) fn tool(&mut self, name: String, input: Value, output: Value) {
+        self.messages.push(Message::tool(name, input, output));
+    }
+
     pub(crate) fn open_resume(&mut self, entries: Vec<ResumeEntry>) {
         self.resume_entries = Some(entries);
         self.resume_index = 0;
@@ -197,6 +202,35 @@ impl AppState {
         self.messages = messages;
         self.scroll_offset = 0;
         self.close_resume();
+    }
+
+    pub(crate) fn context_usage_percent(&self) -> usize {
+        const MAX_CONTEXT_TOKENS: usize = 262_144;
+        let characters = self
+            .messages
+            .iter()
+            .map(|message| {
+                let tool_characters = match &message.kind {
+                    MessageKind::Text => 0,
+                    MessageKind::Tool {
+                        name,
+                        input,
+                        output,
+                    } => {
+                        name.chars().count()
+                            + serde_json::to_string(input).map_or(0, |value| value.chars().count())
+                            + serde_json::to_string(output).map_or(0, |value| value.chars().count())
+                    }
+                };
+                message.content.chars().count() + tool_characters
+            })
+            .sum::<usize>();
+        let estimated_tokens = characters.saturating_add(3) / 4;
+        estimated_tokens
+            .saturating_mul(100)
+            .checked_div(MAX_CONTEXT_TOKENS)
+            .unwrap_or(0)
+            .min(100)
     }
 
     pub(crate) fn generated_messages(&self) -> &[Message] {
@@ -255,7 +289,7 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, Role};
+    use super::{AppState, MessageKind, Role};
 
     #[test]
     fn submit_appends_only_the_user_turn_until_the_worker_replies() {
@@ -291,6 +325,19 @@ mod tests {
     }
 
     #[test]
+    fn streamed_text_deltas_accumulate_into_one_visible_model_message() {
+        let mut state = AppState::new();
+        state.start_agent();
+
+        state.append_agent_text("Here is ".to_owned());
+        state.append_agent_text("the answer.".to_owned());
+
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].role, Role::Roven);
+        assert_eq!(state.messages[0].content, "Here is the answer.");
+    }
+
+    #[test]
     fn whitespace_only_input_does_not_create_turns() {
         let mut state = AppState::new();
         state.insert_char(' ');
@@ -312,6 +359,28 @@ mod tests {
     }
 
     #[test]
+    fn running_agent_keeps_draft_editable_but_blocks_submission_until_finished() {
+        let mut state = AppState::new();
+        state.start_agent();
+
+        state.insert_char('d');
+        state.insert_char('r');
+        state.insert_char('a');
+        state.insert_char('f');
+        state.insert_char('t');
+        state.insert_newline();
+        state.insert_char('2');
+        state.backspace();
+
+        assert_eq!(state.input, "draft\n");
+        assert!(!state.submit());
+
+        state.finish_agent();
+        assert!(state.submit());
+        assert_eq!(state.messages[0].content, "draft\n");
+    }
+
+    #[test]
     fn scrolling_clamps_at_both_transcript_bounds() {
         let mut state = AppState::new();
         state.scroll_up(5);
@@ -319,5 +388,30 @@ mod tests {
 
         state.scroll_down(5);
         assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn tool_appends_structured_tool_messages_for_live_calls() {
+        let mut state = AppState::new();
+        state.tool(
+            "list_directory".to_owned(),
+            serde_json::json!({"path": "."}),
+            serde_json::json!({"status": "ok"}),
+        );
+
+        assert_eq!(state.messages.len(), 1);
+        let message = &state.messages[0];
+        assert_eq!(message.role, Role::Activity);
+        assert!(message.content.is_empty());
+        assert!(matches!(
+            message.kind,
+            MessageKind::Tool {
+                ref name,
+                ref input,
+                ref output,
+            } if name == "list_directory"
+                && input["path"] == "."
+                && output["status"] == "ok"
+        ));
     }
 }

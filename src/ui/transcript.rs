@@ -486,9 +486,11 @@ fn render_table(
             widths[index] = widths[index].max(cell.width());
         }
     }
-    let first_prefix_width = first_prefix.width();
+    let first_available = width.saturating_sub(first_prefix.width());
+    let continuation_available = width.saturating_sub(continuation_prefix.width());
+    let minimum_available = first_available.min(continuation_available);
     let total = widths.iter().sum::<usize>() + columns.saturating_mul(3).saturating_sub(1);
-    if total > width.saturating_sub(first_prefix_width) {
+    if total > minimum_available {
         return rows
             .into_iter()
             .enumerate()
@@ -585,11 +587,12 @@ fn wrap_inline(
     continuation_prefix: &str,
     prefix_style: Style,
 ) -> Vec<Line<'static>> {
-    let prefix_width = first_prefix.width();
-    let available = width.saturating_sub(prefix_width).max(1);
+    let first_available = available_width(width, first_prefix);
+    let continuation_available = available_width(width, continuation_prefix);
     let mut lines = Vec::new();
     let mut current = Vec::<InlineText>::new();
     let mut current_width = 0usize;
+    let mut current_available = first_available;
 
     for span in spans {
         for part in span.text.split_inclusive('\n') {
@@ -597,7 +600,7 @@ fn wrap_inline(
             let text = part.trim_end_matches('\n');
             for word in text.split_inclusive(char::is_whitespace) {
                 let word_width = word.width();
-                if current_width > 0 && current_width + word_width > available {
+                if current_width > 0 && current_width + word_width > current_available {
                     let line_prefix = if lines.is_empty() {
                         first_prefix
                     } else {
@@ -610,6 +613,7 @@ fn wrap_inline(
                         style,
                     ));
                     current_width = 0;
+                    current_available = continuation_available;
                 }
                 if !word.is_empty() {
                     current.push(InlineText {
@@ -632,6 +636,7 @@ fn wrap_inline(
                     style,
                 ));
                 current_width = 0;
+                current_available = continuation_available;
             }
         }
     }
@@ -645,6 +650,10 @@ fn wrap_inline(
         lines.push(line_from_inline(current, line_prefix, style));
     }
     lines
+}
+
+fn available_width(width: usize, prefix: &str) -> usize {
+    width.saturating_sub(prefix.width()).max(1)
 }
 
 fn line_from_inline(
@@ -714,10 +723,17 @@ fn tool_detail_lines(input: &Value, output: &Value) -> Vec<String> {
     }
 
     if let Some(entries) = output.get("entries").and_then(Value::as_array) {
+        let entry_count = entries.len();
         details.push(format!(
             "Entries: {}",
-            count_label(entries.len(), "item", "items")
+            count_label(entry_count, "item", "items")
         ));
+        if output.get("truncated").and_then(Value::as_bool) == Some(true) {
+            details.push(format!(
+                "Details: Truncated after {}",
+                count_label(entry_count, "item", "items")
+            ));
+        }
     }
 
     if let Some(content) = output.get("content").and_then(Value::as_str) {
@@ -744,10 +760,6 @@ fn tool_detail_lines(input: &Value, output: &Value) -> Vec<String> {
                 details.push(format!("Path: {path}"));
             }
         }
-    }
-
-    if output.get("truncated").and_then(Value::as_bool) == Some(true) {
-        details.push("Details: Showing the first 100 entries".to_owned());
     }
 
     details
@@ -823,6 +835,15 @@ mod tests {
         assert_eq!(roven_lines[1].to_string(), "┆       second line");
         assert_eq!(activity_lines[0].to_string(), "Activity agent working");
         assert!(activity_lines[1].to_string().ends_with("still working"));
+    }
+
+    #[test]
+    fn wrapped_model_lines_stay_within_requested_width() {
+        let width = 14;
+        let lines = render_message(&text(Role::Roven, "one two three four five"), width);
+
+        assert!(lines.len() > 2);
+        assert!(lines.iter().all(|line| line.to_string().width() <= width));
     }
 
     #[test]
@@ -947,7 +968,7 @@ mod tests {
                 "entries": [
                     {"name": "src", "path": "src", "kind": "directory"}
                 ],
-                "truncated": false
+                "truncated": true
             }),
         );
         let lines = render_message(&message, 60);
@@ -969,6 +990,11 @@ mod tests {
                 .iter()
                 .any(|line| line.to_string().contains("Entries: 1 item"))
         );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("Details: Truncated after 1 item"))
+        );
         assert!(lines.iter().all(|line| line.to_string().width() <= 60));
         assert!(!lines.iter().any(|line| line.to_string().contains("Roven")));
         assert!(!lines.iter().any(|line| line.to_string().contains("◆")));
@@ -986,6 +1012,17 @@ mod tests {
         );
         assert!(lines.iter().any(|line| line.to_string().starts_with("└")));
         assert!(lines.last().is_some_and(|line| line.spans.is_empty()));
+    }
+
+    #[test]
+    fn model_table_lines_stay_within_requested_width() {
+        let width = 14;
+        let lines = render_message(
+            &text(Role::Roven, "| A | B |\n| --- | --- |\n| wide | row |"),
+            width,
+        );
+
+        assert!(lines.iter().all(|line| line.to_string().width() <= width));
     }
 
     #[test]

@@ -49,7 +49,7 @@ enum WorkerEvent {
     Error(String),
 }
 
-const TOOL_USE_POLICY: &str = r#"Treat every request as read-only unless the user explicitly asks to prepare, register, add, modify, delete, or configure something. Call `prepare_project` only when the user explicitly asks to prepare, register, or add a project; never call it merely because a trusted workspace is available. For an explicit prepare/register/add request about the current trusted workspace, use `prepare_project` with {"path":"."}. When the user asks which Roven tools or capabilities are available, call `list_tools` with {} and rely on its returned names, descriptions, and input schemas. When the user asks for the current workspace path, call `list_directory` with {"path":"."} and report its `workspace_path` value verbatim; never report `.` as the human-facing path. When the user asks about a file's contents, call `list_directory` to locate it, then call `read_file` with a workspace-relative path. Rely on the returned content and never claim that a file was read without a tool result."#;
+const TOOL_USE_POLICY: &str = r#"Treat every request as read-only unless the user explicitly asks to prepare, register, add, modify, delete, or configure something. Call `prepare_project` only when the user explicitly asks to prepare, register, or add a project; never call it merely because a trusted workspace is available. For an explicit prepare/register/add request about the current trusted workspace, use `prepare_project` with {"path":"."}. When the user asks which Roven tools or capabilities are available, call `list_tools` with {} and rely on its returned names, descriptions, and input schemas. When the user asks for the current workspace path, call `list_directory` with {"path":"."} and report its `workspace_path` value verbatim; never report `.` as the human-facing path. When the user asks about a file's contents, call `list_directory` to locate it, then call `read_file` with a non-empty workspace-relative path. `list_directory` lists only immediate entries and may return `truncated: true`; use returned entry paths as the next tool input. If a filesystem tool returns an error, correct the path from its reason and do not retry the unchanged request. Rely on the returned content and never claim that a file was read without a tool result."#;
 
 pub(crate) fn run(runtime_log: Option<RuntimeLog>) -> anyhow::Result<()> {
     log_event(runtime_log.as_ref(), "terminal_starting", "outcome=started");
@@ -143,6 +143,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                         );
                     })?;
                     tool_context = Some(context);
+                    refresh_provider_model(&mut state);
                     state.trusted = true;
                     log_event(runtime_log, "workspace_trusted", "outcome=granted");
                 }
@@ -188,18 +189,50 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
             continue;
         }
         if state.running {
-            if matches!(
-                event,
+            match event {
                 Event::Key(KeyEvent {
-                    code: KeyCode::Esc,
+                    code: KeyCode::Esc, ..
+                }) => {
+                    if let Some(flag) = &cancellation {
+                        flag.store(true, Ordering::Relaxed);
+                        log_event(runtime_log, "agent_cancellation_requested", "source=escape");
+                    }
+                    state.status = Some("Stopping agent...".to_owned());
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Enter,
+                    modifiers,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) if modifiers.contains(KeyModifiers::ALT) => state.insert_newline(),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Backspace,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) => state.backspace(),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char(character),
+                    modifiers,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) if !modifiers.contains(KeyModifiers::CONTROL) => state.insert_char(character),
+                Event::Key(KeyEvent {
+                    code: KeyCode::PageUp,
                     ..
                 })
-            ) {
-                if let Some(flag) = &cancellation {
-                    flag.store(true, Ordering::Relaxed);
-                    log_event(runtime_log, "agent_cancellation_requested", "source=escape");
-                }
-                state.status = Some("Stopping agent...".to_owned());
+                | Event::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    ..
+                }) => state.scroll_up(3),
+                Event::Key(KeyEvent {
+                    code: KeyCode::PageDown,
+                    ..
+                })
+                | Event::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    ..
+                }) => state.scroll_down(3),
+                _ => {}
             }
             continue;
         }
@@ -232,6 +265,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                     state.open_resume(entries);
                     log_event(runtime_log, "resume_picker_opened", "outcome=ok");
                 } else if state.submit() {
+                    refresh_provider_model(&mut state);
                     let user = state.last_user_message().unwrap_or_default().to_owned();
                     let project_store = store.as_ref().expect("trusted store");
                     if session.is_none() {
@@ -382,7 +416,7 @@ fn apply_worker_event(
         WorkerEvent::Text(text) => state.append_agent_text(text),
         WorkerEvent::FunctionCallOutput { call, result } => {
             persist_function_call_output(store, session, &call, &result);
-            state.activity(format!("{} completed", result.name));
+            state.tool(call.name, call.arguments, result.result);
         }
         WorkerEvent::Finished | WorkerEvent::Cancelled => {
             let stopped = matches!(event, WorkerEvent::Cancelled);
@@ -429,6 +463,13 @@ fn log_event(runtime_log: Option<&RuntimeLog>, event: &str, detail: &str) {
     if let Some(log) = runtime_log {
         log.record("terminal", event, detail);
     }
+}
+
+fn refresh_provider_model(state: &mut AppState) {
+    state.provider_model = ProviderProfiles::for_current_user()
+        .ok()
+        .and_then(|profiles| profiles.default_profile().ok().flatten())
+        .map(|profile| profile.model);
 }
 
 fn persist_function_call_output(
@@ -655,6 +696,7 @@ mod tests {
     };
 
     use super::{WorkerEvent, apply_worker_event};
+    use crate::tools::{RovenToolCall, RovenToolResult};
 
     fn temp_root(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("roven-{name}-{}", uuid::Uuid::now_v7()));
@@ -797,6 +839,44 @@ mod tests {
         ));
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn live_function_call_output_is_appended_as_a_structured_tool_message() {
+        let mut state = AppState::new();
+        let call = RovenToolCall {
+            id: "call-1".to_owned(),
+            name: "list_directory".to_owned(),
+            arguments: serde_json::json!({"path": "."}),
+        };
+        let result = RovenToolResult {
+            tool_call_id: "call-1".to_owned(),
+            name: "list_directory".to_owned(),
+            result: serde_json::json!({"status": "ok"}),
+        };
+
+        apply_worker_event(
+            &mut state,
+            None,
+            None,
+            None,
+            WorkerEvent::FunctionCallOutput { call, result },
+        );
+
+        assert_eq!(state.messages.len(), 1);
+        let message = &state.messages[0];
+        assert_eq!(message.role, Role::Activity);
+        assert!(message.content.is_empty());
+        assert!(matches!(
+            message.kind,
+            crate::ui::state::MessageKind::Tool {
+                ref name,
+                ref input,
+                ref output,
+            } if name == "list_directory"
+                && input["path"] == "."
+                && output["status"] == "ok"
+        ));
     }
 
     #[test]
