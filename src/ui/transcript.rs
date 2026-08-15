@@ -832,12 +832,16 @@ mod tests {
             40,
         );
 
-        assert!(lines
-            .iter()
-            .any(|line| line.to_string().contains("├── src/")));
-        assert!(lines
-            .iter()
-            .any(|line| line.to_string().contains("│   └── main.rs")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("├── src/"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("│   └── main.rs"))
+        );
     }
 
     #[test]
@@ -851,24 +855,32 @@ mod tests {
         );
 
         assert!(lines.iter().any(|line| line.to_string().contains("Files")));
-        assert!(!lines
-            .iter()
-            .any(|line| line.to_string().contains("# Files")));
-        assert!(lines
-            .iter()
-            .any(|line| line.to_string().contains("• backend")));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.to_string().contains("# Files"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("• backend"))
+        );
         assert!(lines.iter().any(|line| line.to_string().contains("ready")));
 
         let task_lines = render_message(
             &text(Role::Roven, "- [x] read project\n- [ ] prepare context"),
             60,
         );
-        assert!(task_lines
-            .iter()
-            .any(|line| line.to_string().contains("☒ read project")));
-        assert!(task_lines
-            .iter()
-            .any(|line| line.to_string().contains("☐ prepare context")));
+        assert!(
+            task_lines
+                .iter()
+                .any(|line| line.to_string().contains("☒ read project"))
+        );
+        assert!(
+            task_lines
+                .iter()
+                .any(|line| line.to_string().contains("☐ prepare context"))
+        );
     }
 
     #[test]
@@ -881,10 +893,12 @@ mod tests {
             28,
         );
         assert!(user_lines[0].to_string().starts_with("You › • "));
-        assert!(user_lines
-            .iter()
-            .skip(1)
-            .any(|line| line.to_string().starts_with("│       ")));
+        assert!(
+            user_lines
+                .iter()
+                .skip(1)
+                .any(|line| line.to_string().starts_with("│       "))
+        );
 
         let roven_task_lines = render_message(
             &text(
@@ -894,10 +908,12 @@ mod tests {
             28,
         );
         assert!(roven_task_lines[0].to_string().starts_with("│ • ☒ "));
-        assert!(roven_task_lines
-            .iter()
-            .skip(1)
-            .any(|line| line.to_string().starts_with("┆         ")));
+        assert!(
+            roven_task_lines
+                .iter()
+                .skip(1)
+                .any(|line| line.to_string().starts_with("┆         "))
+        );
 
         let roven_quote_lines = render_message(
             &text(
@@ -906,13 +922,17 @@ mod tests {
             ),
             28,
         );
-        assert!(roven_quote_lines
-            .iter()
-            .any(|line| line.to_string().starts_with("│ │ ")));
-        assert!(roven_quote_lines
-            .iter()
-            .skip(1)
-            .any(|line| line.to_string().starts_with("┆         ")));
+        assert!(
+            roven_quote_lines
+                .iter()
+                .any(|line| line.to_string().starts_with("│ │ "))
+        );
+        assert!(
+            roven_quote_lines
+                .iter()
+                .skip(1)
+                .any(|line| line.to_string().starts_with("┆         "))
+        );
     }
 
     #[test]
@@ -934,26 +954,36 @@ mod tests {
 
         assert!(lines[0].to_string().starts_with("┌"));
         assert!(lines[1].to_string().starts_with("│ List Directory"));
-        assert!(lines
-            .iter()
-            .any(|line| line.to_string().contains("Status: Ok")));
-        assert!(lines
-            .iter()
-            .any(|line| line.to_string().contains("Path: .")));
-        assert!(lines
-            .iter()
-            .any(|line| line.to_string().contains("Entries: 1 item")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("Status: Ok"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("Path: ."))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("Entries: 1 item"))
+        );
         assert!(lines.iter().all(|line| line.to_string().width() <= 60));
         assert!(!lines.iter().any(|line| line.to_string().contains("Roven")));
         assert!(!lines.iter().any(|line| line.to_string().contains("◆")));
         assert!(!lines.iter().any(|line| line.to_string().contains("input")));
         assert!(!lines.iter().any(|line| line.to_string().contains("output")));
-        assert!(!lines
-            .iter()
-            .any(|line| line.to_string().contains("list_directory")));
-        assert!(!lines
-            .iter()
-            .any(|line| line.to_string().contains("\"name\"")));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.to_string().contains("list_directory"))
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.to_string().contains("\"name\""))
+        );
         assert!(lines.iter().any(|line| line.to_string().starts_with("└")));
         assert!(lines.last().is_some_and(|line| line.spans.is_empty()));
     }
@@ -984,18 +1014,24 @@ mod tests {
         );
 
         assert!(lines[0].to_string().starts_with("│ First paragraph."));
-        assert!(!lines
-            .iter()
-            .skip(1)
-            .any(|line| line.to_string().starts_with("│ ")));
-        assert!(lines
-            .iter()
-            .skip(1)
-            .any(|line| line.to_string().starts_with("┆       • later item")));
-        assert!(lines
-            .iter()
-            .skip(1)
-            .any(|line| line.to_string().starts_with("┆") && line.to_string().contains("A")));
+        assert!(
+            !lines
+                .iter()
+                .skip(1)
+                .any(|line| line.to_string().starts_with("│ "))
+        );
+        assert!(
+            lines
+                .iter()
+                .skip(1)
+                .any(|line| line.to_string().starts_with("┆       • later item"))
+        );
+        assert!(
+            lines
+                .iter()
+                .skip(1)
+                .any(|line| line.to_string().starts_with("┆") && line.to_string().contains("A"))
+        );
     }
 
     #[test]
@@ -1019,12 +1055,16 @@ mod tests {
             assert!(!rendered.contains("Roven"));
             assert!(!rendered.contains("◆"));
         }
-        assert!(tool_lines
-            .iter()
-            .any(|line| line.to_string().contains("Content: 2 lines, 22 chars")));
-        assert!(!tool_lines
-            .iter()
-            .any(|line| line.to_string().contains("top secret")));
+        assert!(
+            tool_lines
+                .iter()
+                .any(|line| line.to_string().contains("Content: 2 lines, 22 chars"))
+        );
+        assert!(
+            !tool_lines
+                .iter()
+                .any(|line| line.to_string().contains("top secret"))
+        );
     }
 
     #[test]
@@ -1056,9 +1096,11 @@ mod tests {
             ),
             48,
         );
-        assert!(fallback_lines[1]
-            .to_string()
-            .contains("Completed requested action"));
+        assert!(
+            fallback_lines[1]
+                .to_string()
+                .contains("Completed requested action")
+        );
     }
 
     #[test]
@@ -1079,15 +1121,21 @@ mod tests {
             ),
             64,
         );
-        assert!(prepared_lines
-            .iter()
-            .any(|line| line.to_string().contains("Status: Prepared")));
-        assert!(prepared_lines
-            .iter()
-            .any(|line| line.to_string().contains("Project: pmemc")));
-        assert!(prepared_lines
-            .iter()
-            .any(|line| line.to_string().contains("Path: workspace")));
+        assert!(
+            prepared_lines
+                .iter()
+                .any(|line| line.to_string().contains("Status: Prepared"))
+        );
+        assert!(
+            prepared_lines
+                .iter()
+                .any(|line| line.to_string().contains("Project: pmemc"))
+        );
+        assert!(
+            prepared_lines
+                .iter()
+                .any(|line| line.to_string().contains("Path: workspace"))
+        );
 
         let unknown_lines = render_message(
             &Message::tool(
@@ -1097,15 +1145,21 @@ mod tests {
             ),
             64,
         );
-        assert!(unknown_lines
-            .iter()
-            .any(|line| line.to_string().contains("Status: Error")));
-        assert!(unknown_lines
-            .iter()
-            .any(|line| line.to_string().contains("Reason: unknown tool")));
-        assert!(unknown_lines
-            .iter()
-            .any(|line| line.to_string().contains("Custom Tool")));
+        assert!(
+            unknown_lines
+                .iter()
+                .any(|line| line.to_string().contains("Status: Error"))
+        );
+        assert!(
+            unknown_lines
+                .iter()
+                .any(|line| line.to_string().contains("Reason: unknown tool"))
+        );
+        assert!(
+            unknown_lines
+                .iter()
+                .any(|line| line.to_string().contains("Custom Tool"))
+        );
     }
 
     #[test]
