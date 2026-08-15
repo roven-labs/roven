@@ -1,7 +1,8 @@
 //! Roven-owned tool definitions, dispatch, and deterministic tool execution.
 
 use std::{
-    fs, io,
+    fs,
+    io::{self, Read},
     path::{Component, Path, PathBuf},
     process::Command,
 };
@@ -221,7 +222,14 @@ impl ReadFile {
             Err(reason) => return ReadFileResult::error(reason, input.path),
         };
         let path = workspace_relative_path(&context.trusted_workspace, &target);
-        let metadata = match fs::metadata(&target) {
+        let mut file = match fs::File::open(&target) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied && target.is_dir() => {
+                return ReadFileResult::error(ReadFileErrorReason::NotFile, path);
+            }
+            Err(error) => return ReadFileResult::error(read_file_io_reason(&error), path),
+        };
+        let metadata = match file.metadata() {
             Ok(metadata) => metadata,
             Err(error) => return ReadFileResult::error(read_file_io_reason(&error), path),
         };
@@ -231,14 +239,22 @@ impl ReadFile {
         if metadata.len() > READ_FILE_SIZE_LIMIT {
             return ReadFileResult::error(ReadFileErrorReason::FileTooLarge, path);
         }
-        match fs::read_to_string(&target) {
+        match read_file_contents(&mut file) {
             Ok(content) => ReadFileResult::Ok { path, content },
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                ReadFileResult::error(ReadFileErrorReason::NotText, path)
-            }
-            Err(error) => ReadFileResult::error(read_file_io_reason(&error), path),
+            Err(reason) => ReadFileResult::error(reason, path),
         }
     }
+}
+
+fn read_file_contents(file: &mut fs::File) -> Result<String, ReadFileErrorReason> {
+    let mut bytes = Vec::new();
+    file.take(READ_FILE_SIZE_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| read_file_io_reason(&error))?;
+    if bytes.len() > READ_FILE_SIZE_LIMIT as usize {
+        return Err(ReadFileErrorReason::FileTooLarge);
+    }
+    String::from_utf8(bytes).map_err(|_| ReadFileErrorReason::NotText)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1321,6 +1337,27 @@ mod tests {
                 "path": "limit.txt",
                 "content": content
             })
+        );
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn read_file_caps_an_open_file_that_grows_after_metadata_is_observed() {
+        use std::io::Write;
+
+        let workspace = temp_root("read-file-growth");
+        let path = workspace.join("notes.txt");
+        fs::write(&path, "small").unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 5);
+
+        let mut appender = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        appender.write_all(&vec![b'x'; 50 * 1024]).unwrap();
+        drop(appender);
+
+        assert_eq!(
+            super::read_file_contents(&mut file),
+            Err(super::ReadFileErrorReason::FileTooLarge)
         );
         fs::remove_dir_all(workspace).unwrap();
     }
