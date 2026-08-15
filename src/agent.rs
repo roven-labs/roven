@@ -284,6 +284,50 @@ mod tests {
     }
 
     #[test]
+    fn read_file_tool_calls_round_trip_through_the_real_provider() {
+        let (endpoint, server) = test_support::serve(vec![
+            test_support::sse(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_read_file","function":{"name":"read_file","arguments":"{\"path\":\"Cargo.toml\"}"}}]},"finish_reason":"tool_calls"}]}
+
+"#,
+            ),
+            test_support::sse(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"file read\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let provider = OpenAiCompatibleProvider::new(endpoint, "test-model".to_owned());
+        let events = RefCell::new(Vec::new());
+
+        run(
+            &provider,
+            "key",
+            vec![AgentMessage::User {
+                content: "read Cargo.toml".to_owned(),
+            }],
+            &ToolContext::new(workspace()).unwrap(),
+            &AtomicBool::new(false),
+            None,
+            &mut |event| events.borrow_mut().push(event),
+        )
+        .unwrap();
+
+        assert!(events.borrow().iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { result, .. }
+                if result.result["status"] == "ok"
+                    && result.result["path"] == "Cargo.toml"
+                    && result.result["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("[package]"))
+        )));
+        assert!(matches!(events.borrow().last(), Some(AgentEvent::Finished)));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("\"tool_call_id\":\"call_read_file\""));
+        assert!(requests[1].contains("\\\"status\\\":\\\"ok\\\""));
+    }
+
+    #[test]
     fn provider_failures_are_logged_and_cancellation_is_reported() {
         let (endpoint, server) = test_support::serve(vec![test_support::response(
             "500 Internal Server Error",

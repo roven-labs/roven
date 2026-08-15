@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use crate::storage::{ProjectRegistration, ProjectRegistry, RegistrationLookup};
 
 pub(crate) const PREPARE_PROJECT_DESCRIPTION: &str = "Validate and register the currently trusted project for first-time use with Roven. Use this when the user asks to add/register the current project for future project understanding, resume generation, or portfolio updates. Pass `.` as the path for the current trusted workspace. The tool validates the project path, existing Roven registration, Git repository, GitHub remote, committed baseline, and clean working state, then stores the minimal project registration. It does not inspect source code or initialize code-intelligence systems.";
-pub(crate) const LIST_DIRECTORY_DESCRIPTION: &str = "List the immediate contents of a directory inside the currently trusted Roven workspace. Use this to inspect the workspace structure and locate files or subdirectories before choosing another filesystem tool. Paths are relative to the trusted workspace; use `.` for the workspace root. This tool does not read file contents, search recursively, modify files, register projects, or access paths outside the trusted workspace.";
-pub(crate) const READ_FILE_DESCRIPTION: &str = "Read a known workspace-relative text file after locating it with `list_directory`. Paths are relative to the trusted workspace. This tool reads only regular UTF-8 text files up to 50 KiB and does not modify files or access paths outside the trusted workspace.";
+pub(crate) const LIST_DIRECTORY_DESCRIPTION: &str = "List the immediate contents of a directory inside the currently trusted Roven workspace. Use this to locate a file or subdirectory before choosing another filesystem tool. Pass a workspace-relative path such as `.` or `src`; do not pass an absolute path or `..`. The result is `{status: \"ok\", path, workspace_path, entries, truncated}` with at most 100 immediate entries. If `truncated` is true, do not assume an unlisted entry is absent. Errors are `invalid_path`, `path_not_allowed`, `not_directory`, `permission_denied`, or `io_error`; correct the path before retrying. This tool does not read file contents, recurse, modify files, register projects, or access paths outside the trusted workspace.";
+pub(crate) const READ_FILE_DESCRIPTION: &str = "Read a known workspace-relative text file after locating it with `list_directory`. Pass one field such as `{\"path\":\"src/main.rs\"}`; do not pass an absolute path, `..`, or an empty path. The result is `{status: \"ok\", path, content}` or `{status: \"error\", reason, path}`. It reads only regular UTF-8 text files up to 50 KiB and does not modify files or access paths outside the trusted workspace. Errors are `invalid_path`, `path_not_allowed`, `not_file`, `file_too_large`, `not_text`, `permission_denied`, or `io_error`; use the reason to correct the request and do not claim success without an `ok` result.";
 pub(crate) const LIST_TOOLS_DESCRIPTION: &str = "List the Roven tools available to you in this turn, with their exact descriptions and input schemas. Use this when you need to check which Roven capabilities are currently available before selecting a tool. This reports the live Roven tool registry and does not access the workspace or modify anything.";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -49,7 +49,7 @@ pub(crate) fn definitions() -> Vec<RovenToolDefinition> {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative directory path; use `.` for the workspace root."
+                        "description": "Workspace-relative directory path, such as `.` or `src`; absolute paths and `..` are invalid."
                     }
                 },
                 "required": ["path"],
@@ -64,7 +64,7 @@ pub(crate) fn definitions() -> Vec<RovenToolDefinition> {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative text file path."
+                        "description": "Workspace-relative regular UTF-8 text file path, such as `src/main.rs`; absolute paths, `..`, and empty paths are invalid."
                     }
                 },
                 "required": ["path"],
@@ -520,6 +520,9 @@ fn resolve_workspace_file(
     context: &ToolContext,
     path: &str,
 ) -> Result<PathBuf, ReadFileErrorReason> {
+    if path.is_empty() {
+        return Err(ReadFileErrorReason::InvalidPath);
+    }
     let relative = Path::new(path);
     if relative
         .components()
@@ -1434,6 +1437,31 @@ mod tests {
     }
 
     #[test]
+    fn read_file_rejects_empty_and_colon_containing_paths() {
+        let workspace = temp_root("read-file-paths");
+
+        for path in ["", "notes:name.txt"] {
+            let value = serde_json::to_value(ReadFile.execute(
+                &context(&workspace),
+                ReadFileInput {
+                    path: path.to_owned(),
+                },
+            ))
+            .unwrap();
+            assert_eq!(
+                value,
+                json!({
+                    "status": "error",
+                    "reason": "invalid_path",
+                    "path": path
+                })
+            );
+        }
+
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
     fn read_file_accepts_a_file_exactly_at_the_fifty_kibibyte_limit() {
         let workspace = temp_root("read-file-limit");
         let content = "x".repeat(50 * 1024);
@@ -1542,6 +1570,62 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_rejects_malformed_read_file_input() {
+        let workspace = temp_root("read-file-invalid-input");
+
+        for arguments in [
+            json!({}),
+            json!({ "path": 42 }),
+            json!({
+                "path": "notes.txt",
+                "recursive": true
+            }),
+        ] {
+            let result = dispatch(
+                &context(&workspace),
+                RovenToolCall {
+                    id: "call_invalid_read_file".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments,
+                },
+            );
+            assert_eq!(
+                result.result,
+                json!({
+                    "status": "error",
+                    "reason": "invalid_path",
+                    "path": ""
+                })
+            );
+        }
+
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn dispatch_rejects_malformed_list_directory_input() {
+        let workspace = temp_root("list-directory-invalid-input");
+        let result = dispatch(
+            &context(&workspace),
+            RovenToolCall {
+                id: "call_invalid_list_directory".to_owned(),
+                name: "list_directory".to_owned(),
+                arguments: json!({ "path": 42 }),
+            },
+        );
+
+        assert_eq!(
+            result.result,
+            json!({
+                "status": "error",
+                "reason": "invalid_path",
+                "path": ""
+            })
+        );
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
     fn read_file_io_reason_classifies_permission_and_other_errors() {
         assert_eq!(
             super::read_file_io_reason(&io::Error::from(io::ErrorKind::PermissionDenied)),
@@ -1575,6 +1659,23 @@ mod tests {
                 "tools": expected,
             })
         );
+        let tools = result.result["tools"].as_array().unwrap();
+        let list_directory = tools
+            .iter()
+            .find(|tool| tool["name"] == "list_directory")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap();
+        assert!(list_directory.contains("truncated"));
+        assert!(list_directory.contains("not_directory"));
+        let read_file = tools
+            .iter()
+            .find(|tool| tool["name"] == "read_file")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap();
+        assert!(read_file.contains("file_too_large"));
+        assert!(read_file.contains("status: \"ok\""));
         let invalid = dispatch(
             &trusted,
             RovenToolCall {

@@ -25,8 +25,10 @@ Input:
 { "path": "." }
 ```
 
-The path is workspace-relative. Absolute paths and `..` traversal are rejected.
-Results are capped at 100 entries and include:
+The path is workspace-relative. Use `.` for the workspace root. Absolute paths,
+`..` traversal, and paths that resolve outside the trusted workspace are
+rejected. Only immediate entries are returned; the tool does not recurse or
+read file contents. Results are capped at 100 entries and include:
 
 ```json
 {
@@ -40,14 +42,17 @@ Results are capped at 100 entries and include:
 }
 ```
 
-Possible errors include `invalid_path`, `path_not_allowed`, `not_directory`,
-`permission_denied`, and `io_error`.
+When `truncated` is `true`, the result contains only the first 100 entries; do
+not treat an unlisted entry as absent. Possible errors include `invalid_path`,
+`path_not_allowed`, `not_directory`, `permission_denied`, and `io_error`.
+Correct the path from the returned reason before retrying.
 
 ## `read_file`
 
-Reads a known workspace-relative file after it has been located with
-`list_directory`. It reads only regular UTF-8 text files at most 50 KiB inside
-the trusted workspace and does not modify files or access paths outside it.
+Reads a known, non-empty workspace-relative file path after it has been located
+with `list_directory`. It reads only regular UTF-8 text files at most 50 KiB
+inside the trusted workspace and does not modify files or access paths outside
+it. Absolute paths, `..`, and empty paths are invalid.
 
 Input:
 
@@ -62,7 +67,9 @@ Successful result:
 ```
 
 Possible errors include `invalid_path`, `path_not_allowed`, `not_file`,
-`file_too_large`, `not_text`, `permission_denied`, and `io_error`.
+`file_too_large`, `not_text`, `permission_denied`, and `io_error`. Use the
+returned reason to correct the request; do not claim the file was read unless
+the result has `status: "ok"`.
 
 ## `prepare_project`
 

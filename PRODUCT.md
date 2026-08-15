@@ -61,5 +61,6 @@ tool activity.
 - Filesystem-sensitive tools enforce their own Rust-side workspace boundary.
 - Roven does not edit files, execute arbitrary commands, recurse through a
   project, or expose API keys.
-- Roven does not currently provide a raw project file-reading tool, automatic
-  provider retries, or automatic context summarization.
+- Roven provides a read-only raw project file-reading tool for regular UTF-8
+  files up to 50 KiB inside the trusted workspace. It does not provide
+  automatic provider retries or automatic context summarization.
