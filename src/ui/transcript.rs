@@ -106,7 +106,7 @@ fn render_thought(raw: &str, duration_ms: Option<u64>, width: usize) -> Vec<Line
 
 fn render_tool(name: &str, input: &Value, output: &Value, width: usize) -> Vec<Line<'static>> {
     let card = describe_tool(name, input, output);
-    let mut lines = Vec::with_capacity(card.len() + 2);
+    let mut lines = Vec::with_capacity(card.len() + 3);
     lines.push(Line::from(Span::styled(tool_box_top(width), TOOL_STYLE)));
     for content in card {
         lines.push(Line::from(Span::styled(
@@ -115,16 +115,16 @@ fn render_tool(name: &str, input: &Value, output: &Value, width: usize) -> Vec<L
         )));
     }
     lines.push(Line::from(Span::styled(tool_box_bottom(width), TOOL_STYLE)));
+    lines.push(Line::default());
     lines
 }
 
-fn friendly_tool_label(name: &str) -> &'static str {
-    match name {
-        "list_directory" => "Listed the project directory",
-        "read_file" => "Read a project file",
-        "prepare_project" => "Prepared the project",
-        "list_tools" => "Checked available tools",
-        _ => "Completed requested action",
+fn tool_title(name: &str) -> String {
+    let title = title_case_words(&humanize_identifier(name));
+    if title.is_empty() {
+        "Completed requested action".to_owned()
+    } else {
+        title
     }
 }
 
@@ -683,163 +683,82 @@ fn clip_to_width(value: &str, width: usize) -> String {
 }
 
 fn describe_tool(name: &str, input: &Value, output: &Value) -> Vec<String> {
-    let summary = friendly_tool_label(name).to_owned();
-    let (status, mut details) = match name {
-        "list_directory" => describe_list_directory(output),
-        "read_file" => describe_read_file(output),
-        "prepare_project" => describe_prepare_project(output),
-        "list_tools" => describe_list_tools(output),
-        _ => describe_unknown_tool(input, output),
-    };
-    let mut lines = vec![summary, format!("Status: {status}")];
-    lines.append(&mut details);
+    let mut lines = vec![tool_title(name), format!("Status: {}", tool_status(output))];
+    lines.extend(tool_detail_lines(input, output));
     lines
 }
 
-fn describe_list_directory(output: &Value) -> (String, Vec<String>) {
-    match output.get("status").and_then(Value::as_str) {
-        Some("ok") => {
-            let path = output.get("path").and_then(Value::as_str);
-            let entry_count = output
-                .get("entries")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len);
-            let truncated = output
-                .get("truncated")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let mut details = Vec::new();
-            if let Some(path) = path {
-                details.push(format!("Path: {path}"));
-            }
-            details.push(format!(
-                "Entries: {}",
-                count_label(entry_count, "item", "items")
-            ));
-            if truncated {
-                details.push("Details: Showing the first 100 entries".to_owned());
-            }
-            ("Success".to_owned(), details)
-        }
-        Some("error") => describe_error_tool(output),
-        Some(status) => (title_case_status(status), Vec::new()),
-        None => ("Completed".to_owned(), Vec::new()),
-    }
-}
-
-fn describe_read_file(output: &Value) -> (String, Vec<String>) {
-    match output.get("status").and_then(Value::as_str) {
-        Some("ok") => {
-            let mut details = Vec::new();
-            if let Some(path) = output.get("path").and_then(Value::as_str) {
-                details.push(format!("Path: {path}"));
-            }
-            if let Some(content) = output.get("content").and_then(Value::as_str) {
-                let line_count = content.lines().count().max(1);
-                details.push(format!(
-                    "Content: {}, {}",
-                    count_label(line_count, "line", "lines"),
-                    count_label(content.chars().count(), "char", "chars")
-                ));
-            }
-            ("Success".to_owned(), details)
-        }
-        Some("error") => describe_error_tool(output),
-        Some(status) => (title_case_status(status), Vec::new()),
-        None => ("Completed".to_owned(), Vec::new()),
-    }
-}
-
-fn describe_prepare_project(output: &Value) -> (String, Vec<String>) {
-    match output.get("status").and_then(Value::as_str) {
-        Some("prepared") | Some("already_added") => {
-            let project = output.get("project").and_then(Value::as_object);
-            let mut details = Vec::new();
-            if let Some(name) = project
-                .and_then(|project| project.get("name"))
-                .and_then(Value::as_str)
-            {
-                details.push(format!("Project: {name}"));
-            }
-            if let Some(path) = project
-                .and_then(|project| project.get("path"))
-                .and_then(Value::as_str)
-            {
-                details.push(format!("Path: {path}"));
-            }
-            (
-                title_case_status(
-                    output
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                ),
-                details,
-            )
-        }
-        Some("blocked") => describe_blocked_tool(output),
-        Some(status) => (title_case_status(status), Vec::new()),
-        None => ("Completed".to_owned(), Vec::new()),
-    }
-}
-
-fn describe_list_tools(output: &Value) -> (String, Vec<String>) {
-    match output.get("status").and_then(Value::as_str) {
-        Some("ok") => {
-            let tool_count = output
-                .get("tools")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len);
-            (
-                "Success".to_owned(),
-                vec![format!(
-                    "Available tools: {}",
-                    count_label(tool_count, "tool", "tools")
-                )],
-            )
-        }
-        Some("invalid_input") => ("Invalid input".to_owned(), Vec::new()),
-        Some(status) => (title_case_status(status), Vec::new()),
-        None => ("Completed".to_owned(), Vec::new()),
-    }
-}
-
-fn describe_unknown_tool(input: &Value, output: &Value) -> (String, Vec<String>) {
-    let status = output
+fn tool_status(output: &Value) -> String {
+    output
         .get("status")
         .and_then(Value::as_str)
-        .map(title_case_status)
-        .unwrap_or_else(|| "Completed".to_owned());
+        .map(title_case_words)
+        .unwrap_or_else(|| "Completed".to_owned())
+}
+
+fn tool_detail_lines(input: &Value, output: &Value) -> Vec<String> {
     let mut details = Vec::new();
+
     if let Some(reason) = output.get("reason").and_then(Value::as_str) {
-        details.push(format!("Reason: {}", humanize_snake_case(reason)));
-    } else if let Some(path) = output
+        details.push(format!("Reason: {}", humanize_identifier(reason)));
+    }
+
+    let mut saw_path = false;
+    if let Some(path) = output
         .get("path")
         .and_then(Value::as_str)
         .or_else(|| input.get("path").and_then(Value::as_str))
     {
         details.push(format!("Path: {path}"));
+        saw_path = true;
     }
-    (status, details)
+
+    if let Some(entries) = output.get("entries").and_then(Value::as_array) {
+        details.push(format!(
+            "Entries: {}",
+            count_label(entries.len(), "item", "items")
+        ));
+    }
+
+    if let Some(content) = output.get("content").and_then(Value::as_str) {
+        details.push(format!(
+            "Content: {}, {}",
+            count_label(line_count(content), "line", "lines"),
+            count_label(content.chars().count(), "char", "chars")
+        ));
+    }
+
+    if let Some(tools) = output.get("tools").and_then(Value::as_array) {
+        details.push(format!(
+            "Tools: {}",
+            count_label(tools.len(), "tool", "tools")
+        ));
+    }
+
+    if let Some(project) = output.get("project").and_then(Value::as_object) {
+        if let Some(name) = project.get("name").and_then(Value::as_str) {
+            details.push(format!("Project: {name}"));
+        }
+        if !saw_path {
+            if let Some(path) = project.get("path").and_then(Value::as_str) {
+                details.push(format!("Path: {path}"));
+            }
+        }
+    }
+
+    if output.get("truncated").and_then(Value::as_bool) == Some(true) {
+        details.push("Details: Showing the first 100 entries".to_owned());
+    }
+
+    details
 }
 
-fn describe_error_tool(output: &Value) -> (String, Vec<String>) {
-    let mut details = Vec::new();
-    if let Some(path) = output.get("path").and_then(Value::as_str) {
-        details.push(format!("Path: {path}"));
+fn line_count(value: &str) -> usize {
+    if value.is_empty() {
+        0
+    } else {
+        value.lines().count()
     }
-    if let Some(reason) = output.get("reason").and_then(Value::as_str) {
-        details.push(format!("Reason: {}", humanize_snake_case(reason)));
-    }
-    ("Error".to_owned(), details)
-}
-
-fn describe_blocked_tool(output: &Value) -> (String, Vec<String>) {
-    let mut details = Vec::new();
-    if let Some(reason) = output.get("reason").and_then(Value::as_str) {
-        details.push(format!("Reason: {}", humanize_snake_case(reason)));
-    }
-    ("Blocked".to_owned(), details)
 }
 
 fn count_label(count: usize, singular: &str, plural: &str) -> String {
@@ -847,16 +766,21 @@ fn count_label(count: usize, singular: &str, plural: &str) -> String {
     format!("{count} {noun}")
 }
 
-fn title_case_status(status: &str) -> String {
-    humanize_snake_case(status)
+fn title_case_words(value: &str) -> String {
+    humanize_identifier(value)
         .split_whitespace()
         .map(capitalize_word)
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-fn humanize_snake_case(value: &str) -> String {
-    value.replace('_', " ")
+fn humanize_identifier(value: &str) -> String {
+    value
+        .trim()
+        .replace(['_', '-'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn capitalize_word(word: &str) -> String {
@@ -996,17 +920,26 @@ mod tests {
         let message = Message::tool(
             "list_directory".to_owned(),
             serde_json::json!({"path": "."}),
-            serde_json::json!({"status": "ok", "entries": ["src"]}),
+            serde_json::json!({
+                "status": "ok",
+                "path": ".",
+                "workspace_path": ".",
+                "entries": [
+                    {"name": "src", "path": "src", "kind": "directory"}
+                ],
+                "truncated": false
+            }),
         );
         let lines = render_message(&message, 60);
 
         assert!(lines[0].to_string().starts_with("┌"));
-        assert!(lines[1]
-            .to_string()
-            .starts_with("│ Listed the project directory"));
+        assert!(lines[1].to_string().starts_with("│ List Directory"));
         assert!(lines
             .iter()
-            .any(|line| line.to_string().contains("Status: Success")));
+            .any(|line| line.to_string().contains("Status: Ok")));
+        assert!(lines
+            .iter()
+            .any(|line| line.to_string().contains("Path: .")));
         assert!(lines
             .iter()
             .any(|line| line.to_string().contains("Entries: 1 item")));
@@ -1018,7 +951,11 @@ mod tests {
         assert!(!lines
             .iter()
             .any(|line| line.to_string().contains("list_directory")));
+        assert!(!lines
+            .iter()
+            .any(|line| line.to_string().contains("\"name\"")));
         assert!(lines.iter().any(|line| line.to_string().starts_with("└")));
+        assert!(lines.last().is_some_and(|line| line.spans.is_empty()));
     }
 
     #[test]
@@ -1068,7 +1005,11 @@ mod tests {
             &Message::tool(
                 "read_file".to_owned(),
                 serde_json::json!({"path": "secret.txt"}),
-                serde_json::json!({"contents": "hidden"}),
+                serde_json::json!({
+                    "status": "ok",
+                    "path": "secret.txt",
+                    "content": "top secret\nsecond line"
+                }),
             ),
             40,
         );
@@ -1078,16 +1019,22 @@ mod tests {
             assert!(!rendered.contains("Roven"));
             assert!(!rendered.contains("◆"));
         }
+        assert!(tool_lines
+            .iter()
+            .any(|line| line.to_string().contains("Content: 2 lines, 22 chars")));
+        assert!(!tool_lines
+            .iter()
+            .any(|line| line.to_string().contains("top secret")));
     }
 
     #[test]
     fn tool_labels_are_friendly_and_unknown_tools_use_a_safe_fallback() {
         for (name, label) in [
-            ("list_directory", "Listed the project directory"),
-            ("read_file", "Read a project file"),
-            ("prepare_project", "Prepared the project"),
-            ("list_tools", "Checked available tools"),
-            ("custom_tool", "Completed requested action"),
+            ("list_directory", "List Directory"),
+            ("read_file", "Read File"),
+            ("prepare_project", "Prepare Project"),
+            ("list_tools", "List Tools"),
+            ("custom_tool", "Custom Tool"),
         ] {
             let lines = render_message(
                 &Message::tool(
@@ -1100,6 +1047,18 @@ mod tests {
             assert!(lines[1].to_string().contains(label));
             assert!(!lines[1].to_string().contains(name));
         }
+
+        let fallback_lines = render_message(
+            &Message::tool(
+                "".to_owned(),
+                serde_json::Value::Null,
+                serde_json::json!({"status": "error"}),
+            ),
+            48,
+        );
+        assert!(fallback_lines[1]
+            .to_string()
+            .contains("Completed requested action"));
     }
 
     #[test]
@@ -1146,6 +1105,28 @@ mod tests {
             .any(|line| line.to_string().contains("Reason: unknown tool")));
         assert!(unknown_lines
             .iter()
-            .any(|line| line.to_string().contains("Completed requested action")));
+            .any(|line| line.to_string().contains("Custom Tool")));
+    }
+
+    #[test]
+    fn tool_cards_keep_a_blank_separator_before_the_next_turn() {
+        let tool_lines = render_message(
+            &Message::tool(
+                "read_file".to_owned(),
+                serde_json::json!({"path": "notes.md"}),
+                serde_json::json!({
+                    "status": "ok",
+                    "path": "notes.md",
+                    "content": "alpha\nbeta"
+                }),
+            ),
+            48,
+        );
+        let separator_index = tool_lines.len() - 1;
+        let mut combined = tool_lines.clone();
+        combined.extend(render_message(&text(Role::Roven, "next turn"), 48));
+
+        assert!(combined[separator_index].spans.is_empty());
+        assert_eq!(combined[separator_index + 1].to_string(), "│ next turn");
     }
 }
