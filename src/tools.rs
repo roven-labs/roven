@@ -277,9 +277,7 @@ fn open_workspace_file(
     if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(ReadFileErrorReason::PathNotAllowed);
     }
-    if !normalized_windows_path(&opened_path(&file)?)
-        .starts_with(normalized_windows_path(&context.trusted_workspace))
-    {
+    if !opened_path_is_within_workspace(&opened_path(&file)?, &context.trusted_workspace)? {
         return Err(ReadFileErrorReason::PathNotAllowed);
     }
     Ok(file)
@@ -294,7 +292,7 @@ fn open_workspace_file(
 }
 
 #[cfg(windows)]
-fn opened_path(file: &fs::File) -> Result<PathBuf, ReadFileErrorReason> {
+fn opened_path(file: &fs::File) -> Result<std::ffi::OsString, ReadFileErrorReason> {
     use std::{
         ffi::{OsString, c_void},
         os::windows::{ffi::OsStringExt, io::AsRawHandle},
@@ -319,24 +317,55 @@ fn opened_path(file: &fs::File) -> Result<PathBuf, ReadFileErrorReason> {
             return Err(ReadFileErrorReason::IoError);
         }
         if result < path_len {
-            return Ok(PathBuf::from(OsString::from_wide(
-                &buffer[..result as usize],
-            )));
+            return Ok(OsString::from_wide(&buffer[..result as usize]));
         }
         path_len = result.checked_add(1).ok_or(ReadFileErrorReason::IoError)?;
     }
 }
 
 #[cfg(windows)]
-fn normalized_windows_path(path: &Path) -> PathBuf {
-    let path = path.to_string_lossy();
-    if let Some(unc_path) = path.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{unc_path}"))
-    } else if let Some(path) = path.strip_prefix(r"\\?\") {
-        PathBuf::from(path)
-    } else {
-        PathBuf::from(path.as_ref())
+fn opened_path_is_within_workspace(
+    opened_path: &std::ffi::OsStr,
+    trusted_workspace: &Path,
+) -> Result<bool, ReadFileErrorReason> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const CSTR_EQUAL: i32 = 2;
+
+    unsafe extern "system" {
+        fn CompareStringOrdinal(
+            string1: *const u16,
+            string1_len: i32,
+            string2: *const u16,
+            string2_len: i32,
+            ignore_case: i32,
+        ) -> i32;
     }
+
+    let opened_path: Vec<u16> = opened_path.encode_wide().collect();
+    let trusted_workspace: Vec<u16> = trusted_workspace.as_os_str().encode_wide().collect();
+    if opened_path.len() < trusted_workspace.len() {
+        return Ok(false);
+    }
+    let trusted_len =
+        i32::try_from(trusted_workspace.len()).map_err(|_| ReadFileErrorReason::IoError)?;
+    let comparison = unsafe {
+        CompareStringOrdinal(
+            opened_path.as_ptr(),
+            trusted_len,
+            trusted_workspace.as_ptr(),
+            trusted_len,
+            1,
+        )
+    };
+    if comparison == 0 {
+        return Err(ReadFileErrorReason::IoError);
+    }
+    let has_component_boundary = opened_path
+        .get(trusted_workspace.len())
+        .is_some_and(|character| *character == b'\\' as u16 || *character == b'/' as u16);
+    Ok(comparison == CSTR_EQUAL
+        && (opened_path.len() == trusted_workspace.len() || has_component_boundary))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1702,14 +1731,52 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn normalized_windows_path_removes_verbatim_prefixes() {
-        assert_eq!(
-            super::normalized_windows_path(Path::new(r"\\?\C:\workspace\notes.txt")),
-            PathBuf::from(r"C:\workspace\notes.txt")
+    fn protected_open_rejects_outside_directory_links() {
+        use std::os::windows::fs::symlink_dir;
+
+        let workspace = temp_root("read-file-protected-directory-link-workspace");
+        let outside = temp_root("read-file-protected-directory-link-outside");
+        let link = workspace.join("outside-link");
+        match symlink_dir(&outside, &link) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                fs::remove_dir_all(workspace).unwrap();
+                fs::remove_dir_all(outside).unwrap();
+                return;
+            }
+            Err(error) => panic!("symlink setup failed: {error}"),
+        }
+
+        assert!(matches!(
+            super::open_workspace_file(&context(&workspace), &link),
+            Err(super::ReadFileErrorReason::PathNotAllowed)
+        ));
+        fs::remove_dir_all(workspace).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opened_path_comparison_is_case_insensitive_and_component_bounded() {
+        use std::ffi::OsStr;
+
+        let workspace = Path::new(r"C:\Workspace");
+        assert!(
+            super::opened_path_is_within_workspace(
+                OsStr::new(r"c:\workspace\notes.txt"),
+                workspace
+            )
+            .unwrap()
         );
-        assert_eq!(
-            super::normalized_windows_path(Path::new(r"\\?\UNC\server\share\notes.txt")),
-            PathBuf::from(r"\\server\share\notes.txt")
+        assert!(
+            super::opened_path_is_within_workspace(OsStr::new(r"C:\WORKSPACE"), workspace).unwrap()
+        );
+        assert!(
+            !super::opened_path_is_within_workspace(
+                OsStr::new(r"C:\WorkspaceElse\notes.txt"),
+                workspace
+            )
+            .unwrap()
         );
     }
 }
