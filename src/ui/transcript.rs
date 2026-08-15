@@ -1,4 +1,4 @@
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -8,14 +8,16 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::state::{Message, MessageKind, Role};
 
-const USER_STYLE: Style = Style::new().fg(Color::Cyan);
-const ROVEN_STYLE: Style = Style::new().fg(Color::Green);
+const USER_STYLE: Style = Style::new().fg(Color::White).add_modifier(Modifier::BOLD);
+const MODEL_STYLE: Style = Style::new().fg(Color::Gray);
 const MUTED_STYLE: Style = Style::new().fg(Color::DarkGray);
-const CODE_STYLE: Style = Style::new().fg(Color::Yellow);
-const HEADING_STYLE: Style = Style::new()
-    .fg(Color::LightCyan)
-    .add_modifier(Modifier::BOLD);
+const CODE_STYLE: Style = Style::new().fg(Color::Gray);
+const HEADING_STYLE: Style = Style::new().fg(Color::White).add_modifier(Modifier::BOLD);
 const TOOL_STYLE: Style = Style::new().fg(Color::DarkGray);
+const USER_CONTINUATION_PREFIX: &str = "│     ";
+const MODEL_LABEL: &str = "│ ";
+const MODEL_CONTINUATION_PREFIX: &str = "┆       ";
+const ACTIVITY_LABEL: &str = "Activity ";
 
 #[derive(Debug, Clone)]
 struct InlineText {
@@ -53,13 +55,35 @@ fn render_text(
     if role == Role::Thought {
         return render_thought(&raw, duration_ms, width);
     }
-    let (label, label_style, body_style) = match role {
-        Role::User => ("You › ", USER_STYLE, USER_STYLE),
-        Role::Roven => ("Roven › ", ROVEN_STYLE, ROVEN_STYLE),
-        Role::Activity => ("Roven › ", MUTED_STYLE, MUTED_STYLE),
+    let (label, continuation_prefix, label_style, body_style) = match role {
+        Role::User => (
+            "You › ",
+            USER_CONTINUATION_PREFIX.to_owned(),
+            USER_STYLE,
+            MODEL_STYLE,
+        ),
+        Role::Roven => (
+            MODEL_LABEL,
+            MODEL_CONTINUATION_PREFIX.to_owned(),
+            MODEL_STYLE,
+            MODEL_STYLE,
+        ),
+        Role::Activity => (
+            ACTIVITY_LABEL,
+            " ".repeat(ACTIVITY_LABEL.width()),
+            MUTED_STYLE,
+            MUTED_STYLE,
+        ),
         Role::Thought => unreachable!("thought is handled above"),
     };
-    render_markdown(&raw, label, label_style, body_style, width)
+    render_markdown(
+        &raw,
+        label,
+        &continuation_prefix,
+        label_style,
+        body_style,
+        width,
+    )
 }
 
 fn render_thought(raw: &str, duration_ms: Option<u64>, width: usize) -> Vec<Line<'static>> {
@@ -68,43 +92,78 @@ fn render_thought(raw: &str, duration_ms: Option<u64>, width: usize) -> Vec<Line
         None => "Thought".to_owned(),
     };
     let mut lines = vec![Line::from(Span::styled(title, MUTED_STYLE))];
-    lines.extend(render_markdown(raw, "", MUTED_STYLE, MUTED_STYLE, width));
+    lines.extend(render_markdown(
+        raw,
+        "",
+        "",
+        MUTED_STYLE,
+        MUTED_STYLE,
+        width,
+    ));
     lines.push(Line::default());
     lines
 }
 
 fn render_tool(name: &str, input: &Value, output: &Value, width: usize) -> Vec<Line<'static>> {
-    let prefix = "  ";
-    let mut lines = vec![Line::from(Span::styled(
-        format!("Roven · {name} completed"),
-        TOOL_STYLE,
-    ))];
-    lines.extend(render_json_block("input", input, prefix, width));
-    lines.extend(render_json_block("output", output, prefix, width));
-    lines.push(Line::default());
+    let card = describe_tool(name, input, output);
+    let mut lines = Vec::with_capacity(card.len() + 2);
+    lines.push(Line::from(Span::styled(tool_box_top(width), TOOL_STYLE)));
+    for content in card {
+        lines.push(Line::from(Span::styled(
+            tool_box_line(&content, width),
+            TOOL_STYLE,
+        )));
+    }
+    lines.push(Line::from(Span::styled(tool_box_bottom(width), TOOL_STYLE)));
     lines
 }
 
-fn render_json_block(label: &str, value: &Value, prefix: &str, width: usize) -> Vec<Line<'static>> {
-    let json = serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".to_owned());
-    let available = width.saturating_sub(prefix.chars().count()).max(1);
-    let mut lines = vec![Line::from(Span::styled(
-        format!("{prefix}{label}:"),
-        TOOL_STYLE,
-    ))];
-    for raw_line in json.lines() {
-        let content = if raw_line.is_empty() { " " } else { raw_line };
-        lines.push(Line::from(vec![
-            Span::raw(prefix.to_owned()),
-            Span::styled(clip_to_width(content, available), CODE_STYLE),
-        ]));
+fn friendly_tool_label(name: &str) -> &'static str {
+    match name {
+        "list_directory" => "Listed the project directory",
+        "read_file" => "Read a project file",
+        "prepare_project" => "Prepared the project",
+        "list_tools" => "Checked available tools",
+        _ => "Completed requested action",
     }
-    lines
+}
+
+fn tool_box_top(width: usize) -> String {
+    match width {
+        0 => String::new(),
+        1 => "┌".to_owned(),
+        2 => "┌┐".to_owned(),
+        _ => format!("┌{}┐", "─".repeat(width - 2)),
+    }
+}
+
+fn tool_box_line(content: &str, width: usize) -> String {
+    match width {
+        0 => String::new(),
+        1 => "│".to_owned(),
+        2 => "││".to_owned(),
+        _ => {
+            let inner_width = width - 2;
+            let content = clip_to_width(content, inner_width.saturating_sub(2));
+            let right_padding = inner_width.saturating_sub(content.width() + 1);
+            format!("│ {content}{}│", " ".repeat(right_padding))
+        }
+    }
+}
+
+fn tool_box_bottom(width: usize) -> String {
+    match width {
+        0 => String::new(),
+        1 => "└".to_owned(),
+        2 => "└┘".to_owned(),
+        _ => format!("└{}┘", "─".repeat(width - 2)),
+    }
 }
 
 fn render_markdown(
     raw: &str,
     label: &str,
+    continuation_prefix: &str,
     label_style: Style,
     body_style: Style,
     width: usize,
@@ -118,23 +177,7 @@ fn render_markdown(
     let mut list_stack: Vec<(bool, usize)> = Vec::new();
     let mut quote_depth = 0usize;
     let mut table: Option<TableState> = None;
-
-    let flush_inline =
-        |lines: &mut Vec<Line<'static>>, current: &mut Vec<InlineText>, prefix: &str| {
-            if current.is_empty() {
-                return;
-            }
-            let first_prefix = format!("{label}{prefix}");
-            let continuation_prefix = " ".repeat(first_prefix.chars().count());
-            lines.extend(wrap_inline(
-                current,
-                width,
-                &first_prefix,
-                &continuation_prefix,
-                label_style,
-            ));
-            current.clear();
-        };
+    let mut emitted_label = false;
 
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -164,7 +207,15 @@ fn render_markdown(
                 Event::SoftBreak | Event::HardBreak => table_state.current_cell.push(' '),
                 Event::End(TagEnd::Table) => {
                     let finished = table.take().expect("table state exists");
-                    lines.extend(render_table(finished.rows, label, label_style, width));
+                    let first_prefix =
+                        message_block_prefix(label, continuation_prefix, "", &mut emitted_label);
+                    lines.extend(render_table(
+                        finished.rows,
+                        &first_prefix,
+                        continuation_prefix,
+                        label_style,
+                        width,
+                    ));
                 }
                 _ => {}
             }
@@ -175,8 +226,19 @@ fn render_markdown(
             match event {
                 Event::End(TagEnd::CodeBlock) => {
                     let (_, content) = code_block.take().expect("code block state exists");
-                    flush_inline(&mut lines, &mut current, "");
-                    let code_prefix = format!("{}  ", " ".repeat(label.width()));
+                    flush_inline_block(
+                        &mut lines,
+                        &mut current,
+                        "",
+                        label,
+                        continuation_prefix,
+                        label_style,
+                        width,
+                        &mut emitted_label,
+                    );
+                    let block_prefix =
+                        message_block_prefix(label, continuation_prefix, "", &mut emitted_label);
+                    let code_prefix = format!("{block_prefix}  ");
                     for line in content.lines() {
                         lines.push(Line::from(vec![
                             Span::styled(code_prefix.clone(), body_style),
@@ -194,25 +256,55 @@ fn render_markdown(
 
         match event {
             Event::Start(Tag::Paragraph) => {
-                current_prefix.clear();
+                if quote_depth == 0 {
+                    current_prefix.clear();
+                }
             }
             Event::End(TagEnd::Paragraph) => {
                 let prefix = current_prefix.clone();
-                flush_inline(&mut lines, &mut current, &prefix);
+                flush_inline_block(
+                    &mut lines,
+                    &mut current,
+                    &prefix,
+                    label,
+                    continuation_prefix,
+                    label_style,
+                    width,
+                    &mut emitted_label,
+                );
                 lines.push(Line::default());
             }
             Event::Start(Tag::Heading { level, .. }) => {
+                let _ = level;
                 current_style = HEADING_STYLE;
-                current_prefix = format!("{} ", "#".repeat(heading_number(level)));
+                current_prefix.clear();
             }
             Event::End(TagEnd::Heading(_)) => {
                 let prefix = current_prefix.clone();
-                flush_inline(&mut lines, &mut current, &prefix);
+                flush_inline_block(
+                    &mut lines,
+                    &mut current,
+                    &prefix,
+                    label,
+                    continuation_prefix,
+                    label_style,
+                    width,
+                    &mut emitted_label,
+                );
                 current_style = body_style;
                 lines.push(Line::default());
             }
             Event::Start(Tag::CodeBlock(kind)) => {
-                flush_inline(&mut lines, &mut current, "");
+                flush_inline_block(
+                    &mut lines,
+                    &mut current,
+                    "",
+                    label,
+                    continuation_prefix,
+                    label_style,
+                    width,
+                    &mut emitted_label,
+                );
                 let language = match kind {
                     CodeBlockKind::Fenced(language) => Some(language.to_string()),
                     CodeBlockKind::Indented => None,
@@ -244,7 +336,16 @@ fn render_markdown(
             }
             Event::End(TagEnd::Item) => {
                 let prefix = current_prefix.clone();
-                flush_inline(&mut lines, &mut current, &prefix);
+                flush_inline_block(
+                    &mut lines,
+                    &mut current,
+                    &prefix,
+                    label,
+                    continuation_prefix,
+                    label_style,
+                    width,
+                    &mut emitted_label,
+                );
             }
             Event::Start(Tag::BlockQuote(_)) => {
                 quote_depth += 1;
@@ -255,7 +356,16 @@ fn render_markdown(
                 lines.push(Line::default());
             }
             Event::Start(Tag::Table(_)) => {
-                flush_inline(&mut lines, &mut current, "");
+                flush_inline_block(
+                    &mut lines,
+                    &mut current,
+                    "",
+                    label,
+                    continuation_prefix,
+                    label_style,
+                    width,
+                    &mut emitted_label,
+                );
                 table = Some(TableState {
                     rows: Vec::new(),
                     current_row: Vec::new(),
@@ -263,8 +373,22 @@ fn render_markdown(
                 });
             }
             Event::Rule => {
-                flush_inline(&mut lines, &mut current, "");
-                lines.push(Line::from(Span::styled("  ─────────────", MUTED_STYLE)));
+                flush_inline_block(
+                    &mut lines,
+                    &mut current,
+                    "",
+                    label,
+                    continuation_prefix,
+                    label_style,
+                    width,
+                    &mut emitted_label,
+                );
+                let rule_prefix =
+                    message_block_prefix(label, continuation_prefix, "", &mut emitted_label);
+                lines.push(Line::from(vec![
+                    Span::styled(rule_prefix.to_owned(), label_style),
+                    Span::styled("  ─────────────".to_owned(), MUTED_STYLE),
+                ]));
                 lines.push(Line::default());
             }
             Event::Text(text) => current.push(InlineText {
@@ -297,7 +421,7 @@ fn render_markdown(
                 current_style = style_stack.pop().unwrap_or(body_style)
             }
             Event::TaskListMarker(checked) => current.push(InlineText {
-                text: if checked { "[x] " } else { "[ ] " }.to_owned(),
+                text: if checked { "☒ " } else { "☐ " }.to_owned(),
                 style: current_style,
             }),
             Event::Html(html) | Event::InlineHtml(html) => current.push(InlineText {
@@ -325,7 +449,16 @@ fn render_markdown(
         }
     }
 
-    flush_inline(&mut lines, &mut current, &current_prefix);
+    flush_inline_block(
+        &mut lines,
+        &mut current,
+        &current_prefix,
+        label,
+        continuation_prefix,
+        label_style,
+        width,
+        &mut emitted_label,
+    );
     while lines.last().is_some_and(|line| line.spans.is_empty()) {
         lines.pop();
     }
@@ -338,7 +471,8 @@ fn render_markdown(
 
 fn render_table(
     rows: Vec<Vec<String>>,
-    label: &str,
+    first_prefix: &str,
+    continuation_prefix: &str,
     label_style: Style,
     width: usize,
 ) -> Vec<Line<'static>> {
@@ -352,19 +486,18 @@ fn render_table(
             widths[index] = widths[index].max(cell.width());
         }
     }
-    let label_width = label.width();
+    let first_prefix_width = first_prefix.width();
     let total = widths.iter().sum::<usize>() + columns.saturating_mul(3).saturating_sub(1);
-    if total > width.saturating_sub(label_width) {
-        let continuation_prefix = " ".repeat(label_width);
+    if total > width.saturating_sub(first_prefix_width) {
         return rows
             .into_iter()
             .enumerate()
             .map(|(index, row)| {
                 let text = row.join(" | ");
                 let prefix = if index == 0 {
-                    label
+                    first_prefix
                 } else {
-                    &continuation_prefix
+                    continuation_prefix
                 };
                 Line::from(vec![
                     Span::styled(prefix.to_owned(), label_style),
@@ -376,7 +509,6 @@ fn render_table(
             })
             .collect();
     }
-    let continuation_prefix = " ".repeat(label_width);
     rows.into_iter()
         .enumerate()
         .map(|(index, row)| {
@@ -390,9 +522,9 @@ fn render_table(
                 .collect::<Vec<_>>()
                 .join(" │ ");
             let prefix = if index == 0 {
-                label
+                first_prefix
             } else {
-                &continuation_prefix
+                continuation_prefix
             };
             Line::from(vec![
                 Span::styled(prefix.to_owned(), label_style),
@@ -400,6 +532,50 @@ fn render_table(
             ])
         })
         .collect()
+}
+
+fn block_continuation_prefix(continuation_prefix: &str, local_prefix: &str) -> String {
+    format!("{continuation_prefix}{}", " ".repeat(local_prefix.width()))
+}
+
+fn message_block_prefix(
+    label: &str,
+    continuation_prefix: &str,
+    local_prefix: &str,
+    emitted_label: &mut bool,
+) -> String {
+    if !*emitted_label {
+        *emitted_label = true;
+        format!("{label}{local_prefix}")
+    } else {
+        format!("{continuation_prefix}{local_prefix}")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_inline_block(
+    lines: &mut Vec<Line<'static>>,
+    current: &mut Vec<InlineText>,
+    prefix: &str,
+    label: &str,
+    continuation_prefix: &str,
+    label_style: Style,
+    width: usize,
+    emitted_label: &mut bool,
+) {
+    if current.is_empty() {
+        return;
+    }
+    let first_prefix = message_block_prefix(label, continuation_prefix, prefix, emitted_label);
+    let continuation_prefix = block_continuation_prefix(continuation_prefix, prefix);
+    lines.extend(wrap_inline(
+        current,
+        width,
+        &first_prefix,
+        &continuation_prefix,
+        label_style,
+    ));
+    current.clear();
 }
 
 fn wrap_inline(
@@ -491,17 +667,6 @@ fn normalize_line_endings(value: &str) -> String {
     value.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-fn heading_number(level: HeadingLevel) -> usize {
-    match level {
-        HeadingLevel::H1 => 1,
-        HeadingLevel::H2 => 2,
-        HeadingLevel::H3 => 3,
-        HeadingLevel::H4 => 4,
-        HeadingLevel::H5 => 5,
-        HeadingLevel::H6 => 6,
-    }
-}
-
 fn clip_to_width(value: &str, width: usize) -> String {
     let limit = width.max(1);
     let mut used = 0;
@@ -517,10 +682,200 @@ fn clip_to_width(value: &str, width: usize) -> String {
     clipped
 }
 
+fn describe_tool(name: &str, input: &Value, output: &Value) -> Vec<String> {
+    let summary = friendly_tool_label(name).to_owned();
+    let (status, mut details) = match name {
+        "list_directory" => describe_list_directory(output),
+        "read_file" => describe_read_file(output),
+        "prepare_project" => describe_prepare_project(output),
+        "list_tools" => describe_list_tools(output),
+        _ => describe_unknown_tool(input, output),
+    };
+    let mut lines = vec![summary, format!("Status: {status}")];
+    lines.append(&mut details);
+    lines
+}
+
+fn describe_list_directory(output: &Value) -> (String, Vec<String>) {
+    match output.get("status").and_then(Value::as_str) {
+        Some("ok") => {
+            let path = output.get("path").and_then(Value::as_str);
+            let entry_count = output
+                .get("entries")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let truncated = output
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut details = Vec::new();
+            if let Some(path) = path {
+                details.push(format!("Path: {path}"));
+            }
+            details.push(format!(
+                "Entries: {}",
+                count_label(entry_count, "item", "items")
+            ));
+            if truncated {
+                details.push("Details: Showing the first 100 entries".to_owned());
+            }
+            ("Success".to_owned(), details)
+        }
+        Some("error") => describe_error_tool(output),
+        Some(status) => (title_case_status(status), Vec::new()),
+        None => ("Completed".to_owned(), Vec::new()),
+    }
+}
+
+fn describe_read_file(output: &Value) -> (String, Vec<String>) {
+    match output.get("status").and_then(Value::as_str) {
+        Some("ok") => {
+            let mut details = Vec::new();
+            if let Some(path) = output.get("path").and_then(Value::as_str) {
+                details.push(format!("Path: {path}"));
+            }
+            if let Some(content) = output.get("content").and_then(Value::as_str) {
+                let line_count = content.lines().count().max(1);
+                details.push(format!(
+                    "Content: {}, {}",
+                    count_label(line_count, "line", "lines"),
+                    count_label(content.chars().count(), "char", "chars")
+                ));
+            }
+            ("Success".to_owned(), details)
+        }
+        Some("error") => describe_error_tool(output),
+        Some(status) => (title_case_status(status), Vec::new()),
+        None => ("Completed".to_owned(), Vec::new()),
+    }
+}
+
+fn describe_prepare_project(output: &Value) -> (String, Vec<String>) {
+    match output.get("status").and_then(Value::as_str) {
+        Some("prepared") | Some("already_added") => {
+            let project = output.get("project").and_then(Value::as_object);
+            let mut details = Vec::new();
+            if let Some(name) = project
+                .and_then(|project| project.get("name"))
+                .and_then(Value::as_str)
+            {
+                details.push(format!("Project: {name}"));
+            }
+            if let Some(path) = project
+                .and_then(|project| project.get("path"))
+                .and_then(Value::as_str)
+            {
+                details.push(format!("Path: {path}"));
+            }
+            (
+                title_case_status(
+                    output
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                ),
+                details,
+            )
+        }
+        Some("blocked") => describe_blocked_tool(output),
+        Some(status) => (title_case_status(status), Vec::new()),
+        None => ("Completed".to_owned(), Vec::new()),
+    }
+}
+
+fn describe_list_tools(output: &Value) -> (String, Vec<String>) {
+    match output.get("status").and_then(Value::as_str) {
+        Some("ok") => {
+            let tool_count = output
+                .get("tools")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            (
+                "Success".to_owned(),
+                vec![format!(
+                    "Available tools: {}",
+                    count_label(tool_count, "tool", "tools")
+                )],
+            )
+        }
+        Some("invalid_input") => ("Invalid input".to_owned(), Vec::new()),
+        Some(status) => (title_case_status(status), Vec::new()),
+        None => ("Completed".to_owned(), Vec::new()),
+    }
+}
+
+fn describe_unknown_tool(input: &Value, output: &Value) -> (String, Vec<String>) {
+    let status = output
+        .get("status")
+        .and_then(Value::as_str)
+        .map(title_case_status)
+        .unwrap_or_else(|| "Completed".to_owned());
+    let mut details = Vec::new();
+    if let Some(reason) = output.get("reason").and_then(Value::as_str) {
+        details.push(format!("Reason: {}", humanize_snake_case(reason)));
+    } else if let Some(path) = output
+        .get("path")
+        .and_then(Value::as_str)
+        .or_else(|| input.get("path").and_then(Value::as_str))
+    {
+        details.push(format!("Path: {path}"));
+    }
+    (status, details)
+}
+
+fn describe_error_tool(output: &Value) -> (String, Vec<String>) {
+    let mut details = Vec::new();
+    if let Some(path) = output.get("path").and_then(Value::as_str) {
+        details.push(format!("Path: {path}"));
+    }
+    if let Some(reason) = output.get("reason").and_then(Value::as_str) {
+        details.push(format!("Reason: {}", humanize_snake_case(reason)));
+    }
+    ("Error".to_owned(), details)
+}
+
+fn describe_blocked_tool(output: &Value) -> (String, Vec<String>) {
+    let mut details = Vec::new();
+    if let Some(reason) = output.get("reason").and_then(Value::as_str) {
+        details.push(format!("Reason: {}", humanize_snake_case(reason)));
+    }
+    ("Blocked".to_owned(), details)
+}
+
+fn count_label(count: usize, singular: &str, plural: &str) -> String {
+    let noun = if count == 1 { singular } else { plural };
+    format!("{count} {noun}")
+}
+
+fn title_case_status(status: &str) -> String {
+    humanize_snake_case(status)
+        .split_whitespace()
+        .map(capitalize_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn humanize_snake_case(value: &str) -> String {
+    value.replace('_', " ")
+}
+
+fn capitalize_word(word: &str) -> String {
+    let mut characters = word.chars();
+    match characters.next() {
+        Some(first) => {
+            let mut capitalized = first.to_uppercase().collect::<String>();
+            capitalized.push_str(characters.as_str());
+            capitalized
+        }
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::render_message;
     use crate::ui::state::{Message, MessageKind, Role};
+    use unicode_width::UnicodeWidthStr;
 
     fn text(role: Role, content: &str) -> Message {
         Message {
@@ -532,11 +887,18 @@ mod tests {
     }
 
     #[test]
-    fn multiline_output_preserves_rows_and_aligns_continuations() {
-        let lines = render_message(&text(Role::Roven, "first line\nsecond line"), 40);
+    fn multiline_output_uses_role_specific_prefixes_and_continuations() {
+        let user_lines = render_message(&text(Role::User, "first line\nsecond line"), 40);
+        let roven_lines = render_message(&text(Role::Roven, "first line\nsecond line"), 40);
+        let activity_lines =
+            render_message(&text(Role::Activity, "agent working\nstill working"), 40);
 
-        assert_eq!(lines[0].to_string(), "Roven › first line");
-        assert_eq!(lines[1].to_string(), "        second line");
+        assert_eq!(user_lines[0].to_string(), "You › first line");
+        assert_eq!(user_lines[1].to_string(), "│     second line");
+        assert_eq!(roven_lines[0].to_string(), "│ first line");
+        assert_eq!(roven_lines[1].to_string(), "┆       second line");
+        assert_eq!(activity_lines[0].to_string(), "Activity agent working");
+        assert!(activity_lines[1].to_string().ends_with("still working"));
     }
 
     #[test]
@@ -546,16 +908,12 @@ mod tests {
             40,
         );
 
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.to_string().contains("├── src/"))
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.to_string().contains("│   └── main.rs"))
-        );
+        assert!(lines
+            .iter()
+            .any(|line| line.to_string().contains("├── src/")));
+        assert!(lines
+            .iter()
+            .any(|line| line.to_string().contains("│   └── main.rs")));
     }
 
     #[test]
@@ -568,17 +926,69 @@ mod tests {
             60,
         );
 
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.to_string().contains("# Files"))
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.to_string().contains("• backend"))
-        );
+        assert!(lines.iter().any(|line| line.to_string().contains("Files")));
+        assert!(!lines
+            .iter()
+            .any(|line| line.to_string().contains("# Files")));
+        assert!(lines
+            .iter()
+            .any(|line| line.to_string().contains("• backend")));
         assert!(lines.iter().any(|line| line.to_string().contains("ready")));
+
+        let task_lines = render_message(
+            &text(Role::Roven, "- [x] read project\n- [ ] prepare context"),
+            60,
+        );
+        assert!(task_lines
+            .iter()
+            .any(|line| line.to_string().contains("☒ read project")));
+        assert!(task_lines
+            .iter()
+            .any(|line| line.to_string().contains("☐ prepare context")));
+    }
+
+    #[test]
+    fn wrapped_markdown_keeps_role_gutter_and_local_prefix() {
+        let user_lines = render_message(
+            &text(
+                Role::User,
+                "- user item that wraps across multiple words nicely",
+            ),
+            28,
+        );
+        assert!(user_lines[0].to_string().starts_with("You › • "));
+        assert!(user_lines
+            .iter()
+            .skip(1)
+            .any(|line| line.to_string().starts_with("│       ")));
+
+        let roven_task_lines = render_message(
+            &text(
+                Role::Roven,
+                "- [x] roven task item that wraps across multiple words nicely",
+            ),
+            28,
+        );
+        assert!(roven_task_lines[0].to_string().starts_with("│ • ☒ "));
+        assert!(roven_task_lines
+            .iter()
+            .skip(1)
+            .any(|line| line.to_string().starts_with("┆         ")));
+
+        let roven_quote_lines = render_message(
+            &text(
+                Role::Roven,
+                "> roven quote block that wraps across multiple words nicely",
+            ),
+            28,
+        );
+        assert!(roven_quote_lines
+            .iter()
+            .any(|line| line.to_string().starts_with("│ │ ")));
+        assert!(roven_quote_lines
+            .iter()
+            .skip(1)
+            .any(|line| line.to_string().starts_with("┆         ")));
     }
 
     #[test]
@@ -590,11 +1000,152 @@ mod tests {
         );
         let lines = render_message(&message, 60);
 
-        assert!(lines[0].to_string().contains("list_directory completed"));
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.to_string().contains("entries"))
+        assert!(lines[0].to_string().starts_with("┌"));
+        assert!(lines[1]
+            .to_string()
+            .starts_with("│ Listed the project directory"));
+        assert!(lines
+            .iter()
+            .any(|line| line.to_string().contains("Status: Success")));
+        assert!(lines
+            .iter()
+            .any(|line| line.to_string().contains("Entries: 1 item")));
+        assert!(lines.iter().all(|line| line.to_string().width() <= 60));
+        assert!(!lines.iter().any(|line| line.to_string().contains("Roven")));
+        assert!(!lines.iter().any(|line| line.to_string().contains("◆")));
+        assert!(!lines.iter().any(|line| line.to_string().contains("input")));
+        assert!(!lines.iter().any(|line| line.to_string().contains("output")));
+        assert!(!lines
+            .iter()
+            .any(|line| line.to_string().contains("list_directory")));
+        assert!(lines.iter().any(|line| line.to_string().starts_with("└")));
+    }
+
+    #[test]
+    fn structured_tool_output_clamps_to_narrow_width() {
+        let message = Message::tool(
+            "list_directory".to_owned(),
+            serde_json::json!({"path": "."}),
+            serde_json::json!({"status": "ok"}),
         );
+        let width = 12;
+        let lines = render_message(&message, width);
+
+        assert!(lines.iter().any(|line| line.to_string().starts_with("┌")));
+        assert!(lines.iter().any(|line| line.to_string().starts_with("└")));
+        assert!(lines.iter().all(|line| line.to_string().width() <= width));
+    }
+
+    #[test]
+    fn role_label_is_emitted_once_per_message() {
+        let lines = render_message(
+            &text(
+                Role::Roven,
+                "First paragraph.\n\n- later item\n\n| A | B |\n| --- | --- |\n| 1 | 2 |",
+            ),
+            48,
+        );
+
+        assert!(lines[0].to_string().starts_with("│ First paragraph."));
+        assert!(!lines
+            .iter()
+            .skip(1)
+            .any(|line| line.to_string().starts_with("│ ")));
+        assert!(lines
+            .iter()
+            .skip(1)
+            .any(|line| line.to_string().starts_with("┆       • later item")));
+        assert!(lines
+            .iter()
+            .skip(1)
+            .any(|line| line.to_string().starts_with("┆") && line.to_string().contains("A")));
+    }
+
+    #[test]
+    fn model_and_tool_output_have_no_branding_or_icon_labels() {
+        let model_lines = render_message(&text(Role::Roven, "Answer"), 40);
+        let tool_lines = render_message(
+            &Message::tool(
+                "read_file".to_owned(),
+                serde_json::json!({"path": "secret.txt"}),
+                serde_json::json!({"contents": "hidden"}),
+            ),
+            40,
+        );
+
+        for line in model_lines.iter().chain(tool_lines.iter()) {
+            let rendered = line.to_string();
+            assert!(!rendered.contains("Roven"));
+            assert!(!rendered.contains("◆"));
+        }
+    }
+
+    #[test]
+    fn tool_labels_are_friendly_and_unknown_tools_use_a_safe_fallback() {
+        for (name, label) in [
+            ("list_directory", "Listed the project directory"),
+            ("read_file", "Read a project file"),
+            ("prepare_project", "Prepared the project"),
+            ("list_tools", "Checked available tools"),
+            ("custom_tool", "Completed requested action"),
+        ] {
+            let lines = render_message(
+                &Message::tool(
+                    name.to_owned(),
+                    serde_json::json!({"path": "workspace"}),
+                    serde_json::json!({"status": "unknown_tool", "reason": "unknown_tool"}),
+                ),
+                48,
+            );
+            assert!(lines[1].to_string().contains(label));
+            assert!(!lines[1].to_string().contains(name));
+        }
+    }
+
+    #[test]
+    fn tool_cards_render_structured_status_and_details_for_known_and_unknown_tools() {
+        let prepared_lines = render_message(
+            &Message::tool(
+                "prepare_project".to_owned(),
+                serde_json::json!({"path": "workspace"}),
+                serde_json::json!({
+                    "status": "prepared",
+                    "project": {
+                        "name": "pmemc",
+                        "path": "workspace",
+                        "github_remote": "origin",
+                        "baseline_commit": "abc123"
+                    }
+                }),
+            ),
+            64,
+        );
+        assert!(prepared_lines
+            .iter()
+            .any(|line| line.to_string().contains("Status: Prepared")));
+        assert!(prepared_lines
+            .iter()
+            .any(|line| line.to_string().contains("Project: pmemc")));
+        assert!(prepared_lines
+            .iter()
+            .any(|line| line.to_string().contains("Path: workspace")));
+
+        let unknown_lines = render_message(
+            &Message::tool(
+                "custom_tool".to_owned(),
+                serde_json::json!({"path": "notes.md"}),
+                serde_json::json!({"status": "error", "reason": "unknown_tool"}),
+            ),
+            64,
+        );
+        assert!(unknown_lines
+            .iter()
+            .any(|line| line.to_string().contains("Status: Error")));
+        assert!(unknown_lines
+            .iter()
+            .any(|line| line.to_string().contains("Reason: unknown tool")));
+        assert!(unknown_lines
+            .iter()
+            .any(|line| line.to_string().contains("Completed requested action")));
     }
 }
