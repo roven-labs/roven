@@ -34,11 +34,26 @@ Results are capped at 100 entries and include:
   "path": ".",
   "workspace_path": "C:\\Projects\\my-app",
   "entries": [
-    { "name": "src", "path": "src", "kind": "directory" }
+    { "name": "src", "path": "src", "kind": "directory" },
+    { "name": "main.rs", "path": "src/main.rs", "kind": "file", "size_kb": 3.5 },
+    {
+      "name": "latest",
+      "path": "latest",
+      "kind": "symlink",
+      "size_error": "symlink_not_followed"
+    }
   ],
   "truncated": false
 }
 ```
+
+Every regular file includes `size_kb`, calculated as `file_size_in_bytes / 1024`
+and rounded to two decimal places. This applies to all regular files, including
+executables, binaries, and model files; listing metadata does not read their
+contents. Directories and `other` entries omit size fields. Symlinks are never
+followed and report `size_error: "symlink_not_followed"`. If a regular file's
+metadata cannot be read, the entry remains in the result and reports either
+`size_error: "permission_denied"` or `size_error: "io_error"`.
 
 Possible errors include `invalid_path`, `path_not_allowed`, `not_directory`,
 `permission_denied`, and `io_error`.
