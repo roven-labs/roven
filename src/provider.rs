@@ -382,12 +382,20 @@ fn parse_sse_line(line: &str) -> Result<Vec<ProviderEvent>, ProviderError> {
     if let Some(error) = value.get("error") {
         let code = error
             .get("code")
+            .and_then(displayable_json_scalar)
+            .unwrap_or_else(|| "unspecified".to_owned());
+        let error_type = error
+            .get("metadata")
+            .and_then(|metadata| metadata.get("error_type"))
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("unspecified");
+            .filter(|error_type| !error_type.is_empty());
+        let error_type = error_type
+            .map(|error_type| format!(" type={error_type}"))
+            .unwrap_or_default();
         return Err(ProviderError::diagnostic(
             "stream",
             "remote_error",
-            format!("provider reported a stream error code={code}"),
+            format!("provider reported stream error code={code}{error_type}"),
         ));
     }
     let choice = value.get("choices").and_then(|choices| choices.get(0));
@@ -410,6 +418,16 @@ fn parse_sse_line(line: &str) -> Result<Vec<ProviderEvent>, ProviderError> {
         events.push(ProviderEvent::Finished);
     }
     Ok(events)
+}
+
+fn displayable_json_scalar(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -779,9 +797,35 @@ mod tests {
 
         assert_eq!(
             error,
-            "Provider stream failed (remote_error): provider reported a stream error code=model_unavailable"
+            "Provider stream failed (remote_error): provider reported stream error code=model_unavailable"
         );
         assert!(!error.contains("secret-value"));
+    }
+
+    #[test]
+    fn provider_stream_errors_show_numeric_code_and_safe_category() {
+        let error = parse_sse_line(
+            r#"data: {"error":{"code":429,"message":"temporary failure","metadata":{"error_type":"rate_limit_exceeded"}}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(
+            error,
+            "Provider stream failed (remote_error): provider reported stream error code=429 type=rate_limit_exceeded"
+        );
+    }
+
+    #[test]
+    fn provider_stream_errors_never_include_sensitive_messages() {
+        let error = parse_sse_line(
+            r#"data: {"error":{"code":"invalid_request","message":"Bearer secret-value in prompt"}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(!error.contains("secret-value"));
+        assert!(error.contains("code=invalid_request"));
     }
 
     #[test]
