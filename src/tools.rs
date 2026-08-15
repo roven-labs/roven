@@ -364,8 +364,13 @@ fn opened_path_is_within_workspace(
     let has_component_boundary = opened_path
         .get(trusted_workspace.len())
         .is_some_and(|character| *character == b'\\' as u16 || *character == b'/' as u16);
+    let trusted_root_ends_with_separator = trusted_workspace
+        .last()
+        .is_some_and(|character| *character == b'\\' as u16 || *character == b'/' as u16);
     Ok(comparison == CSTR_EQUAL
-        && (opened_path.len() == trusted_workspace.len() || has_component_boundary))
+        && (opened_path.len() == trusted_workspace.len()
+            || trusted_root_ends_with_separator
+            || has_component_boundary))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1770,6 +1775,13 @@ mod tests {
         );
         assert!(
             super::opened_path_is_within_workspace(OsStr::new(r"C:\WORKSPACE"), workspace).unwrap()
+        );
+        assert!(
+            super::opened_path_is_within_workspace(
+                OsStr::new(r"C:\child\notes.txt"),
+                Path::new(r"C:\")
+            )
+            .unwrap()
         );
         assert!(
             !super::opened_path_is_within_workspace(
