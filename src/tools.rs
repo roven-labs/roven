@@ -222,10 +222,7 @@ impl ReadFile {
             Err(reason) => return ReadFileResult::error(reason, input.path),
         };
         let path = workspace_relative_path(&context.trusted_workspace, &target);
-        if target.is_dir() {
-            return ReadFileResult::error(ReadFileErrorReason::NotFile, path);
-        }
-        let mut file = match open_workspace_file(&target) {
+        let mut file = match open_workspace_file(context, &target) {
             Ok(file) => file,
             Err(reason) => return ReadFileResult::error(reason, path),
         };
@@ -258,15 +255,19 @@ fn read_file_contents(file: &mut fs::File) -> Result<String, ReadFileErrorReason
 }
 
 #[cfg(windows)]
-fn open_workspace_file(path: &Path) -> Result<fs::File, ReadFileErrorReason> {
+fn open_workspace_file(
+    context: &ToolContext,
+    path: &Path,
+) -> Result<fs::File, ReadFileErrorReason> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
     let file = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
         .map_err(|error| read_file_io_reason(&error))?;
     let attributes = file
@@ -276,12 +277,66 @@ fn open_workspace_file(path: &Path) -> Result<fs::File, ReadFileErrorReason> {
     if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(ReadFileErrorReason::PathNotAllowed);
     }
+    if !normalized_windows_path(&opened_path(&file)?)
+        .starts_with(normalized_windows_path(&context.trusted_workspace))
+    {
+        return Err(ReadFileErrorReason::PathNotAllowed);
+    }
     Ok(file)
 }
 
 #[cfg(not(windows))]
-fn open_workspace_file(path: &Path) -> Result<fs::File, ReadFileErrorReason> {
+fn open_workspace_file(
+    _context: &ToolContext,
+    path: &Path,
+) -> Result<fs::File, ReadFileErrorReason> {
     fs::File::open(path).map_err(|error| read_file_io_reason(&error))
+}
+
+#[cfg(windows)]
+fn opened_path(file: &fs::File) -> Result<PathBuf, ReadFileErrorReason> {
+    use std::{
+        ffi::{OsString, c_void},
+        os::windows::{ffi::OsStringExt, io::AsRawHandle},
+    };
+
+    unsafe extern "system" {
+        fn GetFinalPathNameByHandleW(
+            file: *mut c_void,
+            path: *mut u16,
+            path_len: u32,
+            flags: u32,
+        ) -> u32;
+    }
+
+    let mut path_len = 260;
+    loop {
+        let mut buffer = vec![0; path_len as usize];
+        let result = unsafe {
+            GetFinalPathNameByHandleW(file.as_raw_handle(), buffer.as_mut_ptr(), path_len, 0)
+        };
+        if result == 0 {
+            return Err(ReadFileErrorReason::IoError);
+        }
+        if result < path_len {
+            return Ok(PathBuf::from(OsString::from_wide(
+                &buffer[..result as usize],
+            )));
+        }
+        path_len = result.checked_add(1).ok_or(ReadFileErrorReason::IoError)?;
+    }
+}
+
+#[cfg(windows)]
+fn normalized_windows_path(path: &Path) -> PathBuf {
+    let path = path.to_string_lossy();
+    if let Some(unc_path) = path.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc_path}"))
+    } else if let Some(path) = path.strip_prefix(r"\\?\") {
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(path.as_ref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1603,9 +1658,58 @@ mod tests {
         }
 
         assert!(matches!(
-            super::open_workspace_file(&link),
+            super::open_workspace_file(&context(&workspace), &link),
             Err(super::ReadFileErrorReason::PathNotAllowed)
         ));
         fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_file_rejects_final_directory_links_as_paths_not_allowed() {
+        use std::os::windows::fs::symlink_dir;
+
+        let workspace = temp_root("read-file-directory-link-workspace");
+        let outside = temp_root("read-file-directory-link-outside");
+        let link = workspace.join("outside-link");
+        match symlink_dir(&outside, &link) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                fs::remove_dir_all(workspace).unwrap();
+                fs::remove_dir_all(outside).unwrap();
+                return;
+            }
+            Err(error) => panic!("symlink setup failed: {error}"),
+        }
+
+        let result = ReadFile.execute(
+            &context(&workspace),
+            ReadFileInput {
+                path: "outside-link".to_owned(),
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            json!({
+                "status": "error",
+                "reason": "path_not_allowed",
+                "path": "outside-link"
+            })
+        );
+        fs::remove_dir_all(workspace).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalized_windows_path_removes_verbatim_prefixes() {
+        assert_eq!(
+            super::normalized_windows_path(Path::new(r"\\?\C:\workspace\notes.txt")),
+            PathBuf::from(r"C:\workspace\notes.txt")
+        );
+        assert_eq!(
+            super::normalized_windows_path(Path::new(r"\\?\UNC\server\share\notes.txt")),
+            PathBuf::from(r"\\server\share\notes.txt")
+        );
     }
 }
