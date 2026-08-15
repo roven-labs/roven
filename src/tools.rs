@@ -222,12 +222,12 @@ impl ReadFile {
             Err(reason) => return ReadFileResult::error(reason, input.path),
         };
         let path = workspace_relative_path(&context.trusted_workspace, &target);
-        let mut file = match fs::File::open(&target) {
+        if target.is_dir() {
+            return ReadFileResult::error(ReadFileErrorReason::NotFile, path);
+        }
+        let mut file = match open_workspace_file(&target) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied && target.is_dir() => {
-                return ReadFileResult::error(ReadFileErrorReason::NotFile, path);
-            }
-            Err(error) => return ReadFileResult::error(read_file_io_reason(&error), path),
+            Err(reason) => return ReadFileResult::error(reason, path),
         };
         let metadata = match file.metadata() {
             Ok(metadata) => metadata,
@@ -255,6 +255,33 @@ fn read_file_contents(file: &mut fs::File) -> Result<String, ReadFileErrorReason
         return Err(ReadFileErrorReason::FileTooLarge);
     }
     String::from_utf8(bytes).map_err(|_| ReadFileErrorReason::NotText)
+}
+
+#[cfg(windows)]
+fn open_workspace_file(path: &Path) -> Result<fs::File, ReadFileErrorReason> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| read_file_io_reason(&error))?;
+    let attributes = file
+        .metadata()
+        .map_err(|error| read_file_io_reason(&error))?
+        .file_attributes();
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ReadFileErrorReason::PathNotAllowed);
+    }
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn open_workspace_file(path: &Path) -> Result<fs::File, ReadFileErrorReason> {
+    fs::File::open(path).map_err(|error| read_file_io_reason(&error))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1555,5 +1582,30 @@ mod tests {
 
         fs::remove_dir_all(workspace).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn open_workspace_file_rejects_a_symlink_handle() {
+        use std::os::windows::fs::symlink_file;
+
+        let workspace = temp_root("read-file-reparse");
+        let target = workspace.join("target.txt");
+        let link = workspace.join("link.txt");
+        fs::write(&target, "target").unwrap();
+        match symlink_file(&target, &link) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                fs::remove_dir_all(workspace).unwrap();
+                return;
+            }
+            Err(error) => panic!("symlink setup failed: {error}"),
+        }
+
+        assert!(matches!(
+            super::open_workspace_file(&link),
+            Err(super::ReadFileErrorReason::PathNotAllowed)
+        ));
+        fs::remove_dir_all(workspace).unwrap();
     }
 }
