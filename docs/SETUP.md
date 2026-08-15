@@ -31,7 +31,7 @@ The endpoint must be HTTPS, must not contain credentials, query parameters, or
 fragments, and must be the complete endpoint. Roven does not append
 `/chat/completions` automatically.
 
-Examples:
+Examples of complete OpenAI-compatible endpoints (including OpenRouter):
 
 ```text
 https://api.groq.com/openai/v1/chat/completions

@@ -1,4 +1,4 @@
-//! OpenRouter API-key storage in Windows Credential Manager.
+//! Operating-system credential-store support for named provider profiles.
 
 use thiserror::Error;
 
