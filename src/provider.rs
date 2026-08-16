@@ -550,9 +550,13 @@ fn append_tool_call_deltas(
     line: &str,
     tool_call_parts: &mut BTreeMap<usize, ToolCallParts>,
 ) -> Result<(), ProviderError> {
-    let Some(data) = line.strip_prefix("data: ") else {
+    let Some(data) = line.strip_prefix("data:") else {
         return Ok(());
     };
+    let data = data.strip_prefix(' ').unwrap_or(data);
+    if data.is_empty() {
+        return Ok(());
+    }
     if data == "[DONE]" {
         return Ok(());
     }
@@ -846,6 +850,30 @@ mod tests {
         .unwrap();
         super::append_tool_call_deltas(
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"project","arguments":"\\\\work\"}"}}]}}]}"#,
+            &mut chunks,
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::finish_tool_calls(chunks).unwrap(),
+            vec![RovenToolCall {
+                id: "call_1".to_owned(),
+                name: "prepare_project".to_owned(),
+                arguments: serde_json::json!({ "path": "C:\\work" }),
+            }]
+        );
+    }
+
+    #[test]
+    fn compact_tool_call_chunks_become_roven_tool_calls() {
+        let mut chunks = std::collections::BTreeMap::new();
+        super::append_tool_call_deltas(
+            r#"data:{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"prepare_","arguments":"{\"path\":\"C:"}}]}}]}"#,
+            &mut chunks,
+        )
+        .unwrap();
+        super::append_tool_call_deltas(
+            r#"data:{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"project","arguments":"\\\\work\"}"}}]}}]}"#,
             &mut chunks,
         )
         .unwrap();

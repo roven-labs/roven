@@ -24,8 +24,9 @@ use serde_json::Value;
 use crate::{
     agent::{self, AgentEvent, AgentMessage},
     credentials::{self, SecretStore},
-    profiles::ProviderProfiles,
-    provider::OpenAiCompatibleProvider,
+    ollama, openrouter,
+    profiles::{ProviderProfile, ProviderProfiles},
+    provider::{OpenAiCompatibleProvider, Provider},
     runtime_log::RuntimeLog,
     storage::{ConversationEvent, EventKind, ProjectStore, SessionMeta},
     tools::{RovenToolCall, RovenToolResult, ToolContext},
@@ -40,6 +41,7 @@ use super::{
 enum WorkerEvent {
     Thought(String),
     Text(String),
+    ContextUsage(usize),
     FunctionCallOutput {
         call: RovenToolCall,
         result: RovenToolResult,
@@ -359,27 +361,38 @@ fn spawn_worker(
                 .default_profile()
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "No default provider profile. Run `roven auth set`.".to_owned())?;
-            let key = credentials::OsCredentialStore::for_profile_id(&profile.id)
-                .get()
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| {
-                    format!(
-                        "API key missing for provider profile `{}`. Run `roven auth set`.",
-                        profile.name
-                    )
-                })?;
-            let provider = OpenAiCompatibleProvider::new(profile.endpoint, profile.model);
+            let key = resolve_profile_api_key(
+                &profile,
+                &credentials::OsCredentialStore::for_profile_id(&profile.id),
+            )?;
+            let endpoint = profile.endpoint;
+            let model = profile.model;
+            let is_ollama = ollama::is_native_endpoint(&endpoint);
+            let context_window = if is_ollama {
+                ollama::context_window(&key, &endpoint, &model)
+            } else {
+                openrouter::context_window(&key, &endpoint, &model)
+            };
+            let provider: Box<dyn Provider> = if is_ollama {
+                Box::new(ollama::OllamaProvider::new(endpoint, model))
+            } else {
+                Box::new(OpenAiCompatibleProvider::new(endpoint, model))
+            };
             agent::run(
-                &provider,
+                provider.as_ref(),
                 &key,
                 messages,
                 &tool_context,
+                context_window,
                 &cancelled,
                 runtime_log.as_ref(),
                 &mut |event| {
                     let message = match event {
                         AgentEvent::Thought(thought) => WorkerEvent::Thought(thought),
                         AgentEvent::Text(text) => WorkerEvent::Text(text),
+                        AgentEvent::ContextUsage(prompt_tokens) => {
+                            WorkerEvent::ContextUsage(prompt_tokens)
+                        }
                         AgentEvent::ToolResult { call, result } => {
                             WorkerEvent::FunctionCallOutput { call, result }
                         }
@@ -404,6 +417,20 @@ fn spawn_worker(
     });
 }
 
+fn resolve_profile_api_key(
+    profile: &ProviderProfile,
+    store: &impl SecretStore,
+) -> Result<String, String> {
+    credentials::resolve_api_key(profile, store)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "API key missing for provider profile `{}`. Run `roven auth set`.",
+                profile.name
+            )
+        })
+}
+
 fn apply_worker_event(
     state: &mut AppState,
     store: Option<&ProjectStore>,
@@ -414,6 +441,7 @@ fn apply_worker_event(
     match event {
         WorkerEvent::Thought(thought) => state.append_thought(thought),
         WorkerEvent::Text(text) => state.append_agent_text(text),
+        WorkerEvent::ContextUsage(prompt_tokens) => state.context_percent = Some(prompt_tokens),
         WorkerEvent::FunctionCallOutput { call, result } => {
             persist_function_call_output(store, session, &call, &result);
             state.tool(call.name, call.arguments, result.result);
@@ -688,9 +716,15 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        cell::RefCell,
+        fs,
+        sync::{Mutex, OnceLock},
+    };
 
     use crate::{
+        credentials::{CredentialError, SecretStore},
+        profiles::ProviderProfile,
         storage::{ConversationEvent, EventKind, ProjectStore},
         ui::state::{AppState, Role},
     };
@@ -698,10 +732,77 @@ mod tests {
     use super::{WorkerEvent, apply_worker_event};
     use crate::tools::{RovenToolCall, RovenToolResult};
 
+    #[derive(Default)]
+    struct MemoryStore {
+        value: RefCell<Option<String>>,
+    }
+
+    impl SecretStore for MemoryStore {
+        fn get(&self) -> Result<Option<String>, CredentialError> {
+            Ok(self.value.borrow().clone())
+        }
+
+        fn set(&self, secret: &str) -> Result<(), CredentialError> {
+            *self.value.borrow_mut() = Some(secret.to_owned());
+            Ok(())
+        }
+
+        fn delete(&self) -> Result<bool, CredentialError> {
+            Ok(self.value.borrow_mut().take().is_some())
+        }
+    }
+
     fn temp_root(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("roven-{name}-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&path).expect("temporary root should exist");
         path
+    }
+
+    fn profile(id: &str, endpoint: &str) -> ProviderProfile {
+        ProviderProfile {
+            id: id.to_owned(),
+            name: "provider".to_owned(),
+            endpoint: endpoint.to_owned(),
+            model: "model".to_owned(),
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock should not be poisoned")
+    }
+
+    #[test]
+    fn runtime_key_resolution_prefers_environment_and_falls_back_to_store() {
+        let _guard = env_lock();
+        let profile = profile(
+            "openrouter",
+            "https://openrouter.ai/api/v1/chat/completions",
+        );
+        let store = MemoryStore {
+            value: RefCell::new(Some("stored-secret".into())),
+        };
+        let previous = std::env::var_os("OPENROUTER_API_KEY");
+
+        unsafe { std::env::set_var("OPENROUTER_API_KEY", "env-secret") };
+        assert_eq!(
+            super::resolve_profile_api_key(&profile, &store).unwrap(),
+            "env-secret"
+        );
+
+        unsafe { std::env::set_var("OPENROUTER_API_KEY", "   ") };
+        assert_eq!(
+            super::resolve_profile_api_key(&profile, &store).unwrap(),
+            "stored-secret"
+        );
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("OPENROUTER_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
+        }
     }
 
     #[test]

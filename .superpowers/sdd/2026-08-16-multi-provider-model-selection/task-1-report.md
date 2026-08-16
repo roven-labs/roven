@@ -85,3 +85,63 @@ Key results:
 
 - The explicit Ollama allowlist is intentionally small and currently includes the repo-known models `minimax-m3:cloud` and `gemma4:31b-cloud`. If PMEMC expects a broader supported Ollama Cloud catalog, Task 2 should expand it from a canonical product list before the UI starts enforcing model switches against it.
 - `resolve_api_key(profile, store)` is implemented and tested, but the current UI worker still reads the keyring directly because `src/ui/terminal.rs` is outside the Task 1 file list. The environment-first behavior is therefore available as the new credential interface, but not yet wired into the runtime path in this task.
+
+## Fix Round 1
+
+### Scope
+
+Addressed both review findings without expanding into `/model` or startup-banner work:
+
+- Wired `credentials::resolve_api_key` into the real runtime path in `src/ui/terminal.rs` with environment-first lookup and keyring fallback.
+- Made OpenAI-compatible tool-call accumulation accept compact `data:` SSE prefixes in `src/provider.rs`.
+
+### Files changed
+
+- `src/ui/terminal.rs`
+  - Added `resolve_profile_api_key(profile, store)` and used it from `spawn_worker`.
+  - Added a focused regression test proving runtime env-key precedence and keyring fallback.
+- `src/provider.rs`
+  - Normalized `append_tool_call_deltas` to accept both `data:` and `data: ` prefixes.
+  - Added a regression test proving compact tool-call chunks survive accumulation.
+
+### TDD checkpoint before production edits
+
+Command:
+
+```powershell
+cargo test runtime_key_resolution_prefers_environment_and_falls_back_to_store -- --exact --nocapture
+```
+
+Observed failure:
+
+```text
+error[E0425]: cannot find function `resolve_profile_api_key` in module `super`
+```
+
+This was the expected missing-runtime-wiring failure before the production edit.
+
+### Verification
+
+Commands run:
+
+```powershell
+cargo test runtime_key_resolution_prefers_environment_and_falls_back_to_store -- --nocapture
+cargo test compact_tool_call_chunks_become_roven_tool_calls -- --nocapture
+cargo test
+```
+
+Observed output summary:
+
+- `cargo test runtime_key_resolution_prefers_environment_and_falls_back_to_store -- --nocapture`
+  - `1 passed; 0 failed`
+- `cargo test compact_tool_call_chunks_become_roven_tool_calls -- --nocapture`
+  - `1 passed; 0 failed`
+- `cargo test`
+  - Library tests: `126 passed; 0 failed`
+  - CLI tests: `3 passed; 0 failed`
+  - Doctests: `0 failed`
+
+### Fix-round concerns
+
+- The earlier Task 1 concern about runtime env-key wiring is resolved by the `src/ui/terminal.rs` change in this fix round.
+- The Ollama allowlist concern remains unchanged: it still intentionally includes only the repo-known models `minimax-m3:cloud` and `gemma4:31b-cloud`.
