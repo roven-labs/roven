@@ -876,8 +876,8 @@ mod tests {
 
     use super::{
         BlockedReason, ListDirectory, ListDirectoryInput, PrepareProject, PrepareProjectInput,
-        PrepareProjectResult, ReadFile, ReadFileInput, RovenToolCall, ToolContext, definitions,
-        dispatch,
+        PrepareProjectResult, READ_FILE_DESCRIPTION, ReadFile, ReadFileInput, RovenToolCall,
+        ToolContext, definitions, dispatch,
     };
 
     fn temp_root(name: &str) -> PathBuf {
@@ -1573,6 +1573,27 @@ mod tests {
             json!({
                 "status": "ok",
                 "tools": expected,
+            })
+        );
+        let read_file = result.result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "read_file")
+            .expect("read_file must be registered");
+        assert_eq!(read_file["description"], READ_FILE_DESCRIPTION);
+        assert_eq!(
+            read_file["input_schema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative text file path."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
             })
         );
         let invalid = dispatch(
