@@ -1,5 +1,6 @@
 //! Operating-system credential-store support for named provider profiles.
 
+use crate::{model_catalog::ProviderKind, profiles::ProviderProfile};
 use thiserror::Error;
 
 const SERVICE_NAME: &str = "roven";
@@ -90,14 +91,32 @@ pub(crate) fn store_confirmed_api_key(
     store.set(secret)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn resolve_api_key(
+    profile: &ProviderProfile,
+    store: &impl SecretStore,
+) -> Result<Option<String>, CredentialError> {
+    if let Some(secret) = ProviderKind::from_endpoint(&profile.endpoint)
+        .and_then(|kind| std::env::var(kind.api_key_env_var()).ok())
+        .filter(|secret| !secret.trim().is_empty())
+    {
+        return Ok(Some(secret));
+    }
+    store.get()
+}
+
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::{
+        cell::RefCell,
+        sync::{Mutex, OnceLock},
+    };
 
     use super::{
-        CredentialError, OsCredentialStore, SecretStore, credential_account,
+        CredentialError, OsCredentialStore, SecretStore, credential_account, resolve_api_key,
         store_confirmed_api_key,
     };
+    use crate::profiles::ProviderProfile;
 
     #[derive(Default)]
     struct MemoryStore {
@@ -263,5 +282,45 @@ mod tests {
             Some("existing-secret"),
             "failure must not clear a retained credential"
         );
+    }
+
+    fn profile(id: &str, endpoint: &str) -> ProviderProfile {
+        ProviderProfile {
+            id: id.to_owned(),
+            name: "provider".to_owned(),
+            endpoint: endpoint.to_owned(),
+            model: "model".to_owned(),
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock should not be poisoned")
+    }
+
+    #[test]
+    fn environment_key_takes_precedence_over_the_stored_profile_key() {
+        let _guard = env_lock();
+        let profile = profile(
+            "openrouter",
+            "https://openrouter.ai/api/v1/chat/completions",
+        );
+        let store = MemoryStore {
+            value: RefCell::new(Some("stored-secret".into())),
+            failure: false,
+        };
+
+        let previous = std::env::var_os("OPENROUTER_API_KEY");
+        unsafe { std::env::set_var("OPENROUTER_API_KEY", "env-secret") };
+        let resolved = resolve_api_key(&profile, &store).unwrap();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("OPENROUTER_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
+        }
+
+        assert_eq!(resolved.as_deref(), Some("env-secret"));
     }
 }

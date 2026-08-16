@@ -3,7 +3,11 @@
 mod agent;
 mod cli;
 mod commands;
+mod context;
 mod credentials;
+mod model_catalog;
+mod ollama;
+mod openrouter;
 mod profiles;
 mod provider;
 mod runtime_log;
