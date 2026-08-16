@@ -755,10 +755,8 @@ fn tool_detail_lines(input: &Value, output: &Value) -> Vec<String> {
         if let Some(name) = project.get("name").and_then(Value::as_str) {
             details.push(format!("Project: {name}"));
         }
-        if !saw_path {
-            if let Some(path) = project.get("path").and_then(Value::as_str) {
-                details.push(format!("Path: {path}"));
-            }
+        if !saw_path && let Some(path) = project.get("path").and_then(Value::as_str) {
+            details.push(format!("Path: {path}"));
         }
     }
 

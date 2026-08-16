@@ -39,6 +39,25 @@ where
     }
 }
 
+pub(crate) fn banner_lines(status: StartupProviderStatus) -> Vec<&'static str> {
+    match status {
+        StartupProviderStatus::NoProviderAccess => vec![
+            "OpenRouter: missing",
+            "Ollama Cloud: missing",
+            "Next step: roven auth set",
+        ],
+        StartupProviderStatus::OpenRouterOnly => {
+            vec!["OpenRouter: configured", "Ollama Cloud: missing"]
+        }
+        StartupProviderStatus::OllamaOnly => {
+            vec!["OpenRouter: missing", "Ollama Cloud: configured"]
+        }
+        StartupProviderStatus::BothConfigured => {
+            vec!["OpenRouter: configured", "Ollama Cloud: configured"]
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{StartupProviderStatus, detect_provider_status};
@@ -62,24 +81,5 @@ mod tests {
             detect_provider_status(&[], |_| false, |_| false),
             StartupProviderStatus::NoProviderAccess
         );
-    }
-}
-
-pub(crate) fn banner_lines(status: StartupProviderStatus) -> Vec<&'static str> {
-    match status {
-        StartupProviderStatus::NoProviderAccess => vec![
-            "OpenRouter: missing",
-            "Ollama Cloud: missing",
-            "Next step: roven auth set",
-        ],
-        StartupProviderStatus::OpenRouterOnly => {
-            vec!["OpenRouter: configured", "Ollama Cloud: missing"]
-        }
-        StartupProviderStatus::OllamaOnly => {
-            vec!["OpenRouter: missing", "Ollama Cloud: configured"]
-        }
-        StartupProviderStatus::BothConfigured => {
-            vec!["OpenRouter: configured", "Ollama Cloud: configured"]
-        }
     }
 }

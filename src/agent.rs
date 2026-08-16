@@ -6,7 +6,8 @@ use crate::tools::{
     RovenToolCall, RovenToolDefinition, RovenToolResult, ToolContext, definitions, dispatch,
 };
 use crate::{
-    provider::{OpenAiCompatibleProvider, ProviderError},
+    context,
+    provider::{Provider, ProviderError},
     runtime_log::RuntimeLog,
 };
 
@@ -48,6 +49,8 @@ pub(crate) enum ProviderEvent {
     Thought(String),
     Text(String),
     ToolCalls(Vec<RovenToolCall>),
+    ContextUsage(usize),
+    ResponseFinished,
     Finished,
     Cancelled,
 }
@@ -60,21 +63,35 @@ pub(crate) enum AgentEvent {
         call: RovenToolCall,
         result: RovenToolResult,
     },
+    ContextUsage(usize),
     Finished,
     Cancelled,
+}
+
+pub(crate) struct AgentRun<'a> {
+    pub(crate) provider: &'a dyn Provider,
+    pub(crate) api_key: &'a str,
+    pub(crate) tool_context: &'a ToolContext,
+    pub(crate) context_window: Option<usize>,
+    pub(crate) cancelled: &'a AtomicBool,
+    pub(crate) runtime_log: Option<&'a RuntimeLog>,
 }
 
 /// Continue the same user turn until the provider produces a final response.
 /// Tool execution and authorization stay here; adapters only transport events.
 pub(crate) fn run(
-    provider: &OpenAiCompatibleProvider,
-    api_key: &str,
+    agent_run: AgentRun<'_>,
     mut messages: Vec<AgentMessage>,
-    context: &ToolContext,
-    cancelled: &AtomicBool,
-    runtime_log: Option<&RuntimeLog>,
     emit: &mut dyn FnMut(AgentEvent),
 ) -> Result<(), ProviderError> {
+    let AgentRun {
+        provider,
+        api_key,
+        tool_context,
+        context_window,
+        cancelled,
+        runtime_log,
+    } = agent_run;
     loop {
         let request = AgentRequest::new(messages.clone());
         record(
@@ -92,8 +109,12 @@ pub(crate) fn run(
         let mut finished = false;
         let mut was_cancelled = false;
 
-        if let Err(error) =
-            provider.stream(api_key, &request, cancelled, &mut |event| match event {
+        if let Err(error) = provider.stream(
+            api_key,
+            &request,
+            cancelled,
+            runtime_log,
+            &mut |event| match event {
                 ProviderEvent::Thought(thought) => {
                     response_reasoning.push_str(&thought);
                     record(
@@ -120,6 +141,18 @@ pub(crate) fn run(
                     );
                     tool_calls = Some(calls);
                 }
+                ProviderEvent::ContextUsage(prompt_tokens) => {
+                    if let Some(context_window) = context_window {
+                        let context_percent = context::percent(prompt_tokens, context_window);
+                        record(
+                            runtime_log,
+                            "context_usage_received",
+                            &format!("percent={context_percent}"),
+                        );
+                        emit(AgentEvent::ContextUsage(context_percent));
+                    }
+                }
+                ProviderEvent::ResponseFinished => {}
                 ProviderEvent::Finished => {
                     record(runtime_log, "model_response_finished", "outcome=finished");
                     finished = true;
@@ -128,8 +161,8 @@ pub(crate) fn run(
                     record(runtime_log, "model_response_cancelled", "outcome=cancelled");
                     was_cancelled = true;
                 }
-            })
-        {
+            },
+        ) {
             record(
                 runtime_log,
                 "model_request_failed",
@@ -154,7 +187,7 @@ pub(crate) fn run(
                     "tool_dispatch_started",
                     &format!("name={}", call.name),
                 );
-                let result = dispatch(context, call.clone());
+                let result = dispatch(tool_context, call.clone());
                 let status = result
                     .result
                     .get("status")
@@ -200,15 +233,32 @@ mod tests {
     use std::{cell::RefCell, fs, sync::atomic::AtomicBool};
 
     use crate::{
-        provider::{OpenAiCompatibleProvider, ProviderError, test_support},
+        provider::{OpenAiCompatibleProvider, Provider, ProviderError, test_support},
         runtime_log::RuntimeLog,
         tools::ToolContext,
     };
 
-    use super::{AgentEvent, AgentMessage, run};
+    use super::{AgentEvent, AgentMessage, AgentRun, run};
 
     fn workspace() -> std::path::PathBuf {
         std::env::current_dir().unwrap().canonicalize().unwrap()
+    }
+
+    struct ContextUsageProvider;
+
+    impl Provider for ContextUsageProvider {
+        fn stream(
+            &self,
+            _api_key: &str,
+            _request: &super::AgentRequest,
+            _cancelled: &AtomicBool,
+            _runtime_log: Option<&RuntimeLog>,
+            emit: &mut dyn FnMut(super::ProviderEvent),
+        ) -> Result<(), ProviderError> {
+            emit(super::ProviderEvent::ContextUsage(50));
+            emit(super::ProviderEvent::Finished);
+            Ok(())
+        }
     }
 
     #[test]
@@ -220,14 +270,17 @@ mod tests {
         let events = RefCell::new(Vec::new());
 
         run(
-            &provider,
-            "key",
+            AgentRun {
+                provider: &provider,
+                api_key: "key",
+                tool_context: &ToolContext::new(workspace()).unwrap(),
+                context_window: None,
+                cancelled: &AtomicBool::new(false),
+                runtime_log: None,
+            },
             vec![AgentMessage::User {
                 content: "hello".to_owned(),
             }],
-            &ToolContext::new(workspace()).unwrap(),
-            &AtomicBool::new(false),
-            None,
             &mut |event| events.borrow_mut().push(event),
         )
         .unwrap();
@@ -261,14 +314,17 @@ mod tests {
         let events = RefCell::new(Vec::new());
 
         run(
-            &provider,
-            "key",
+            AgentRun {
+                provider: &provider,
+                api_key: "key",
+                tool_context: &ToolContext::new(workspace()).unwrap(),
+                context_window: None,
+                cancelled: &AtomicBool::new(false),
+                runtime_log: None,
+            },
             vec![AgentMessage::User {
                 content: "register this".to_owned(),
             }],
-            &ToolContext::new(workspace()).unwrap(),
-            &AtomicBool::new(false),
-            None,
             &mut |event| events.borrow_mut().push(event),
         )
         .unwrap();
@@ -299,14 +355,17 @@ mod tests {
         let events = RefCell::new(Vec::new());
 
         run(
-            &provider,
-            "key",
+            AgentRun {
+                provider: &provider,
+                api_key: "key",
+                tool_context: &ToolContext::new(workspace()).unwrap(),
+                context_window: None,
+                cancelled: &AtomicBool::new(false),
+                runtime_log: None,
+            },
             vec![AgentMessage::User {
                 content: "read Cargo.toml".to_owned(),
             }],
-            &ToolContext::new(workspace()).unwrap(),
-            &AtomicBool::new(false),
-            None,
             &mut |event| events.borrow_mut().push(event),
         )
         .unwrap();
@@ -340,14 +399,17 @@ mod tests {
         let log = RuntimeLog::for_file(&log_path).unwrap();
 
         let result = run(
-            &provider,
-            "key",
+            AgentRun {
+                provider: &provider,
+                api_key: "key",
+                tool_context: &ToolContext::new(workspace()).unwrap(),
+                context_window: None,
+                cancelled: &AtomicBool::new(false),
+                runtime_log: Some(&log),
+            },
             vec![AgentMessage::User {
                 content: "hello".to_owned(),
             }],
-            &ToolContext::new(workspace()).unwrap(),
-            &AtomicBool::new(false),
-            Some(&log),
             &mut |_| {},
         );
 
@@ -368,18 +430,50 @@ mod tests {
         let provider = OpenAiCompatibleProvider::new(endpoint, "test-model".to_owned());
         let events = RefCell::new(Vec::new());
         run(
-            &provider,
-            "key",
+            AgentRun {
+                provider: &provider,
+                api_key: "key",
+                tool_context: &ToolContext::new(workspace()).unwrap(),
+                context_window: None,
+                cancelled: &AtomicBool::new(true),
+                runtime_log: None,
+            },
             vec![AgentMessage::User {
                 content: "cancel".to_owned(),
             }],
-            &ToolContext::new(workspace()).unwrap(),
-            &AtomicBool::new(true),
-            None,
             &mut |event| events.borrow_mut().push(event),
         )
         .unwrap();
         assert_eq!(events.into_inner(), vec![AgentEvent::Cancelled]);
         assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn agent_run_groups_runtime_dependencies_without_changing_context_usage() {
+        let provider = ContextUsageProvider;
+        let events = RefCell::new(Vec::new());
+        let tool_context = ToolContext::new(workspace()).unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        run(
+            AgentRun {
+                provider: &provider,
+                api_key: "key",
+                tool_context: &tool_context,
+                context_window: Some(100),
+                cancelled: &cancelled,
+                runtime_log: None,
+            },
+            vec![AgentMessage::User {
+                content: "hello".to_owned(),
+            }],
+            &mut |event| events.borrow_mut().push(event),
+        )
+        .unwrap();
+
+        assert_eq!(
+            events.into_inner(),
+            vec![AgentEvent::ContextUsage(50), AgentEvent::Finished]
+        );
     }
 }

@@ -194,14 +194,14 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
             continue;
         }
         if state.model_selection.is_some() {
-            if let Event::Key(key) = event {
-                if let Err(error) = handle_model_selection_key(
+            if let Event::Key(key) = event
+                && let Err(error) = handle_model_selection_key(
                     &mut state,
                     &ProviderProfiles::for_current_user()?,
                     key,
-                ) {
-                    state.activity(error);
-                }
+                )
+            {
+                state.activity(error);
             }
             continue;
         }
@@ -399,13 +399,15 @@ fn spawn_worker(
                 Box::new(OpenAiCompatibleProvider::new(endpoint, model))
             };
             agent::run(
-                provider.as_ref(),
-                &key,
+                agent::AgentRun {
+                    provider: provider.as_ref(),
+                    api_key: &key,
+                    tool_context: &tool_context,
+                    context_window,
+                    cancelled: &cancelled,
+                    runtime_log: runtime_log.as_ref(),
+                },
                 messages,
-                &tool_context,
-                context_window,
-                &cancelled,
-                runtime_log.as_ref(),
                 &mut |event| {
                     let message = match event {
                         AgentEvent::Thought(thought) => WorkerEvent::Thought(thought),
