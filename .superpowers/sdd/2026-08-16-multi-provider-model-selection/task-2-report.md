@@ -94,3 +94,46 @@ Result: all tests passed.
 
 - The repository already had unrelated dirty changes outside Task 2, including `src/tools.rs` and documentation/context files. They were left untouched.
 - `src/ui/state.rs` and `src/ui/view.rs` already contained uncommitted Task 1-era context footer changes in the worktree; Task 2 builds on those current on-disk files rather than reverting or splitting them.
+
+## Fix round 1
+
+Date: 2026-08-16
+
+Reviewer note addressed: the `/model` save path no longer performs separate `update_model` and `set_default` writes.
+
+### What changed
+
+- Replaced the split profile writes with `ProviderProfiles::switch_model_and_default(id, model)`.
+- The new operation:
+  - reads one profile document
+  - updates the selected profile model
+  - updates `default_profile_id`
+  - commits once through the existing atomic file writer
+- Updated the `/model` save path in `src/ui/terminal.rs` to use that single operation.
+
+### Regression coverage
+
+- Replaced the old profile update test with:
+  - `profiles::tests::switch_model_and_default_updates_both_fields_in_one_operation`
+- Re-ran the existing `/model` behavior tests to preserve:
+  - successful switching
+  - blank cancel
+  - Escape cancel
+  - unsupported-model errors preserving prior selection
+
+### Verification
+
+Focused tests:
+
+```powershell
+cargo test switch_model_and_default_updates_both_fields_in_one_operation -- --nocapture
+cargo test ui::terminal::tests:: -- --nocapture
+```
+
+Full suite:
+
+```powershell
+cargo test -- --nocapture
+```
+
+Result: all tests passed.

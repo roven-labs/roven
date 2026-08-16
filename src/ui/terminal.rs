@@ -538,10 +538,7 @@ fn handle_model_selection_key(
                         return Ok(false);
                     }
                     let updated = profiles
-                        .update_model(&choice.id, &model)
-                        .map_err(|error| error.to_string())?;
-                    profiles
-                        .set_default(&choice.id)
+                        .switch_model_and_default(&choice.id, &model)
                         .map_err(|error| error.to_string())?;
                     refresh_provider_model_from(state, profiles);
                     state.close_model_selection();

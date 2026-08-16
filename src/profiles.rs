@@ -120,7 +120,7 @@ impl ProviderProfiles {
         self.write(&document)
     }
 
-    pub(crate) fn update_model(
+    pub(crate) fn switch_model_and_default(
         &self,
         id: &str,
         model: &str,
@@ -136,6 +136,7 @@ impl ProviderProfiles {
             .find(|profile| profile.id == id)
             .ok_or_else(|| ProfileError::NotFound(id.to_owned()))?;
         profile.model = model.to_owned();
+        document.default_profile_id = Some(id.to_owned());
         let updated = profile.clone();
         self.write(&document)?;
         Ok(updated)
@@ -279,8 +280,8 @@ mod tests {
     }
 
     #[test]
-    fn update_model_only_changes_the_selected_profile() {
-        let data_root = temp_root("provider-profile-update");
+    fn switch_model_and_default_updates_both_fields_in_one_operation() {
+        let data_root = temp_root("provider-profile-switch");
         let profiles = ProviderProfiles::for_data_root(data_root.clone());
         let first = profiles
             .create(
@@ -292,11 +293,16 @@ mod tests {
         let second = profiles
             .create("ollama", "https://ollama.com/api/chat", "minimax-m3:cloud")
             .unwrap();
+        profiles.set_default(&first.id).unwrap();
 
-        let updated = profiles.update_model(&second.id, "gpt-oss:120b-cloud").unwrap();
+        let updated = profiles
+            .switch_model_and_default(&second.id, "gpt-oss:120b-cloud")
+            .unwrap();
         let listed = profiles.list().unwrap();
 
+        assert_eq!(updated.id, second.id);
         assert_eq!(updated.model, "gpt-oss:120b-cloud");
+        assert_eq!(profiles.default_profile().unwrap().unwrap().id, second.id);
         assert_eq!(
             listed.iter().find(|profile| profile.id == first.id).unwrap().model,
             "openai/gpt-oss-20b"
