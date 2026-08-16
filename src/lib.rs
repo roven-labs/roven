@@ -1,5 +1,9 @@
 //! Testable application entry points for Roven.
 
+use std::{io, path::PathBuf};
+
+use directories::ProjectDirs;
+
 mod agent;
 mod cli;
 mod commands;
@@ -12,6 +16,15 @@ mod tools;
 mod ui;
 
 use runtime_log::RuntimeLog;
+
+const QUALIFIER: &str = "io.github.vishal24p";
+const APPLICATION: &str = "Roven";
+
+pub(crate) fn app_data_root() -> io::Result<PathBuf> {
+    ProjectDirs::from(QUALIFIER, "", APPLICATION)
+        .map(|directories| directories.data_local_dir().to_path_buf())
+        .ok_or_else(|| io::Error::other("the operating-system local data directory is unavailable"))
+}
 
 /// Run the Roven command.
 ///

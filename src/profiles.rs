@@ -1,13 +1,10 @@
 use std::{fs, io::Write, path::PathBuf};
 
 use atomic_write_file::AtomicWriteFile;
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
-const QUALIFIER: &str = "io.github.vishal24p";
-const APPLICATION: &str = "Roven";
 const PROFILES_FILE: &str = "provider-profiles.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,11 +48,9 @@ struct ProfileDocument {
 
 impl ProviderProfiles {
     pub(crate) fn for_current_user() -> Result<Self, ProfileError> {
-        let directories = ProjectDirs::from(QUALIFIER, "", APPLICATION)
-            .ok_or(ProfileError::DataDirectoryUnavailable)?;
-        Ok(Self::for_data_root(
-            directories.data_local_dir().to_path_buf(),
-        ))
+        let data_root =
+            crate::app_data_root().map_err(|_| ProfileError::DataDirectoryUnavailable)?;
+        Ok(Self::for_data_root(data_root))
     }
 
     pub(crate) fn for_data_root(data_root: PathBuf) -> Self {

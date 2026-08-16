@@ -8,20 +8,14 @@ use std::{
 };
 
 use atomic_write_file::AtomicWriteFile;
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-const QUALIFIER: &str = "io.github.vishal24p";
-const APPLICATION: &str = "Roven";
-
 #[derive(Debug, Error)]
 pub(crate) enum StorageError {
-    #[error("the operating-system local data directory is unavailable")]
-    DataDirectoryUnavailable,
     #[error("local Roven storage could not be read or written")]
     Io(#[from] std::io::Error),
     #[error("local Roven storage contains invalid structured data")]
@@ -53,9 +47,7 @@ pub(crate) struct ProjectRegistry {
 
 impl ProjectRegistry {
     pub(crate) fn for_current_user() -> Result<Self, StorageError> {
-        let project_dirs = ProjectDirs::from(QUALIFIER, "", APPLICATION)
-            .ok_or(StorageError::DataDirectoryUnavailable)?;
-        Ok(Self::for_data_root(project_dirs.data_local_dir()))
+        Ok(Self::for_data_root(crate::app_data_root()?))
     }
 
     pub(crate) fn for_data_root(data_root: impl Into<PathBuf>) -> Self {
@@ -228,9 +220,8 @@ pub(crate) struct ProjectStore {
 impl ProjectStore {
     pub(crate) fn for_current_directory() -> Result<Self, StorageError> {
         let project_root = std::env::current_dir()?.canonicalize()?;
-        let project_dirs = ProjectDirs::from(QUALIFIER, "", APPLICATION)
-            .ok_or(StorageError::DataDirectoryUnavailable)?;
-        Self::for_project(project_dirs.data_local_dir(), &project_root)
+        let data_root = crate::app_data_root()?;
+        Self::for_project(&data_root, &project_root)
     }
 
     pub(crate) fn for_project(data_root: &Path, project_root: &Path) -> Result<Self, StorageError> {
