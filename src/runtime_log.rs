@@ -7,12 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use directories::ProjectDirs;
-
 use crate::storage::now_ms;
-
-const QUALIFIER: &str = "io.github.vishal24p";
-const APPLICATION: &str = "Roven";
 
 #[derive(Clone)]
 pub(crate) struct RuntimeLog {
@@ -22,10 +17,7 @@ pub(crate) struct RuntimeLog {
 
 impl RuntimeLog {
     pub(crate) fn for_current_user() -> io::Result<Self> {
-        let dirs = ProjectDirs::from(QUALIFIER, "", APPLICATION).ok_or_else(|| {
-            io::Error::other("the operating-system local data directory is unavailable")
-        })?;
-        Self::for_file(dirs.data_local_dir().join("log.md"))
+        Self::for_file(crate::app_data_root()?.join("log.md"))
     }
 
     pub(crate) fn for_file(path: impl Into<PathBuf>) -> io::Result<Self> {

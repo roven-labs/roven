@@ -1,24 +1,37 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Margin, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use super::state::AppState;
 use super::transcript::render_message;
+use super::{
+    startup::{self, StartupProviderStatus},
+    state::{AppState, ModelSelection},
+};
 
 pub(crate) const MINIMUM_WIDTH: u16 = 40;
 pub(crate) const MINIMUM_HEIGHT: u16 = 8;
 
-const MUTED_STYLE: Style = Style::new().fg(Color::DarkGray);
-const STATUS_STYLE: Style = Style::new().fg(Color::LightCyan);
-const TRUST_TITLE_STYLE: Style = Style::new().fg(Color::LightBlue);
-const TRUST_PATH_STYLE: Style = Style::new().fg(Color::Yellow);
+const SCREEN_STYLE: Style = Style::new().fg(Color::Gray).bg(Color::Black);
+const FRAME_STYLE: Style = Style::new().fg(Color::DarkGray).bg(Color::Black);
+const MUTED_STYLE: Style = Style::new().fg(Color::DarkGray).bg(Color::Black);
+const PRIMARY_STYLE: Style = Style::new().fg(Color::White).bg(Color::Black);
+const STATUS_STYLE: Style = Style::new()
+    .fg(Color::Gray)
+    .bg(Color::Black)
+    .add_modifier(Modifier::BOLD);
+const TRUST_TITLE_STYLE: Style = Style::new().fg(Color::White);
+const TRUST_PATH_STYLE: Style = Style::new().fg(Color::Gray);
 const TRUST_BODY_STYLE: Style = Style::new().fg(Color::Gray);
-const TRUST_SELECTED_STYLE: Style = Style::new().fg(Color::LightCyan);
+const TRUST_SELECTED_STYLE: Style = Style::new().fg(Color::White);
 const TRUST_UNSELECTED_STYLE: Style = Style::new().fg(Color::DarkGray);
+const FOOTER_STYLE: Style = Style::new().fg(Color::DarkGray).bg(Color::Black);
+
+const COMPOSER_PREFIX: &str = "→ ";
+const COMPOSER_PLACEHOLDER: &str = "Add a follow-up";
 
 pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
@@ -65,6 +78,12 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
                     "No source search or file edits",
                     TRUST_BODY_STYLE,
                 )),
+                Line::from(""),
+                Line::from(Span::styled("PROVIDER ACCESS", MUTED_STYLE)),
+                Line::from(""),
+                startup_provider_line(state.startup_provider_status, 0),
+                startup_provider_line(state.startup_provider_status, 1),
+                startup_provider_line(state.startup_provider_status, 2),
                 Line::from(""),
                 Line::from(Span::styled("CHOOSE", MUTED_STYLE)),
                 Line::from(""),
@@ -128,18 +147,40 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
         return;
     }
 
+    if let Some(selection) = &state.model_selection {
+        draw_model_selection(frame, area, selection);
+        return;
+    }
+
+    let chat_area = area.inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+
     let composer_height = composer_height(&state.input);
     let status_height = u16::from(state.status.is_some());
-    let [transcript_area, status_area, composer_area] = Layout::vertical([
+    let [transcript_area, status_area, composer_area, footer_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(status_height),
         Constraint::Length(composer_height),
+        Constraint::Length(1),
     ])
-    .areas(area);
+    .areas(chat_area);
 
     draw_transcript(frame, transcript_area, state);
     draw_status_bar(frame, status_area, state);
     draw_composer(frame, composer_area, state);
+    draw_footer(frame, footer_area, state);
+}
+
+fn startup_provider_line(status: Option<StartupProviderStatus>, index: usize) -> Line<'static> {
+    let Some(status) = status else {
+        return Line::from("");
+    };
+    startup::banner_lines(status)
+        .get(index)
+        .map(|line| Line::from(Span::styled((*line).to_owned(), TRUST_BODY_STYLE)))
+        .unwrap_or_else(|| Line::from(""))
 }
 
 fn display_workspace_path(path: &str) -> &str {
@@ -170,7 +211,12 @@ fn draw_transcript(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let maximum_scroll = line_count.saturating_sub(area.height);
     state.set_scroll_limit(maximum_scroll);
     let scroll_from_top = maximum_scroll.saturating_sub(state.scroll_offset);
-    frame.render_widget(Paragraph::new(lines).scroll((scroll_from_top, 0)), area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(SCREEN_STYLE)
+            .scroll((scroll_from_top, 0)),
+        area,
+    );
 
     if state.is_scrolled_away_from_latest() && area.width > 1 {
         let indicator_area = Rect::new(area.x + area.width - 1, area.y, 1, area.height);
@@ -182,16 +228,20 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
     let Some(status) = state.status.as_deref() else {
         return;
     };
-    frame.render_widget(Paragraph::new(Span::styled(status, STATUS_STYLE)), area);
+    frame.render_widget(
+        Paragraph::new(Span::styled(status, STATUS_STYLE)).style(SCREEN_STYLE),
+        area,
+    );
 }
 
 fn draw_composer(frame: &mut Frame, area: Rect, state: &AppState) {
     let visible_input = visible_composer_text(&state.input);
-    let composer = Paragraph::new(visible_input.as_str())
+    let composer = Paragraph::new(composer_lines(&visible_input))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(MUTED_STYLE),
+                .border_style(FRAME_STYLE)
+                .style(SCREEN_STYLE),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(composer, area);
@@ -203,15 +253,115 @@ fn draw_composer(frame: &mut Frame, area: Rect, state: &AppState) {
     let cursor_x = area
         .x
         .saturating_add(1)
+        .saturating_add(COMPOSER_PREFIX.chars().count() as u16)
         .saturating_add(last_line_width)
         .min(area.x.saturating_add(area.width).saturating_sub(2));
     let cursor_y = area
         .y
         .saturating_add(visible_lines.len().saturating_sub(1) as u16)
         .saturating_add(1);
-    if !state.running {
-        frame.set_cursor_position((cursor_x, cursor_y));
+    frame.set_cursor_position((cursor_x, cursor_y));
+}
+
+fn draw_footer(frame: &mut Frame, area: Rect, state: &AppState) {
+    let model = state
+        .provider_model
+        .as_deref()
+        .unwrap_or("No configured model");
+    let context = state.context_percent.map_or_else(
+        || "context unavailable".to_owned(),
+        |percent| format!("{percent}% context used"),
+    );
+    let footer = format!("{model} · {context}");
+    frame.render_widget(Paragraph::new(footer).style(FOOTER_STYLE), area);
+}
+
+fn draw_model_selection(frame: &mut Frame, area: Rect, selection: &ModelSelection) {
+    match selection {
+        ModelSelection::Provider { entries, index } => {
+            let items = entries
+                .iter()
+                .enumerate()
+                .map(|(entry_index, entry)| {
+                    let marker = if entry_index == *index { ">" } else { " " };
+                    format!(
+                        "{marker} {} · {} · {}",
+                        entry.name,
+                        entry.model,
+                        entry.access.label()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Switch model\n\nChoose provider\n\n{items}\n\nEnter select   Esc cancel"
+                ))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(MUTED_STYLE),
+                ),
+                area,
+            );
+        }
+        ModelSelection::Model {
+            choice,
+            value,
+            error,
+        } => {
+            let body = format!(
+                "Switch model\n\nProvider: {}\nAccess: {}\nCurrent model: {}\n\nNew model ID\n> {}\n\n{}\n{}",
+                choice.name,
+                choice.access.label(),
+                choice.model,
+                value,
+                error.as_deref().unwrap_or(""),
+                "Enter save   blank Enter/Esc cancel"
+            );
+            frame.render_widget(
+                Paragraph::new(body)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(MUTED_STYLE),
+                    )
+                    .wrap(Wrap { trim: false }),
+                area,
+            );
+            let cursor_x = area
+                .x
+                .saturating_add(3)
+                .saturating_add(value.chars().count() as u16)
+                .min(area.x.saturating_add(area.width).saturating_sub(2));
+            let cursor_y = area.y.saturating_add(6);
+            frame.set_cursor_position((cursor_x, cursor_y));
+        }
     }
+}
+
+fn composer_lines(input: &str) -> Vec<Line<'static>> {
+    if input.is_empty() {
+        return vec![Line::from(vec![
+            Span::styled(COMPOSER_PREFIX, MUTED_STYLE),
+            Span::styled(COMPOSER_PLACEHOLDER, MUTED_STYLE),
+        ])];
+    }
+
+    input
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            if index == 0 {
+                Line::from(vec![
+                    Span::styled(COMPOSER_PREFIX, PRIMARY_STYLE),
+                    Span::styled(line.to_owned(), PRIMARY_STYLE),
+                ])
+            } else {
+                Line::from(Span::styled(format!("  {line}"), PRIMARY_STYLE))
+            }
+        })
+        .collect()
 }
 
 fn visible_composer_text(input: &str) -> String {
@@ -229,7 +379,10 @@ mod tests {
     };
 
     use super::{MINIMUM_HEIGHT, MINIMUM_WIDTH, draw};
-    use crate::ui::state::AppState;
+    use crate::ui::{
+        startup::StartupProviderStatus,
+        state::{AppState, ModelSelection, ProviderAccessState, ProviderChoice},
+    };
 
     fn render(state: &mut AppState, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
@@ -261,9 +414,59 @@ mod tests {
     }
 
     #[test]
+    fn trust_screen_shows_no_provider_access_and_setup_step() {
+        let mut state = AppState::new();
+        state.startup_provider_status = Some(StartupProviderStatus::NoProviderAccess);
+
+        let rendered = render(&mut state, 80, 24);
+
+        assert!(rendered.contains("PROVIDER ACCESS"));
+        assert!(rendered.contains("OpenRouter: missing"));
+        assert!(rendered.contains("Ollama Cloud: missing"));
+        assert!(rendered.contains("roven auth set"));
+    }
+
+    #[test]
+    fn trust_screen_shows_openrouter_only_access() {
+        let mut state = AppState::new();
+        state.startup_provider_status = Some(StartupProviderStatus::OpenRouterOnly);
+
+        let rendered = render(&mut state, 80, 24);
+
+        assert!(rendered.contains("OpenRouter: configured"));
+        assert!(rendered.contains("Ollama Cloud: missing"));
+        assert!(!rendered.contains("Run `roven auth set`"));
+    }
+
+    #[test]
+    fn trust_screen_shows_ollama_only_access() {
+        let mut state = AppState::new();
+        state.startup_provider_status = Some(StartupProviderStatus::OllamaOnly);
+
+        let rendered = render(&mut state, 80, 24);
+
+        assert!(rendered.contains("OpenRouter: missing"));
+        assert!(rendered.contains("Ollama Cloud: configured"));
+        assert!(!rendered.contains("Run `roven auth set`"));
+    }
+
+    #[test]
+    fn trust_screen_shows_both_provider_access_states() {
+        let mut state = AppState::new();
+        state.startup_provider_status = Some(StartupProviderStatus::BothConfigured);
+
+        let rendered = render(&mut state, 80, 24);
+
+        assert!(rendered.contains("OpenRouter: configured"));
+        assert!(rendered.contains("Ollama Cloud: configured"));
+        assert!(!rendered.contains("roven auth set"));
+    }
+
+    #[test]
     fn populated_screen_renders_left_aligned_turns() {
         let mut state = AppState::new();
         state.trusted = true;
+        state.provider_model = Some("configured-model".to_owned());
         for character in "Hello".chars() {
             state.insert_char(character);
         }
@@ -272,6 +475,8 @@ mod tests {
         let rendered = render(&mut state, 80, 24);
 
         assert!(rendered.contains("You › Hello"));
+        assert!(rendered.contains("→ Add a follow-up"));
+        assert!(rendered.contains("configured-model · context unavailable"));
         assert!(!rendered.contains("Roven"));
         assert!(!rendered.contains("Project agent"));
         assert!(!rendered.contains("The chat UI is ready"));
@@ -288,7 +493,8 @@ mod tests {
 
         assert!(rendered.contains("Thought:"));
         assert!(rendered.contains("Check the request."));
-        assert!(rendered.contains("Roven › Here is the answer."));
+        assert!(rendered.contains("│ Here is the answer."));
+        assert!(!rendered.contains("Roven ›"));
     }
 
     #[test]
@@ -297,6 +503,7 @@ mod tests {
         state.trusted = true;
         state.start_agent();
         assert!(render(&mut state, 80, 24).contains("Agent working..."));
+        assert!(!render(&mut state, 80, 24).contains("◆"));
 
         state.append_thought("Inspecting the request.".to_owned());
         assert!(render(&mut state, 80, 24).contains("Thinking..."));
@@ -343,12 +550,64 @@ mod tests {
             .draw(|frame| draw(frame, &mut state))
             .expect("frame should render");
 
+        assert!(render(&mut state, 80, 24).contains("→ Add a follow-up"));
+
         assert_eq!(
             terminal
                 .backend_mut()
                 .get_cursor_position()
                 .expect("test backend should report cursor position"),
-            Position::new(1, 22)
+            Position::new(4, 21)
         );
+    }
+
+    #[test]
+    fn footer_uses_only_the_configured_model_and_context_percent() {
+        let mut state = AppState::new();
+        state.trusted = true;
+        state.provider_model = Some("OpenRouter · provider/model-v2".to_owned());
+        state.messages.push(crate::ui::state::Message::text(
+            crate::ui::state::Role::User,
+            "Hello".to_owned(),
+            None,
+        ));
+
+        let rendered = render(&mut state, 100, 24);
+
+        assert!(rendered.contains("OpenRouter · provider/model-v2 · context unavailable"));
+        assert!(!rendered.contains("tokens"));
+        assert!(!rendered.contains("256K"));
+    }
+
+    #[test]
+    fn model_picker_lists_provider_access_without_showing_secrets() {
+        let mut state = AppState::new();
+        state.trusted = true;
+        state.model_selection = Some(ModelSelection::Provider {
+            entries: vec![
+                ProviderChoice {
+                    id: "openrouter".to_owned(),
+                    name: "OpenRouter".to_owned(),
+                    endpoint: "https://openrouter.ai/api/v1/chat/completions".to_owned(),
+                    model: "openai/gpt-oss-20b".to_owned(),
+                    access: ProviderAccessState::Ready,
+                },
+                ProviderChoice {
+                    id: "ollama".to_owned(),
+                    name: "Ollama".to_owned(),
+                    endpoint: "https://ollama.com/api/chat".to_owned(),
+                    model: "minimax-m3:cloud".to_owned(),
+                    access: ProviderAccessState::MissingApiKey,
+                },
+            ],
+            index: 1,
+        });
+
+        let rendered = render(&mut state, 100, 24);
+
+        assert!(rendered.contains("Switch model"));
+        assert!(rendered.contains("OpenRouter · openai/gpt-oss-20b · ready"));
+        assert!(rendered.contains("Ollama · minimax-m3:cloud · API key missing"));
+        assert!(!rendered.contains("secret"));
     }
 }

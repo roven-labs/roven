@@ -1,9 +1,13 @@
 # Roven
 
-Roven helps students and developers turn their real projects into useful career context.
+Roven helps students and developers work with a trusted project in a controlled
+terminal session.
 
-It validates a trusted Git project, understands the important parts of that project, and saves a concise project summary. The user can later reuse that summary to prepare a resume, portfolio, or other job-application content.
+It validates a trusted Git project and stores only the registration metadata
+needed to identify that project and its committed baseline. Conversation and
+tool results are stored separately in the local session history.
 
-Roven stores project facts, not job-specific resume bullets or ATS keywords. Those are generated later from the selected projects and a job description.
+The user can inspect project files through the trusted read-only tools, while
+provider keys remain in the operating-system credential store.
 
 The user stays in control: Roven only works inside the trusted project folder and does not remove project data without explicit user action.

@@ -1,13 +1,10 @@
 use std::{fs, io::Write, path::PathBuf};
 
 use atomic_write_file::AtomicWriteFile;
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
-const QUALIFIER: &str = "io.github.vishal24p";
-const APPLICATION: &str = "Roven";
 const PROFILES_FILE: &str = "provider-profiles.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,11 +48,9 @@ struct ProfileDocument {
 
 impl ProviderProfiles {
     pub(crate) fn for_current_user() -> Result<Self, ProfileError> {
-        let directories = ProjectDirs::from(QUALIFIER, "", APPLICATION)
-            .ok_or(ProfileError::DataDirectoryUnavailable)?;
-        Ok(Self::for_data_root(
-            directories.data_local_dir().to_path_buf(),
-        ))
+        let data_root =
+            crate::app_data_root().map_err(|_| ProfileError::DataDirectoryUnavailable)?;
+        Ok(Self::for_data_root(data_root))
     }
 
     pub(crate) fn for_data_root(data_root: PathBuf) -> Self {
@@ -118,6 +113,28 @@ impl ProviderProfiles {
         }
         document.default_profile_id = Some(id.to_owned());
         self.write(&document)
+    }
+
+    pub(crate) fn switch_model_and_default(
+        &self,
+        id: &str,
+        model: &str,
+    ) -> Result<ProviderProfile, ProfileError> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(ProfileError::EmptyModel);
+        }
+        let mut document = self.read()?;
+        let profile = document
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == id)
+            .ok_or_else(|| ProfileError::NotFound(id.to_owned()))?;
+        profile.model = model.to_owned();
+        document.default_profile_id = Some(id.to_owned());
+        let updated = profile.clone();
+        self.write(&document)?;
+        Ok(updated)
     }
 
     pub(crate) fn remove(&self, id: &str) -> Result<ProviderProfile, ProfileError> {
@@ -254,6 +271,49 @@ mod tests {
 
         fs::write(data_root.join(PROFILES_FILE), b"not json").unwrap();
         assert!(profiles.list().is_err());
+        fs::remove_dir_all(data_root).unwrap();
+    }
+
+    #[test]
+    fn switch_model_and_default_updates_both_fields_in_one_operation() {
+        let data_root = temp_root("provider-profile-switch");
+        let profiles = ProviderProfiles::for_data_root(data_root.clone());
+        let first = profiles
+            .create(
+                "openrouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "openai/gpt-oss-20b",
+            )
+            .unwrap();
+        let second = profiles
+            .create("ollama", "https://ollama.com/api/chat", "minimax-m3:cloud")
+            .unwrap();
+        profiles.set_default(&first.id).unwrap();
+
+        let updated = profiles
+            .switch_model_and_default(&second.id, "gpt-oss:120b-cloud")
+            .unwrap();
+        let listed = profiles.list().unwrap();
+
+        assert_eq!(updated.id, second.id);
+        assert_eq!(updated.model, "gpt-oss:120b-cloud");
+        assert_eq!(profiles.default_profile().unwrap().unwrap().id, second.id);
+        assert_eq!(
+            listed
+                .iter()
+                .find(|profile| profile.id == first.id)
+                .unwrap()
+                .model,
+            "openai/gpt-oss-20b"
+        );
+        assert_eq!(
+            listed
+                .iter()
+                .find(|profile| profile.id == second.id)
+                .unwrap()
+                .model,
+            "gpt-oss:120b-cloud"
+        );
         fs::remove_dir_all(data_root).unwrap();
     }
 }

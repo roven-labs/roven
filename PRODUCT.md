@@ -8,9 +8,10 @@ asks the user to trust it for that launch. Trust is runtime-only and is never
 persisted across launches.
 
 After trust, Roven loads only the optional root `ROVEN.md`, creates a session on
-the first user message, and streams through the selected named
-OpenAI-compatible provider profile. The profile supplies the exact HTTPS
-chat-completions endpoint, model ID, and operating-system-stored API key.
+the first user message, and streams through the selected named provider
+profile. The profile supplies the exact HTTPS endpoint, model ID, and
+operating-system-stored API key. OpenAI-compatible endpoints and Ollama Cloud's
+native `/api/chat` endpoint are handled by separate protocol adapters.
 
 ## User-facing workflow
 
@@ -27,6 +28,8 @@ chat-completions endpoint, model ID, and operating-system-stored API key.
 The Rust harness, rather than the model prompt, enforces filesystem authority:
 
 - `list_directory` lists only immediate entries inside the trusted workspace.
+- `read_file` reads regular UTF-8 text files up to 50 KiB inside the trusted
+  workspace.
 - `prepare_project` independently canonicalizes and compares its requested path
   with the trusted workspace before project lookup, Git validation, or writes.
 - `list_tools` reports the live tool registry.
@@ -47,13 +50,16 @@ projects/<project-name>.json           registered project identity and baseline
 sessions/<workspace-sha256>/<uuid>/    conversation sessions
   meta.json                            session identity and timestamps
   events.jsonl                         conversation and tool-call events
+ollama-stream-failures.log             raw Ollama stream data after failures
 log.md                                 operational diagnostics only
 ```
 
-API keys never enter these files. `events.jsonl` records structured
+API keys are stored in the operating-system credential store and are not
+intentionally written to these files. `events.jsonl` records structured
 `function_call_output` events with the tool call ID, tool name, input, and
-output, allowing the live transcript and resumed provider messages to preserve
-tool activity.
+output, including successful `read_file` contents. Those results can be sent
+back to the selected provider on later turns or resume. The Ollama failure log
+can contain raw model output and tool-call arguments.
 
 ## Safety and non-goals
 
@@ -61,5 +67,6 @@ tool activity.
 - Filesystem-sensitive tools enforce their own Rust-side workspace boundary.
 - Roven does not edit files, execute arbitrary commands, recurse through a
   project, or expose API keys.
-- Roven does not currently provide a raw project file-reading tool, automatic
-  provider retries, or automatic context summarization.
+- Roven provides a read-only raw project file-reading tool for regular UTF-8
+  files up to 50 KiB inside the trusted workspace. It does not provide
+  automatic provider retries or automatic context summarization.

@@ -1,3 +1,4 @@
+mod startup;
 mod state;
 mod terminal;
 mod transcript;

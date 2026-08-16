@@ -11,6 +11,8 @@ use thiserror::Error;
 
 use crate::{
     agent::{AgentMessage, AgentRequest, ProviderEvent},
+    ollama, openrouter,
+    runtime_log::RuntimeLog,
     tools::{RovenToolCall, RovenToolDefinition},
 };
 
@@ -31,7 +33,7 @@ pub(crate) enum ProviderError {
 }
 
 impl ProviderError {
-    fn diagnostic(
+    pub(crate) fn diagnostic(
         stage: &'static str,
         category: &'static str,
         detail: impl std::fmt::Display,
@@ -44,6 +46,17 @@ impl ProviderError {
     }
 }
 
+pub(crate) trait Provider {
+    fn stream(
+        &self,
+        api_key: &str,
+        request: &AgentRequest,
+        cancelled: &AtomicBool,
+        runtime_log: Option<&RuntimeLog>,
+        emit: &mut dyn FnMut(ProviderEvent),
+    ) -> Result<(), ProviderError>;
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct OpenAiCompatibleProvider {
     endpoint: String,
@@ -54,18 +67,15 @@ impl OpenAiCompatibleProvider {
     pub(crate) fn new(endpoint: String, model: String) -> Self {
         Self { endpoint, model }
     }
-
-    fn request_endpoint(&self) -> &str {
-        &self.endpoint
-    }
 }
 
-impl OpenAiCompatibleProvider {
-    pub(crate) fn stream(
+impl Provider for OpenAiCompatibleProvider {
+    fn stream(
         &self,
         api_key: &str,
         request: &AgentRequest,
         cancelled: &AtomicBool,
+        runtime_log: Option<&RuntimeLog>,
         emit: &mut dyn FnMut(ProviderEvent),
     ) -> Result<(), ProviderError> {
         let payload =
@@ -83,7 +93,7 @@ impl OpenAiCompatibleProvider {
                 .build(),
         );
         let mut response = agent
-            .post(self.request_endpoint())
+            .post(&self.endpoint)
             .header("Authorization", &format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
@@ -101,6 +111,12 @@ impl OpenAiCompatibleProvider {
         }
         let reader = BufReader::new(response.body_mut().as_reader());
         let mut tool_call_parts = BTreeMap::new();
+        let openrouter_usage = openrouter::is_endpoint(&self.endpoint);
+        let ollama_tool_calls = ollama::is_endpoint(&self.endpoint);
+        let mut ollama_tool_call_parts = ollama::ToolCallAccumulator::default();
+        let mut ollama_capture = ollama::StreamCapture::new(&self.endpoint, &self.model);
+        let mut prompt_tokens = None;
+        let mut response_finished = false;
 
         for line in reader.lines() {
             if cancelled.load(Ordering::Relaxed) {
@@ -108,32 +124,104 @@ impl OpenAiCompatibleProvider {
                 return Ok(());
             }
             let line = line.map_err(stream_read_error)?;
-            append_tool_call_deltas(&line, &mut tool_call_parts)?;
-            for event in parse_sse_line(&line)? {
-                if matches!(event, ProviderEvent::Finished) {
-                    if tool_call_parts.is_empty() {
-                        emit(ProviderEvent::Finished);
-                    } else {
-                        emit(ProviderEvent::ToolCalls(finish_tool_calls(
-                            tool_call_parts,
-                        )?));
-                    }
-                    return Ok(());
+            ollama_capture.record_line(&line);
+            if ollama_tool_calls {
+                if let Err(error) = ollama_tool_call_parts.append_line(&line) {
+                    ollama::record_failure(&ollama_capture, runtime_log, &error);
+                    return Err(error);
                 }
-                emit(event);
+            } else if let Err(error) = append_tool_call_deltas(&line, &mut tool_call_parts) {
+                ollama::record_failure(&ollama_capture, runtime_log, &error);
+                return Err(error);
+            }
+            let events = match parse_sse_line_for_endpoint(&line, openrouter_usage) {
+                Ok(events) => events,
+                Err(error) => {
+                    ollama::record_failure(&ollama_capture, runtime_log, &error);
+                    return Err(error);
+                }
+            };
+            for event in events {
+                match event {
+                    ProviderEvent::ResponseFinished => {
+                        if !response_finished {
+                            if !tool_call_parts.is_empty() || !ollama_tool_call_parts.is_empty() {
+                                let calls = match finish_provider_tool_calls(
+                                    ollama_tool_calls,
+                                    std::mem::take(&mut tool_call_parts),
+                                    std::mem::take(&mut ollama_tool_call_parts),
+                                ) {
+                                    Ok(calls) => calls,
+                                    Err(error) => {
+                                        ollama::record_failure(
+                                            &ollama_capture,
+                                            runtime_log,
+                                            &error,
+                                        );
+                                        return Err(error);
+                                    }
+                                };
+                                emit(ProviderEvent::ToolCalls(calls));
+                            }
+                            response_finished = true;
+                        }
+                    }
+                    ProviderEvent::ContextUsage(tokens) => prompt_tokens = Some(tokens),
+                    ProviderEvent::Finished => {
+                        if !tool_call_parts.is_empty() || !ollama_tool_call_parts.is_empty() {
+                            let calls = match finish_provider_tool_calls(
+                                ollama_tool_calls,
+                                std::mem::take(&mut tool_call_parts),
+                                std::mem::take(&mut ollama_tool_call_parts),
+                            ) {
+                                Ok(calls) => calls,
+                                Err(error) => {
+                                    ollama::record_failure(&ollama_capture, runtime_log, &error);
+                                    return Err(error);
+                                }
+                            };
+                            emit(ProviderEvent::ToolCalls(calls));
+                        }
+                        if let Some(tokens) = prompt_tokens.take() {
+                            emit(ProviderEvent::ContextUsage(tokens));
+                        }
+                        emit(ProviderEvent::Finished);
+                        return Ok(());
+                    }
+                    event => emit(event),
+                }
             }
         }
         if cancelled.load(Ordering::Relaxed) {
             emit(ProviderEvent::Cancelled);
             Ok(())
+        } else if response_finished {
+            if let Some(tokens) = prompt_tokens {
+                emit(ProviderEvent::ContextUsage(tokens));
+            }
+            emit(ProviderEvent::Finished);
+            Ok(())
         } else {
-            Err(ProviderError::diagnostic(
+            let error = ProviderError::diagnostic(
                 "stream",
                 "unexpected_eof",
                 "provider closed the stream before signalling completion",
-            ))
+            );
+            ollama::record_failure(&ollama_capture, runtime_log, &error);
+            Err(error)
         }
     }
+}
+
+fn finish_provider_tool_calls(
+    ollama_tool_calls: bool,
+    tool_call_parts: BTreeMap<usize, ToolCallParts>,
+    ollama_tool_call_parts: ollama::ToolCallAccumulator,
+) -> Result<Vec<RovenToolCall>, ProviderError> {
+    if ollama_tool_calls {
+        return ollama_tool_call_parts.finish();
+    }
+    finish_tool_calls(tool_call_parts)
 }
 
 #[derive(Serialize)]
@@ -278,7 +366,7 @@ struct ChatCompletionToolCallFunction {
     arguments: String,
 }
 
-fn request_error(error: ureq::Error) -> ProviderError {
+pub(crate) fn request_error(error: ureq::Error) -> ProviderError {
     match &error {
         ureq::Error::StatusCode(status) => response_error(*status, None),
         ureq::Error::HostNotFound => ProviderError::diagnostic("request", "dns", "host not found"),
@@ -301,7 +389,7 @@ fn request_error(error: ureq::Error) -> ProviderError {
     }
 }
 
-fn response_error(status: u16, retry_after: Option<&str>) -> ProviderError {
+pub(crate) fn response_error(status: u16, retry_after: Option<&str>) -> ProviderError {
     if status == 429 {
         let detail = retry_after
             .filter(|value| !value.trim().is_empty())
@@ -316,7 +404,7 @@ fn response_error(status: u16, retry_after: Option<&str>) -> ProviderError {
     }
 }
 
-fn stream_read_error(error: std::io::Error) -> ProviderError {
+pub(crate) fn stream_read_error(error: std::io::Error) -> ProviderError {
     io_error("stream", &error)
 }
 
@@ -370,10 +458,22 @@ fn sanitize_diagnostic(detail: &str) -> String {
     truncated
 }
 
+#[cfg(test)]
 fn parse_sse_line(line: &str) -> Result<Vec<ProviderEvent>, ProviderError> {
-    let Some(data) = line.strip_prefix("data: ") else {
+    parse_sse_line_for_endpoint(line, false)
+}
+
+fn parse_sse_line_for_endpoint(
+    line: &str,
+    openrouter_usage: bool,
+) -> Result<Vec<ProviderEvent>, ProviderError> {
+    let Some(data) = line.strip_prefix("data:") else {
         return Ok(Vec::new());
     };
+    let data = data.strip_prefix(' ').unwrap_or(data);
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
     if data == "[DONE]" {
         return Ok(vec![ProviderEvent::Finished]);
     }
@@ -382,17 +482,34 @@ fn parse_sse_line(line: &str) -> Result<Vec<ProviderEvent>, ProviderError> {
     if let Some(error) = value.get("error") {
         let code = error
             .get("code")
+            .and_then(displayable_json_scalar)
+            .unwrap_or_else(|| "unspecified".to_owned());
+        let error_type = error
+            .get("metadata")
+            .and_then(|metadata| metadata.get("error_type"))
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("unspecified");
+            .filter(|error_type| !error_type.is_empty());
+        let error_type = error_type
+            .map(|error_type| format!(" type={error_type}"))
+            .unwrap_or_default();
         return Err(ProviderError::diagnostic(
             "stream",
             "remote_error",
-            format!("provider reported a stream error code={code}"),
+            format!("provider reported stream error code={code}{error_type}"),
         ));
+    }
+    let mut events = Vec::new();
+    if openrouter_usage
+        && let Some(prompt_tokens) = value
+            .get("usage")
+            .and_then(|usage| usage.get("prompt_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|tokens| usize::try_from(tokens).ok())
+    {
+        events.push(ProviderEvent::ContextUsage(prompt_tokens));
     }
     let choice = value.get("choices").and_then(|choices| choices.get(0));
     let delta = choice.and_then(|choice| choice.get("delta"));
-    let mut events = Vec::new();
     if let Some(thought) = delta.and_then(reasoning_from_delta) {
         events.push(ProviderEvent::Thought(thought));
     }
@@ -407,9 +524,19 @@ fn parse_sse_line(line: &str) -> Result<Vec<ProviderEvent>, ProviderError> {
         .and_then(serde_json::Value::as_str)
         .is_some()
     {
-        events.push(ProviderEvent::Finished);
+        events.push(ProviderEvent::ResponseFinished);
     }
     Ok(events)
+}
+
+fn displayable_json_scalar(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -423,9 +550,13 @@ fn append_tool_call_deltas(
     line: &str,
     tool_call_parts: &mut BTreeMap<usize, ToolCallParts>,
 ) -> Result<(), ProviderError> {
-    let Some(data) = line.strip_prefix("data: ") else {
+    let Some(data) = line.strip_prefix("data:") else {
         return Ok(());
     };
+    let data = data.strip_prefix(' ').unwrap_or(data);
+    if data.is_empty() {
+        return Ok(());
+    }
     if data == "[DONE]" {
         return Ok(());
     }
@@ -610,8 +741,8 @@ mod tests {
     };
 
     use super::{
-        ChatCompletionsRequest, OpenAiCompatibleProvider, parse_sse_line, request_error,
-        response_error,
+        ChatCompletionsRequest, OpenAiCompatibleProvider, Provider, parse_sse_line,
+        parse_sse_line_for_endpoint, request_error, response_error,
     };
 
     type StreamEvent = ProviderEvent;
@@ -623,10 +754,7 @@ mod tests {
             "gemma4:31b-cloud".to_owned(),
         );
 
-        assert_eq!(
-            provider.request_endpoint(),
-            "https://ollama.com/v1/chat/completions"
-        );
+        assert_eq!(provider.endpoint, "https://ollama.com/v1/chat/completions");
     }
 
     #[test]
@@ -680,6 +808,39 @@ mod tests {
     }
 
     #[test]
+    fn parser_returns_openrouter_prompt_usage_from_the_final_chunk() {
+        assert_eq!(
+            parse_sse_line_for_endpoint(
+                r#"data: {"choices":[],"usage":{"prompt_tokens":512}}"#,
+                true,
+            )
+            .unwrap(),
+            vec![StreamEvent::ContextUsage(512)]
+        );
+    }
+
+    #[test]
+    fn parser_accepts_sse_data_without_a_space_and_preserves_usage_order() {
+        let events = [
+            r#"data:{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":512}}"#,
+            "data:[DONE]",
+        ]
+        .into_iter()
+        .flat_map(|line| parse_sse_line_for_endpoint(line, true).unwrap())
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ResponseFinished,
+                StreamEvent::ContextUsage(512),
+                StreamEvent::Finished,
+            ]
+        );
+    }
+
+    #[test]
     fn tool_call_chunks_become_roven_tool_calls() {
         let mut chunks = std::collections::BTreeMap::new();
         super::append_tool_call_deltas(
@@ -689,6 +850,30 @@ mod tests {
         .unwrap();
         super::append_tool_call_deltas(
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"project","arguments":"\\\\work\"}"}}]}}]}"#,
+            &mut chunks,
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::finish_tool_calls(chunks).unwrap(),
+            vec![RovenToolCall {
+                id: "call_1".to_owned(),
+                name: "prepare_project".to_owned(),
+                arguments: serde_json::json!({ "path": "C:\\work" }),
+            }]
+        );
+    }
+
+    #[test]
+    fn compact_tool_call_chunks_become_roven_tool_calls() {
+        let mut chunks = std::collections::BTreeMap::new();
+        super::append_tool_call_deltas(
+            r#"data:{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"prepare_","arguments":"{\"path\":\"C:"}}]}}]}"#,
+            &mut chunks,
+        )
+        .unwrap();
+        super::append_tool_call_deltas(
+            r#"data:{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"project","arguments":"\\\\work\"}"}}]}}]}"#,
             &mut chunks,
         )
         .unwrap();
@@ -779,9 +964,54 @@ mod tests {
 
         assert_eq!(
             error,
-            "Provider stream failed (remote_error): provider reported a stream error code=model_unavailable"
+            "Provider stream failed (remote_error): provider reported stream error code=model_unavailable"
         );
         assert!(!error.contains("secret-value"));
+    }
+
+    #[test]
+    fn provider_stream_errors_show_numeric_code_and_safe_category() {
+        let error = parse_sse_line(
+            r#"data: {"error":{"code":429,"message":"temporary failure","metadata":{"error_type":"rate_limit_exceeded"}}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(
+            error,
+            "Provider stream failed (remote_error): provider reported stream error code=429 type=rate_limit_exceeded"
+        );
+    }
+
+    #[test]
+    fn provider_stream_errors_handle_boolean_and_non_scalar_codes_safely() {
+        for (code, expected) in [
+            ("true", "true"),
+            ("null", "unspecified"),
+            ("[]", "unspecified"),
+        ] {
+            let error = parse_sse_line(&format!(
+                r#"data: {{"error":{{"code":{code},"message":"Bearer secret-value","metadata":{{"error_type":""}}}}}}"#
+            ))
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains(&format!("code={expected}")));
+            assert!(!error.contains("secret-value"));
+            assert!(!error.contains(" type="));
+        }
+    }
+
+    #[test]
+    fn provider_stream_errors_never_include_sensitive_messages() {
+        let error = parse_sse_line(
+            r#"data: {"error":{"code":"invalid_request","message":"Bearer secret-value in prompt"}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(!error.contains("secret-value"));
+        assert!(error.contains("code=invalid_request"));
     }
 
     #[test]
@@ -812,6 +1042,7 @@ mod tests {
                 "key",
                 &request,
                 &std::sync::atomic::AtomicBool::new(false),
+                None,
                 &mut |_| {},
             )
             .unwrap_err();
@@ -830,6 +1061,7 @@ mod tests {
                 "key",
                 &request,
                 &std::sync::atomic::AtomicBool::new(false),
+                None,
                 &mut |_| {},
             )
             .unwrap_err();

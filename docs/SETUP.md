@@ -23,7 +23,7 @@ roven auth set
 Roven asks for:
 
 1. A user-chosen profile name.
-2. The complete HTTPS OpenAI-compatible chat-completions endpoint.
+2. The complete HTTPS provider endpoint.
 3. The model ID accepted by that endpoint.
 4. The API key, entered twice for confirmation.
 
@@ -31,13 +31,17 @@ The endpoint must be HTTPS, must not contain credentials, query parameters, or
 fragments, and must be the complete endpoint. Roven does not append
 `/chat/completions` automatically.
 
-Examples:
+Examples of complete endpoints:
 
 ```text
 https://api.groq.com/openai/v1/chat/completions
 https://openrouter.ai/api/v1/chat/completions
-https://ollama.com/v1/chat/completions
+https://ollama.com/api/chat
 ```
+
+Use `https://ollama.com/api/chat` for Ollama Cloud's native API. Do not use
+`https://ollama.com/v1/chat/completions` if you want Roven's native Ollama
+context-window usage and tool-call handling.
 
 The profile metadata is stored in the local application-data directory. The API
 key is stored separately in the operating-system credential store and is never
@@ -79,6 +83,7 @@ On Windows, Roven uses:
 %LOCALAPPDATA%\Roven\data\provider-profiles.json
 %LOCALAPPDATA%\Roven\data\projects\<project-name>.json
 %LOCALAPPDATA%\Roven\data\sessions\<workspace-sha256>\<session-uuid>\
+%LOCALAPPDATA%\Roven\data\ollama-stream-failures.log  (only after an Ollama stream failure)
 ```
 
 Each session directory contains `meta.json` and
@@ -91,9 +96,16 @@ Each session directory contains `meta.json` and
   temporarily unavailable or has no capacity. It is not a project or Git error.
 - HTTP 429 means the provider rate limit was reached; wait and try again.
 - HTTP 404 usually means the endpoint or model ID is wrong. Check that the
-  complete chat-completions endpoint was entered exactly.
+  complete provider endpoint was entered exactly.
 - If no default profile or API key exists, run `roven auth list`,
   `roven auth use`, or `roven auth set` as appropriate.
 
-Never put secrets in repository files, command-line arguments, Roven's local
-conversation files, logs, test fixtures, or terminal output.
+API keys are stored in the operating-system credential store. Do not put
+secrets in project files, command-line arguments, Roven's local conversation
+files, logs, test fixtures, or terminal output. Successful `read_file` results
+are persisted in session history and may be sent to the selected provider on a
+later turn or resume. An Ollama failure log may contain raw model output and
+tool-call arguments.
+
+See [PROVIDERS.md](PROVIDERS.md) for copy-ready commands, provider-specific
+examples, context-usage behavior, and troubleshooting.

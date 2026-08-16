@@ -1,4 +1,4 @@
-//! Named OpenAI-compatible provider-profile commands.
+//! Named provider-profile commands.
 
 use std::io::{self, Write};
 
@@ -24,7 +24,7 @@ pub(crate) fn run(command: AuthCommand) -> anyhow::Result<()> {
 
 fn create_profile(profiles: &ProviderProfiles) -> anyhow::Result<()> {
     let name = prompt_required("Profile name: ")?;
-    let endpoint = prompt_required("OpenAI-compatible HTTPS chat-completions endpoint: ")?;
+    let endpoint = prompt_required("Provider HTTPS endpoint: ")?;
     let model = prompt_required("Model ID: ")?;
     let secret = rpassword::prompt_password("API key: ")?;
     let confirmation = rpassword::prompt_password("Confirm API key: ")?;

@@ -15,6 +15,7 @@ fn help_describes_the_current_command_surface() {
 
     let stdout = String::from_utf8(output.stdout).expect("help should be UTF-8");
     assert!(stdout.contains("Roven"));
+    assert!(stdout.contains("roven"));
     assert!(stdout.contains("auth"));
     for legacy_command in ["init", "project", "status", "inspect", "review", "history"] {
         assert!(

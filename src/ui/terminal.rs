@@ -24,15 +24,18 @@ use serde_json::Value;
 use crate::{
     agent::{self, AgentEvent, AgentMessage},
     credentials::{self, SecretStore},
-    profiles::ProviderProfiles,
-    provider::OpenAiCompatibleProvider,
+    model_catalog::{ProviderKind, validate_model},
+    ollama, openrouter,
+    profiles::{ProviderProfile, ProviderProfiles},
+    provider::{OpenAiCompatibleProvider, Provider},
     runtime_log::RuntimeLog,
     storage::{ConversationEvent, EventKind, ProjectStore, SessionMeta},
     tools::{RovenToolCall, RovenToolResult, ToolContext},
 };
 
 use super::{
-    state::{AppState, Message, ResumeEntry, Role},
+    startup,
+    state::{AppState, Message, ProviderAccessState, ProviderChoice, ResumeEntry, Role},
     view,
 };
 
@@ -40,6 +43,7 @@ use super::{
 enum WorkerEvent {
     Thought(String),
     Text(String),
+    ContextUsage(usize),
     FunctionCallOutput {
         call: RovenToolCall,
         result: RovenToolResult,
@@ -49,7 +53,7 @@ enum WorkerEvent {
     Error(String),
 }
 
-const TOOL_USE_POLICY: &str = r#"Treat every request as read-only unless the user explicitly asks to prepare, register, add, modify, delete, or configure something. Call `prepare_project` only when the user explicitly asks to prepare, register, or add a project; never call it merely because a trusted workspace is available. For an explicit prepare/register/add request about the current trusted workspace, use `prepare_project` with {"path":"."}. When the user asks which Roven tools or capabilities are available, call `list_tools` with {} and rely on its returned names, descriptions, and input schemas. When the user asks for the current workspace path, call `list_directory` with {"path":"."} and report its `workspace_path` value verbatim; never report `.` as the human-facing path. When the user asks about a file's contents, call `list_directory` to locate it, then call `read_file` with a workspace-relative path. Rely on the returned content and never claim that a file was read without a tool result."#;
+const TOOL_USE_POLICY: &str = r#"Treat every request as read-only unless the user explicitly asks to prepare, register, add, modify, delete, or configure something. Call `prepare_project` only when the user explicitly asks to prepare, register, or add a project; never call it merely because a trusted workspace is available. For an explicit prepare/register/add request about the current trusted workspace, use `prepare_project` with {"path":"."}. When the user asks which Roven tools or capabilities are available, call `list_tools` with {} and rely on its returned names, descriptions, and input schemas. When the user asks for the current workspace path, call `list_directory` with {"path":"."} and report its `workspace_path` value verbatim; never report `.` as the human-facing path. When the user asks about a file's contents, call `list_directory` to locate it, then call `read_file` with a non-empty workspace-relative path. `list_directory` lists only immediate entries and may return `truncated: true`; use returned entry paths as the next tool input. If a filesystem tool returns an error, correct the path from its reason and do not retry the unchanged request. Rely on the returned content and never claim that a file was read without a tool result."#;
 
 pub(crate) fn run(runtime_log: Option<RuntimeLog>) -> anyhow::Result<()> {
     log_event(runtime_log.as_ref(), "terminal_starting", "outcome=started");
@@ -78,6 +82,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
         .canonicalize()?
         .to_string_lossy()
         .into_owned();
+    refresh_startup_provider_status(&mut state);
     log_event(
         runtime_log,
         "workspace_detected",
@@ -143,6 +148,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                         );
                     })?;
                     tool_context = Some(context);
+                    refresh_provider_model(&mut state);
                     state.trusted = true;
                     log_event(runtime_log, "workspace_trusted", "outcome=granted");
                 }
@@ -187,19 +193,63 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
             }
             continue;
         }
+        if state.model_selection.is_some() {
+            if let Event::Key(key) = event
+                && let Err(error) = handle_model_selection_key(
+                    &mut state,
+                    &ProviderProfiles::for_current_user()?,
+                    key,
+                )
+            {
+                state.activity(error);
+            }
+            continue;
+        }
         if state.running {
-            if matches!(
-                event,
+            match event {
                 Event::Key(KeyEvent {
-                    code: KeyCode::Esc,
+                    code: KeyCode::Esc, ..
+                }) => {
+                    if let Some(flag) = &cancellation {
+                        flag.store(true, Ordering::Relaxed);
+                        log_event(runtime_log, "agent_cancellation_requested", "source=escape");
+                    }
+                    state.status = Some("Stopping agent...".to_owned());
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Enter,
+                    modifiers,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) if modifiers.contains(KeyModifiers::ALT) => state.insert_newline(),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Backspace,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) => state.backspace(),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char(character),
+                    modifiers,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) if !modifiers.contains(KeyModifiers::CONTROL) => state.insert_char(character),
+                Event::Key(KeyEvent {
+                    code: KeyCode::PageUp,
                     ..
                 })
-            ) {
-                if let Some(flag) = &cancellation {
-                    flag.store(true, Ordering::Relaxed);
-                    log_event(runtime_log, "agent_cancellation_requested", "source=escape");
-                }
-                state.status = Some("Stopping agent...".to_owned());
+                | Event::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    ..
+                }) => state.scroll_up(3),
+                Event::Key(KeyEvent {
+                    code: KeyCode::PageDown,
+                    ..
+                })
+                | Event::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    ..
+                }) => state.scroll_down(3),
+                _ => {}
             }
             continue;
         }
@@ -231,7 +281,13 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                         .collect();
                     state.open_resume(entries);
                     log_event(runtime_log, "resume_picker_opened", "outcome=ok");
+                } else if raw.trim() == "/model" {
+                    state.input.clear();
+                    if let Err(error) = open_model_switch(&mut state) {
+                        state.activity(error);
+                    }
                 } else if state.submit() {
+                    refresh_provider_model(&mut state);
                     let user = state.last_user_message().unwrap_or_default().to_owned();
                     let project_store = store.as_ref().expect("trusted store");
                     if session.is_none() {
@@ -325,27 +381,40 @@ fn spawn_worker(
                 .default_profile()
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "No default provider profile. Run `roven auth set`.".to_owned())?;
-            let key = credentials::OsCredentialStore::for_profile_id(&profile.id)
-                .get()
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| {
-                    format!(
-                        "API key missing for provider profile `{}`. Run `roven auth set`.",
-                        profile.name
-                    )
-                })?;
-            let provider = OpenAiCompatibleProvider::new(profile.endpoint, profile.model);
+            let key = resolve_profile_api_key(
+                &profile,
+                &credentials::OsCredentialStore::for_profile_id(&profile.id),
+            )?;
+            let endpoint = profile.endpoint;
+            let model = profile.model;
+            let is_ollama = ollama::is_native_endpoint(&endpoint);
+            let context_window = if is_ollama {
+                ollama::context_window(&key, &endpoint, &model)
+            } else {
+                openrouter::context_window(&key, &endpoint, &model)
+            };
+            let provider: Box<dyn Provider> = if is_ollama {
+                Box::new(ollama::OllamaProvider::new(endpoint, model))
+            } else {
+                Box::new(OpenAiCompatibleProvider::new(endpoint, model))
+            };
             agent::run(
-                &provider,
-                &key,
+                agent::AgentRun {
+                    provider: provider.as_ref(),
+                    api_key: &key,
+                    tool_context: &tool_context,
+                    context_window,
+                    cancelled: &cancelled,
+                    runtime_log: runtime_log.as_ref(),
+                },
                 messages,
-                &tool_context,
-                &cancelled,
-                runtime_log.as_ref(),
                 &mut |event| {
                     let message = match event {
                         AgentEvent::Thought(thought) => WorkerEvent::Thought(thought),
                         AgentEvent::Text(text) => WorkerEvent::Text(text),
+                        AgentEvent::ContextUsage(prompt_tokens) => {
+                            WorkerEvent::ContextUsage(prompt_tokens)
+                        }
                         AgentEvent::ToolResult { call, result } => {
                             WorkerEvent::FunctionCallOutput { call, result }
                         }
@@ -370,6 +439,160 @@ fn spawn_worker(
     });
 }
 
+fn resolve_profile_api_key(
+    profile: &ProviderProfile,
+    store: &impl SecretStore,
+) -> Result<String, String> {
+    credentials::resolve_api_key(profile, store)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "API key missing for provider profile `{}`. Run `roven auth set`.",
+                profile.name
+            )
+        })
+}
+
+fn open_model_switch(state: &mut AppState) -> Result<(), String> {
+    let profiles = ProviderProfiles::for_current_user().map_err(|error| error.to_string())?;
+    open_model_switch_with(state, &profiles, provider_access_state)
+}
+
+fn open_model_switch_with<F>(
+    state: &mut AppState,
+    profiles: &ProviderProfiles,
+    access_state_for: F,
+) -> Result<(), String>
+where
+    F: Fn(&ProviderProfile) -> ProviderAccessState,
+{
+    let entries = profiles
+        .list()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|profile| {
+            let access = access_state_for(&profile);
+            ProviderChoice {
+                id: profile.id,
+                name: profile.name,
+                endpoint: profile.endpoint,
+                model: profile.model,
+                access,
+            }
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return Err("No provider profiles. Run `roven auth set`.".to_owned());
+    }
+    let default_profile_id = profiles
+        .default_profile()
+        .map_err(|error| error.to_string())?
+        .map(|profile| profile.id);
+    state.open_model_selection(entries, default_profile_id.as_deref());
+    Ok(())
+}
+
+fn handle_model_selection_key(
+    state: &mut AppState,
+    profiles: &ProviderProfiles,
+    key: KeyEvent,
+) -> Result<bool, String> {
+    match key.code {
+        KeyCode::Esc => {
+            state.close_model_selection();
+            Ok(false)
+        }
+        KeyCode::Up => {
+            state.select_previous_model_provider();
+            Ok(false)
+        }
+        KeyCode::Down => {
+            state.select_next_model_provider();
+            Ok(false)
+        }
+        KeyCode::Enter => {
+            let Some(selection) = state.model_selection.clone() else {
+                return Ok(false);
+            };
+            match selection {
+                super::state::ModelSelection::Provider { .. } => {
+                    state.begin_model_entry();
+                    Ok(false)
+                }
+                super::state::ModelSelection::Model { choice, value, .. } => {
+                    let model = value.trim().to_owned();
+                    if model.is_empty() {
+                        state.close_model_selection();
+                        return Ok(false);
+                    }
+                    if !choice.access.is_ready() {
+                        state.set_model_entry_error(match choice.access {
+                            ProviderAccessState::MissingApiKey => format!(
+                                "{} is missing an API key. Run `roven auth set` before switching to it.",
+                                choice.name
+                            ),
+                            ProviderAccessState::CredentialStoreUnavailable => format!(
+                                "{} is unavailable because the credential store could not be read.",
+                                choice.name
+                            ),
+                            ProviderAccessState::Ready => String::new(),
+                        });
+                        return Ok(false);
+                    }
+                    if !validate_model(&choice.endpoint, &model) {
+                        state.set_model_entry_error(unsupported_model_message(&choice, &model));
+                        return Ok(false);
+                    }
+                    let updated = profiles
+                        .switch_model_and_default(&choice.id, &model)
+                        .map_err(|error| error.to_string())?;
+                    refresh_provider_model_from(state, profiles);
+                    state.close_model_selection();
+                    state.activity(format!(
+                        "Active provider set to {} · {}",
+                        updated.name, updated.model
+                    ));
+                    Ok(true)
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            state.backspace_model_entry();
+            Ok(false)
+        }
+        KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.push_model_entry_char(character);
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn provider_access_state(profile: &ProviderProfile) -> ProviderAccessState {
+    match credentials::resolve_api_key(
+        profile,
+        &credentials::OsCredentialStore::for_profile_id(&profile.id),
+    ) {
+        Ok(Some(_)) => ProviderAccessState::Ready,
+        Ok(None) => ProviderAccessState::MissingApiKey,
+        Err(_) => ProviderAccessState::CredentialStoreUnavailable,
+    }
+}
+
+fn unsupported_model_message(choice: &ProviderChoice, model: &str) -> String {
+    match ProviderKind::from_endpoint(&choice.endpoint) {
+        Some(ProviderKind::OllamaCloud) => format!(
+            "`{model}` is not a supported Ollama Cloud model for {}. Enter one of Ollama's documented cloud model IDs.",
+            choice.name
+        ),
+        Some(ProviderKind::OpenRouter) => format!(
+            "`{model}` is not a valid OpenRouter model ID for {}. Enter it as `provider/model`.",
+            choice.name
+        ),
+        None => format!("`{model}` is not supported for {}.", choice.name),
+    }
+}
+
 fn apply_worker_event(
     state: &mut AppState,
     store: Option<&ProjectStore>,
@@ -380,9 +603,10 @@ fn apply_worker_event(
     match event {
         WorkerEvent::Thought(thought) => state.append_thought(thought),
         WorkerEvent::Text(text) => state.append_agent_text(text),
+        WorkerEvent::ContextUsage(prompt_tokens) => state.context_percent = Some(prompt_tokens),
         WorkerEvent::FunctionCallOutput { call, result } => {
             persist_function_call_output(store, session, &call, &result);
-            state.activity(format!("{} completed", result.name));
+            state.tool(call.name, call.arguments, result.result);
         }
         WorkerEvent::Finished | WorkerEvent::Cancelled => {
             let stopped = matches!(event, WorkerEvent::Cancelled);
@@ -429,6 +653,52 @@ fn log_event(runtime_log: Option<&RuntimeLog>, event: &str, detail: &str) {
     if let Some(log) = runtime_log {
         log.record("terminal", event, detail);
     }
+}
+
+fn refresh_provider_model(state: &mut AppState) {
+    if let Ok(profiles) = ProviderProfiles::for_current_user() {
+        refresh_provider_model_from(state, &profiles);
+    } else {
+        state.provider_model = None;
+    }
+}
+
+fn refresh_startup_provider_status(state: &mut AppState) {
+    match ProviderProfiles::for_current_user() {
+        Ok(profiles) => refresh_startup_provider_status_from(state, &profiles),
+        Err(_) => {
+            state.startup_provider_status = Some(startup::detect_provider_status(
+                &[],
+                |_| false,
+                credentials::has_provider_env_api_key,
+            ));
+        }
+    }
+}
+
+fn refresh_startup_provider_status_from(state: &mut AppState, profiles: &ProviderProfiles) {
+    let profiles = profiles.list().unwrap_or_default();
+    state.startup_provider_status = Some(startup::detect_provider_status(
+        &profiles,
+        |profile| {
+            credentials::resolve_api_key(
+                profile,
+                &credentials::OsCredentialStore::for_profile_id(&profile.id),
+            )
+            .ok()
+            .flatten()
+            .is_some()
+        },
+        credentials::has_provider_env_api_key,
+    ));
+}
+
+fn refresh_provider_model_from(state: &mut AppState, profiles: &ProviderProfiles) {
+    state.provider_model = profiles
+        .default_profile()
+        .ok()
+        .flatten()
+        .map(|profile| format!("{} · {}", profile.name, profile.model));
 }
 
 fn persist_function_call_output(
@@ -647,19 +917,173 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        cell::RefCell,
+        fs,
+        sync::{Mutex, OnceLock},
+    };
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use crate::{
+        credentials::{CredentialError, SecretStore},
+        profiles::{ProviderProfile, ProviderProfiles},
         storage::{ConversationEvent, EventKind, ProjectStore},
-        ui::state::{AppState, Role},
+        ui::{
+            startup::StartupProviderStatus,
+            state::{AppState, ModelSelection, Role},
+        },
     };
 
     use super::{WorkerEvent, apply_worker_event};
+    use crate::tools::{RovenToolCall, RovenToolResult};
+
+    #[derive(Default)]
+    struct MemoryStore {
+        value: RefCell<Option<String>>,
+    }
+
+    impl SecretStore for MemoryStore {
+        fn get(&self) -> Result<Option<String>, CredentialError> {
+            Ok(self.value.borrow().clone())
+        }
+
+        fn set(&self, secret: &str) -> Result<(), CredentialError> {
+            *self.value.borrow_mut() = Some(secret.to_owned());
+            Ok(())
+        }
+
+        fn delete(&self) -> Result<bool, CredentialError> {
+            Ok(self.value.borrow_mut().take().is_some())
+        }
+    }
 
     fn temp_root(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("roven-{name}-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&path).expect("temporary root should exist");
         path
+    }
+
+    fn profile(id: &str, endpoint: &str) -> ProviderProfile {
+        ProviderProfile {
+            id: id.to_owned(),
+            name: "provider".to_owned(),
+            endpoint: endpoint.to_owned(),
+            model: "model".to_owned(),
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock should not be poisoned")
+    }
+
+    fn with_provider_envs<T>(
+        openrouter: Option<&str>,
+        ollama: Option<&str>,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        let previous_openrouter = std::env::var_os("OPENROUTER_API_KEY");
+        let previous_ollama = std::env::var_os("OLLAMA_API_KEY");
+        match openrouter {
+            Some(value) => unsafe { std::env::set_var("OPENROUTER_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
+        }
+        match ollama {
+            Some(value) => unsafe { std::env::set_var("OLLAMA_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OLLAMA_API_KEY") },
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+        match previous_openrouter {
+            Some(value) => unsafe { std::env::set_var("OPENROUTER_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
+        }
+        match previous_ollama {
+            Some(value) => unsafe { std::env::set_var("OLLAMA_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OLLAMA_API_KEY") },
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn refreshed_startup_provider_status(
+        openrouter: Option<&str>,
+        ollama: Option<&str>,
+    ) -> StartupProviderStatus {
+        let _guard = env_lock();
+        let data_root = temp_root("startup-provider-status");
+        let profiles = ProviderProfiles::for_data_root(data_root.clone());
+        let mut state = AppState::new();
+        let status = with_provider_envs(openrouter, ollama, || {
+            super::refresh_startup_provider_status_from(&mut state, &profiles);
+            state
+                .startup_provider_status
+                .expect("startup provider status should be set")
+        });
+        fs::remove_dir_all(data_root).expect("temporary root should be removed");
+        status
+    }
+
+    #[test]
+    fn runtime_key_resolution_prefers_environment_and_falls_back_to_store() {
+        let _guard = env_lock();
+        let profile = profile(
+            "openrouter",
+            "https://openrouter.ai/api/v1/chat/completions",
+        );
+        let store = MemoryStore {
+            value: RefCell::new(Some("stored-secret".into())),
+        };
+        let previous = std::env::var_os("OPENROUTER_API_KEY");
+
+        unsafe { std::env::set_var("OPENROUTER_API_KEY", "env-secret") };
+        assert_eq!(
+            super::resolve_profile_api_key(&profile, &store).unwrap(),
+            "env-secret"
+        );
+
+        unsafe { std::env::set_var("OPENROUTER_API_KEY", "   ") };
+        assert_eq!(
+            super::resolve_profile_api_key(&profile, &store).unwrap(),
+            "stored-secret"
+        );
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("OPENROUTER_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
+        }
+    }
+
+    #[test]
+    fn startup_status_detects_openrouter_env_without_saved_profile() {
+        assert_eq!(
+            refreshed_startup_provider_status(Some("openrouter-env-secret"), None),
+            StartupProviderStatus::OpenRouterOnly
+        );
+    }
+
+    #[test]
+    fn startup_status_detects_ollama_env_without_saved_profile() {
+        assert_eq!(
+            refreshed_startup_provider_status(None, Some("ollama-env-secret")),
+            StartupProviderStatus::OllamaOnly
+        );
+    }
+
+    #[test]
+    fn startup_status_detects_both_envs_without_saved_profiles() {
+        assert_eq!(
+            refreshed_startup_provider_status(
+                Some("openrouter-env-secret"),
+                Some("ollama-env-secret")
+            ),
+            StartupProviderStatus::BothConfigured
+        );
     }
 
     #[test]
@@ -800,6 +1224,44 @@ mod tests {
     }
 
     #[test]
+    fn live_function_call_output_is_appended_as_a_structured_tool_message() {
+        let mut state = AppState::new();
+        let call = RovenToolCall {
+            id: "call-1".to_owned(),
+            name: "list_directory".to_owned(),
+            arguments: serde_json::json!({"path": "."}),
+        };
+        let result = RovenToolResult {
+            tool_call_id: "call-1".to_owned(),
+            name: "list_directory".to_owned(),
+            result: serde_json::json!({"status": "ok"}),
+        };
+
+        apply_worker_event(
+            &mut state,
+            None,
+            None,
+            None,
+            WorkerEvent::FunctionCallOutput { call, result },
+        );
+
+        assert_eq!(state.messages.len(), 1);
+        let message = &state.messages[0];
+        assert_eq!(message.role, Role::Activity);
+        assert!(message.content.is_empty());
+        assert!(matches!(
+            message.kind,
+            crate::ui::state::MessageKind::Tool {
+                ref name,
+                ref input,
+                ref output,
+            } if name == "list_directory"
+                && input["path"] == "."
+                && output["status"] == "ok"
+        ));
+    }
+
+    #[test]
     fn worker_errors_and_cancellation_update_the_ui_and_persist_outcomes() {
         let data = temp_root("worker-events-data");
         let project = temp_root("worker-events-project");
@@ -859,5 +1321,234 @@ mod tests {
         }));
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn model_switch_changes_the_selected_provider_and_model() {
+        let data_root = temp_root("model-switch-success");
+        let profiles = crate::profiles::ProviderProfiles::for_data_root(data_root.clone());
+        let first = profiles
+            .create(
+                "OpenRouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "openai/gpt-oss-20b",
+            )
+            .unwrap();
+        let second = profiles
+            .create("Ollama", "https://ollama.com/api/chat", "minimax-m3:cloud")
+            .unwrap();
+        profiles.set_default(&first.id).unwrap();
+
+        let mut state = AppState::new();
+        super::open_model_switch_with(&mut state, &profiles, |_profile| {
+            crate::ui::state::ProviderAccessState::Ready
+        })
+        .unwrap();
+        super::handle_model_selection_key(
+            &mut state,
+            &profiles,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .unwrap();
+        super::handle_model_selection_key(
+            &mut state,
+            &profiles,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        match state.model_selection.as_mut().unwrap() {
+            ModelSelection::Model { value, .. } => *value = "gpt-oss:120b-cloud".to_owned(),
+            selection => panic!("expected model entry, got {selection:?}"),
+        }
+
+        assert!(
+            super::handle_model_selection_key(
+                &mut state,
+                &profiles,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )
+            .unwrap()
+        );
+        assert!(state.model_selection.is_none());
+        assert_eq!(profiles.default_profile().unwrap().unwrap().id, second.id);
+        assert_eq!(
+            profiles.default_profile().unwrap().unwrap().model,
+            "gpt-oss:120b-cloud"
+        );
+        assert_eq!(
+            state.provider_model.as_deref(),
+            Some("Ollama · gpt-oss:120b-cloud")
+        );
+        fs::remove_dir_all(data_root).unwrap();
+    }
+
+    #[test]
+    fn blank_model_entry_cancels_without_changing_the_current_selection() {
+        let data_root = temp_root("model-switch-blank-cancel");
+        let profiles = crate::profiles::ProviderProfiles::for_data_root(data_root.clone());
+        let default = profiles
+            .create(
+                "OpenRouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "openai/gpt-oss-20b",
+            )
+            .unwrap();
+        let second = profiles
+            .create("Ollama", "https://ollama.com/api/chat", "minimax-m3:cloud")
+            .unwrap();
+        profiles.set_default(&default.id).unwrap();
+
+        let mut state = AppState::new();
+        state.provider_model = Some("OpenRouter · openai/gpt-oss-20b".to_owned());
+        super::open_model_switch_with(&mut state, &profiles, |_profile| {
+            crate::ui::state::ProviderAccessState::Ready
+        })
+        .unwrap();
+        super::handle_model_selection_key(
+            &mut state,
+            &profiles,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .unwrap();
+        super::handle_model_selection_key(
+            &mut state,
+            &profiles,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        match state.model_selection.as_mut().unwrap() {
+            ModelSelection::Model { value, .. } => *value = "   ".to_owned(),
+            selection => panic!("expected model entry, got {selection:?}"),
+        }
+
+        assert!(
+            !super::handle_model_selection_key(
+                &mut state,
+                &profiles,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )
+            .unwrap()
+        );
+        assert!(state.model_selection.is_none());
+        assert_eq!(profiles.default_profile().unwrap().unwrap().id, default.id);
+        assert_eq!(
+            profiles
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|profile| profile.id == second.id)
+                .unwrap()
+                .model,
+            "minimax-m3:cloud"
+        );
+        assert_eq!(
+            state.provider_model.as_deref(),
+            Some("OpenRouter · openai/gpt-oss-20b")
+        );
+        fs::remove_dir_all(data_root).unwrap();
+    }
+
+    #[test]
+    fn escape_cancels_provider_selection_without_changing_the_current_selection() {
+        let data_root = temp_root("model-switch-escape-cancel");
+        let profiles = crate::profiles::ProviderProfiles::for_data_root(data_root.clone());
+        let default = profiles
+            .create(
+                "OpenRouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "openai/gpt-oss-20b",
+            )
+            .unwrap();
+        profiles
+            .create("Ollama", "https://ollama.com/api/chat", "minimax-m3:cloud")
+            .unwrap();
+        profiles.set_default(&default.id).unwrap();
+
+        let mut state = AppState::new();
+        state.provider_model = Some("OpenRouter · openai/gpt-oss-20b".to_owned());
+        super::open_model_switch_with(&mut state, &profiles, |_profile| {
+            crate::ui::state::ProviderAccessState::Ready
+        })
+        .unwrap();
+
+        assert!(
+            !super::handle_model_selection_key(
+                &mut state,
+                &profiles,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            )
+            .unwrap()
+        );
+        assert!(state.model_selection.is_none());
+        assert_eq!(profiles.default_profile().unwrap().unwrap().id, default.id);
+        assert_eq!(
+            state.provider_model.as_deref(),
+            Some("OpenRouter · openai/gpt-oss-20b")
+        );
+        fs::remove_dir_all(data_root).unwrap();
+    }
+
+    #[test]
+    fn unsupported_model_keeps_the_previous_selection_and_shows_a_friendly_error() {
+        let data_root = temp_root("model-switch-invalid");
+        let profiles = crate::profiles::ProviderProfiles::for_data_root(data_root.clone());
+        let default = profiles
+            .create(
+                "OpenRouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "openai/gpt-oss-20b",
+            )
+            .unwrap();
+        profiles
+            .create("Ollama", "https://ollama.com/api/chat", "minimax-m3:cloud")
+            .unwrap();
+        profiles.set_default(&default.id).unwrap();
+
+        let mut state = AppState::new();
+        state.provider_model = Some("OpenRouter · openai/gpt-oss-20b".to_owned());
+        super::open_model_switch_with(&mut state, &profiles, |_profile| {
+            crate::ui::state::ProviderAccessState::Ready
+        })
+        .unwrap();
+        super::handle_model_selection_key(
+            &mut state,
+            &profiles,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .unwrap();
+        super::handle_model_selection_key(
+            &mut state,
+            &profiles,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        match state.model_selection.as_mut().unwrap() {
+            ModelSelection::Model { value, .. } => *value = "llama3.1:8b".to_owned(),
+            selection => panic!("expected model entry, got {selection:?}"),
+        }
+
+        assert!(
+            !super::handle_model_selection_key(
+                &mut state,
+                &profiles,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )
+            .unwrap()
+        );
+        match state.model_selection.as_ref().unwrap() {
+            ModelSelection::Model { error, .. } => {
+                let error = error.as_deref().unwrap();
+                assert!(error.contains("llama3.1:8b"));
+                assert!(error.contains("Ollama"));
+                assert!(error.contains("supported"));
+            }
+            selection => panic!("expected model entry, got {selection:?}"),
+        }
+        assert_eq!(profiles.default_profile().unwrap().unwrap().id, default.id);
+        assert_eq!(
+            state.provider_model.as_deref(),
+            Some("OpenRouter · openai/gpt-oss-20b")
+        );
+        fs::remove_dir_all(data_root).unwrap();
     }
 }
