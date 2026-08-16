@@ -6,7 +6,10 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use super::state::{AppState, ModelSelection};
+use super::{
+    startup::{self, StartupProviderStatus},
+    state::{AppState, ModelSelection},
+};
 use super::transcript::render_message;
 
 pub(crate) const MINIMUM_WIDTH: u16 = 40;
@@ -75,6 +78,12 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
                     "No source search or file edits",
                     TRUST_BODY_STYLE,
                 )),
+                Line::from(""),
+                Line::from(Span::styled("PROVIDER ACCESS", MUTED_STYLE)),
+                Line::from(""),
+                startup_provider_line(state.startup_provider_status, 0),
+                startup_provider_line(state.startup_provider_status, 1),
+                startup_provider_line(state.startup_provider_status, 2),
                 Line::from(""),
                 Line::from(Span::styled("CHOOSE", MUTED_STYLE)),
                 Line::from(""),
@@ -162,6 +171,19 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
     draw_status_bar(frame, status_area, state);
     draw_composer(frame, composer_area, state);
     draw_footer(frame, footer_area, state);
+}
+
+fn startup_provider_line(
+    status: Option<StartupProviderStatus>,
+    index: usize,
+) -> Line<'static> {
+    let Some(status) = status else {
+        return Line::from("");
+    };
+    startup::banner_lines(status)
+        .get(index)
+        .map(|line| Line::from(Span::styled((*line).to_owned(), TRUST_BODY_STYLE)))
+        .unwrap_or_else(|| Line::from(""))
 }
 
 fn display_workspace_path(path: &str) -> &str {
@@ -360,7 +382,10 @@ mod tests {
     };
 
     use super::{MINIMUM_HEIGHT, MINIMUM_WIDTH, draw};
-    use crate::ui::state::{AppState, ModelSelection, ProviderAccessState, ProviderChoice};
+    use crate::ui::{
+        startup::StartupProviderStatus,
+        state::{AppState, ModelSelection, ProviderAccessState, ProviderChoice},
+    };
 
     fn render(state: &mut AppState, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
@@ -389,6 +414,55 @@ mod tests {
         assert!(rendered.contains("READ-ONLY ACCESS"));
         assert!(rendered.contains("Trust and start"));
         assert!(rendered.contains("Exit Roven"));
+    }
+
+    #[test]
+    fn trust_screen_shows_no_provider_access_and_setup_step() {
+        let mut state = AppState::new();
+        state.startup_provider_status = Some(StartupProviderStatus::NoProviderAccess);
+
+        let rendered = render(&mut state, 80, 24);
+
+        assert!(rendered.contains("PROVIDER ACCESS"));
+        assert!(rendered.contains("OpenRouter: missing"));
+        assert!(rendered.contains("Ollama Cloud: missing"));
+        assert!(rendered.contains("roven auth set"));
+    }
+
+    #[test]
+    fn trust_screen_shows_openrouter_only_access() {
+        let mut state = AppState::new();
+        state.startup_provider_status = Some(StartupProviderStatus::OpenRouterOnly);
+
+        let rendered = render(&mut state, 80, 24);
+
+        assert!(rendered.contains("OpenRouter: configured"));
+        assert!(rendered.contains("Ollama Cloud: missing"));
+        assert!(!rendered.contains("Run `roven auth set`"));
+    }
+
+    #[test]
+    fn trust_screen_shows_ollama_only_access() {
+        let mut state = AppState::new();
+        state.startup_provider_status = Some(StartupProviderStatus::OllamaOnly);
+
+        let rendered = render(&mut state, 80, 24);
+
+        assert!(rendered.contains("OpenRouter: missing"));
+        assert!(rendered.contains("Ollama Cloud: configured"));
+        assert!(!rendered.contains("Run `roven auth set`"));
+    }
+
+    #[test]
+    fn trust_screen_shows_both_provider_access_states() {
+        let mut state = AppState::new();
+        state.startup_provider_status = Some(StartupProviderStatus::BothConfigured);
+
+        let rendered = render(&mut state, 80, 24);
+
+        assert!(rendered.contains("OpenRouter: configured"));
+        assert!(rendered.contains("Ollama Cloud: configured"));
+        assert!(!rendered.contains("roven auth set"));
     }
 
     #[test]

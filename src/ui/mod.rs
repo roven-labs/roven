@@ -1,4 +1,5 @@
 mod state;
+mod startup;
 mod terminal;
 mod transcript;
 mod view;

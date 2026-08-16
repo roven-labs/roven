@@ -2,6 +2,8 @@ use std::time::Instant;
 
 use serde_json::Value;
 
+use super::startup::StartupProviderStatus;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Role {
     User,
@@ -120,6 +122,7 @@ pub(crate) struct AppState {
     pub(crate) resume_entries: Option<Vec<ResumeEntry>>,
     pub(crate) resume_index: usize,
     pub(crate) model_selection: Option<ModelSelection>,
+    pub(crate) startup_provider_status: Option<StartupProviderStatus>,
 }
 
 impl AppState {

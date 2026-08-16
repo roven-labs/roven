@@ -34,6 +34,7 @@ use crate::{
 };
 
 use super::{
+    startup,
     state::{AppState, Message, ProviderAccessState, ProviderChoice, ResumeEntry, Role},
     view,
 };
@@ -81,6 +82,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
         .canonicalize()?
         .to_string_lossy()
         .into_owned();
+    refresh_startup_provider_status(&mut state);
     log_event(
         runtime_log,
         "workspace_detected",
@@ -655,6 +657,26 @@ fn refresh_provider_model(state: &mut AppState) {
     } else {
         state.provider_model = None;
     }
+}
+
+fn refresh_startup_provider_status(state: &mut AppState) {
+    state.startup_provider_status = Some(
+        ProviderProfiles::for_current_user()
+            .ok()
+            .and_then(|profiles| profiles.list().ok())
+            .map(|profiles| {
+                startup::detect_provider_status(&profiles, |profile| {
+                    credentials::resolve_api_key(
+                        profile,
+                        &credentials::OsCredentialStore::for_profile_id(&profile.id),
+                    )
+                    .ok()
+                    .flatten()
+                    .is_some()
+                })
+            })
+            .unwrap_or(startup::StartupProviderStatus::NoProviderAccess),
+    );
 }
 
 fn refresh_provider_model_from(state: &mut AppState, profiles: &ProviderProfiles) {

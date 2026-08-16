@@ -323,4 +323,24 @@ mod tests {
 
         assert_eq!(resolved.as_deref(), Some("env-secret"));
     }
+
+    #[test]
+    fn ollama_environment_key_takes_precedence_over_the_stored_profile_key() {
+        let _guard = env_lock();
+        let profile = profile("ollama", "https://ollama.com/api/chat");
+        let store = MemoryStore {
+            value: RefCell::new(Some("stored-secret".into())),
+            failure: false,
+        };
+
+        let previous = std::env::var_os("OLLAMA_API_KEY");
+        unsafe { std::env::set_var("OLLAMA_API_KEY", "env-secret") };
+        let resolved = resolve_api_key(&profile, &store).unwrap();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("OLLAMA_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OLLAMA_API_KEY") },
+        }
+
+        assert_eq!(resolved.as_deref(), Some("env-secret"));
+    }
 }
