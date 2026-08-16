@@ -1,7 +1,20 @@
 use url::Url;
 
 const OPENROUTER_HOSTS: &[&str] = &["openrouter.ai", "eu.openrouter.ai"];
-const OLLAMA_CLOUD_MODELS: &[&str] = &["minimax-m3:cloud", "gemma4:31b-cloud"];
+const OLLAMA_CLOUD_MODELS: &[&str] = &[
+    "deepseek-v4-flash:cloud",
+    "deepseek-v4-pro:cloud",
+    "gemma4:31b-cloud",
+    "glm-5.1:cloud",
+    "glm-5.2:cloud",
+    "gpt-oss:20b-cloud",
+    "gpt-oss:120b-cloud",
+    "kimi-k2.6:cloud",
+    "minimax-m2.7:cloud",
+    "minimax-m3:cloud",
+    "mistral-large-3:675b-cloud",
+    "qwen3.5:cloud",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderKind {
@@ -99,6 +112,10 @@ mod tests {
 
         assert!(catalog.validate("minimax-m3:cloud"));
         assert!(catalog.validate("gemma4:31b-cloud"));
+        assert!(catalog.validate("gpt-oss:120b-cloud"));
+        assert!(catalog.validate("gpt-oss:20b-cloud"));
+        assert!(catalog.validate("kimi-k2.6:cloud"));
         assert!(!catalog.validate("llama3.1:8b"));
+        assert!(!catalog.validate("totally-unknown:cloud"));
     }
 }

@@ -24,6 +24,7 @@ use serde_json::Value;
 use crate::{
     agent::{self, AgentEvent, AgentMessage},
     credentials::{self, SecretStore},
+    model_catalog::{ProviderKind, validate_model},
     ollama, openrouter,
     profiles::{ProviderProfile, ProviderProfiles},
     provider::{OpenAiCompatibleProvider, Provider},
@@ -33,7 +34,7 @@ use crate::{
 };
 
 use super::{
-    state::{AppState, Message, ResumeEntry, Role},
+    state::{AppState, Message, ProviderAccessState, ProviderChoice, ResumeEntry, Role},
     view,
 };
 
@@ -190,6 +191,16 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
             }
             continue;
         }
+        if state.model_selection.is_some() {
+            if let Event::Key(key) = event {
+                if let Err(error) =
+                    handle_model_selection_key(&mut state, &ProviderProfiles::for_current_user()?, key)
+                {
+                    state.activity(error);
+                }
+            }
+            continue;
+        }
         if state.running {
             match event {
                 Event::Key(KeyEvent {
@@ -266,6 +277,11 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                         .collect();
                     state.open_resume(entries);
                     log_event(runtime_log, "resume_picker_opened", "outcome=ok");
+                } else if raw.trim() == "/model" {
+                    state.input.clear();
+                    if let Err(error) = open_model_switch(&mut state) {
+                        state.activity(error);
+                    }
                 } else if state.submit() {
                     refresh_provider_model(&mut state);
                     let user = state.last_user_message().unwrap_or_default().to_owned();
@@ -431,6 +447,149 @@ fn resolve_profile_api_key(
         })
 }
 
+fn open_model_switch(state: &mut AppState) -> Result<(), String> {
+    let profiles = ProviderProfiles::for_current_user().map_err(|error| error.to_string())?;
+    open_model_switch_with(state, &profiles, provider_access_state)
+}
+
+fn open_model_switch_with<F>(
+    state: &mut AppState,
+    profiles: &ProviderProfiles,
+    access_state_for: F,
+) -> Result<(), String>
+where
+    F: Fn(&ProviderProfile) -> ProviderAccessState,
+{
+    let entries = profiles
+        .list()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|profile| {
+            let access = access_state_for(&profile);
+            ProviderChoice {
+                id: profile.id,
+                name: profile.name,
+                endpoint: profile.endpoint,
+                model: profile.model,
+                access,
+            }
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return Err("No provider profiles. Run `roven auth set`.".to_owned());
+    }
+    let default_profile_id = profiles
+        .default_profile()
+        .map_err(|error| error.to_string())?
+        .map(|profile| profile.id);
+    state.open_model_selection(entries, default_profile_id.as_deref());
+    Ok(())
+}
+
+fn handle_model_selection_key(
+    state: &mut AppState,
+    profiles: &ProviderProfiles,
+    key: KeyEvent,
+) -> Result<bool, String> {
+    match key.code {
+        KeyCode::Esc => {
+            state.close_model_selection();
+            Ok(false)
+        }
+        KeyCode::Up => {
+            state.select_previous_model_provider();
+            Ok(false)
+        }
+        KeyCode::Down => {
+            state.select_next_model_provider();
+            Ok(false)
+        }
+        KeyCode::Enter => {
+            let Some(selection) = state.model_selection.clone() else {
+                return Ok(false);
+            };
+            match selection {
+                super::state::ModelSelection::Provider { .. } => {
+                    state.begin_model_entry();
+                    Ok(false)
+                }
+                super::state::ModelSelection::Model { choice, value, .. } => {
+                    let model = value.trim().to_owned();
+                    if model.is_empty() {
+                        state.close_model_selection();
+                        return Ok(false);
+                    }
+                    if !choice.access.is_ready() {
+                        state.set_model_entry_error(match choice.access {
+                            ProviderAccessState::MissingApiKey => format!(
+                                "{} is missing an API key. Run `roven auth set` before switching to it.",
+                                choice.name
+                            ),
+                            ProviderAccessState::CredentialStoreUnavailable => format!(
+                                "{} is unavailable because the credential store could not be read.",
+                                choice.name
+                            ),
+                            ProviderAccessState::Ready => String::new(),
+                        });
+                        return Ok(false);
+                    }
+                    if !validate_model(&choice.endpoint, &model) {
+                        state.set_model_entry_error(unsupported_model_message(&choice, &model));
+                        return Ok(false);
+                    }
+                    let updated = profiles
+                        .update_model(&choice.id, &model)
+                        .map_err(|error| error.to_string())?;
+                    profiles
+                        .set_default(&choice.id)
+                        .map_err(|error| error.to_string())?;
+                    refresh_provider_model_from(state, profiles);
+                    state.close_model_selection();
+                    state.activity(format!(
+                        "Active provider set to {} · {}",
+                        updated.name, updated.model
+                    ));
+                    Ok(true)
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            state.backspace_model_entry();
+            Ok(false)
+        }
+        KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.push_model_entry_char(character);
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn provider_access_state(profile: &ProviderProfile) -> ProviderAccessState {
+    match credentials::resolve_api_key(
+        profile,
+        &credentials::OsCredentialStore::for_profile_id(&profile.id),
+    ) {
+        Ok(Some(_)) => ProviderAccessState::Ready,
+        Ok(None) => ProviderAccessState::MissingApiKey,
+        Err(_) => ProviderAccessState::CredentialStoreUnavailable,
+    }
+}
+
+fn unsupported_model_message(choice: &ProviderChoice, model: &str) -> String {
+    match ProviderKind::from_endpoint(&choice.endpoint) {
+        Some(ProviderKind::OllamaCloud) => format!(
+            "`{model}` is not a supported Ollama Cloud model for {}. Enter one of Ollama's documented cloud model IDs.",
+            choice.name
+        ),
+        Some(ProviderKind::OpenRouter) => format!(
+            "`{model}` is not a valid OpenRouter model ID for {}. Enter it as `provider/model`.",
+            choice.name
+        ),
+        None => format!("`{model}` is not supported for {}.", choice.name),
+    }
+}
+
 fn apply_worker_event(
     state: &mut AppState,
     store: Option<&ProjectStore>,
@@ -494,10 +653,19 @@ fn log_event(runtime_log: Option<&RuntimeLog>, event: &str, detail: &str) {
 }
 
 fn refresh_provider_model(state: &mut AppState) {
-    state.provider_model = ProviderProfiles::for_current_user()
+    if let Ok(profiles) = ProviderProfiles::for_current_user() {
+        refresh_provider_model_from(state, &profiles);
+    } else {
+        state.provider_model = None;
+    }
+}
+
+fn refresh_provider_model_from(state: &mut AppState, profiles: &ProviderProfiles) {
+    state.provider_model = profiles
+        .default_profile()
         .ok()
-        .and_then(|profiles| profiles.default_profile().ok().flatten())
-        .map(|profile| profile.model);
+        .flatten()
+        .map(|profile| format!("{} · {}", profile.name, profile.model));
 }
 
 fn persist_function_call_output(
@@ -722,11 +890,13 @@ mod tests {
         sync::{Mutex, OnceLock},
     };
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
     use crate::{
         credentials::{CredentialError, SecretStore},
         profiles::ProviderProfile,
         storage::{ConversationEvent, EventKind, ProjectStore},
-        ui::state::{AppState, Role},
+        ui::state::{AppState, ModelSelection, Role},
     };
 
     use super::{WorkerEvent, apply_worker_event};
@@ -1040,5 +1210,234 @@ mod tests {
         }));
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn model_switch_changes_the_selected_provider_and_model() {
+        let data_root = temp_root("model-switch-success");
+        let profiles = crate::profiles::ProviderProfiles::for_data_root(data_root.clone());
+        let first = profiles
+            .create(
+                "OpenRouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "openai/gpt-oss-20b",
+            )
+            .unwrap();
+        let second = profiles
+            .create("Ollama", "https://ollama.com/api/chat", "minimax-m3:cloud")
+            .unwrap();
+        profiles.set_default(&first.id).unwrap();
+
+        let mut state = AppState::new();
+        super::open_model_switch_with(&mut state, &profiles, |_profile| {
+            crate::ui::state::ProviderAccessState::Ready
+        })
+        .unwrap();
+        super::handle_model_selection_key(
+            &mut state,
+            &profiles,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .unwrap();
+        super::handle_model_selection_key(
+            &mut state,
+            &profiles,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        match state.model_selection.as_mut().unwrap() {
+            ModelSelection::Model { value, .. } => *value = "gpt-oss:120b-cloud".to_owned(),
+            selection => panic!("expected model entry, got {selection:?}"),
+        }
+
+        assert!(
+            super::handle_model_selection_key(
+                &mut state,
+                &profiles,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )
+            .unwrap()
+        );
+        assert!(state.model_selection.is_none());
+        assert_eq!(profiles.default_profile().unwrap().unwrap().id, second.id);
+        assert_eq!(
+            profiles.default_profile().unwrap().unwrap().model,
+            "gpt-oss:120b-cloud"
+        );
+        assert_eq!(
+            state.provider_model.as_deref(),
+            Some("Ollama · gpt-oss:120b-cloud")
+        );
+        fs::remove_dir_all(data_root).unwrap();
+    }
+
+    #[test]
+    fn blank_model_entry_cancels_without_changing_the_current_selection() {
+        let data_root = temp_root("model-switch-blank-cancel");
+        let profiles = crate::profiles::ProviderProfiles::for_data_root(data_root.clone());
+        let default = profiles
+            .create(
+                "OpenRouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "openai/gpt-oss-20b",
+            )
+            .unwrap();
+        let second = profiles
+            .create("Ollama", "https://ollama.com/api/chat", "minimax-m3:cloud")
+            .unwrap();
+        profiles.set_default(&default.id).unwrap();
+
+        let mut state = AppState::new();
+        state.provider_model = Some("OpenRouter · openai/gpt-oss-20b".to_owned());
+        super::open_model_switch_with(&mut state, &profiles, |_profile| {
+            crate::ui::state::ProviderAccessState::Ready
+        })
+        .unwrap();
+        super::handle_model_selection_key(
+            &mut state,
+            &profiles,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .unwrap();
+        super::handle_model_selection_key(
+            &mut state,
+            &profiles,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        match state.model_selection.as_mut().unwrap() {
+            ModelSelection::Model { value, .. } => *value = "   ".to_owned(),
+            selection => panic!("expected model entry, got {selection:?}"),
+        }
+
+        assert!(
+            !super::handle_model_selection_key(
+                &mut state,
+                &profiles,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )
+            .unwrap()
+        );
+        assert!(state.model_selection.is_none());
+        assert_eq!(profiles.default_profile().unwrap().unwrap().id, default.id);
+        assert_eq!(
+            profiles
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|profile| profile.id == second.id)
+                .unwrap()
+                .model,
+            "minimax-m3:cloud"
+        );
+        assert_eq!(
+            state.provider_model.as_deref(),
+            Some("OpenRouter · openai/gpt-oss-20b")
+        );
+        fs::remove_dir_all(data_root).unwrap();
+    }
+
+    #[test]
+    fn escape_cancels_provider_selection_without_changing_the_current_selection() {
+        let data_root = temp_root("model-switch-escape-cancel");
+        let profiles = crate::profiles::ProviderProfiles::for_data_root(data_root.clone());
+        let default = profiles
+            .create(
+                "OpenRouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "openai/gpt-oss-20b",
+            )
+            .unwrap();
+        profiles
+            .create("Ollama", "https://ollama.com/api/chat", "minimax-m3:cloud")
+            .unwrap();
+        profiles.set_default(&default.id).unwrap();
+
+        let mut state = AppState::new();
+        state.provider_model = Some("OpenRouter · openai/gpt-oss-20b".to_owned());
+        super::open_model_switch_with(&mut state, &profiles, |_profile| {
+            crate::ui::state::ProviderAccessState::Ready
+        })
+        .unwrap();
+
+        assert!(
+            !super::handle_model_selection_key(
+                &mut state,
+                &profiles,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            )
+            .unwrap()
+        );
+        assert!(state.model_selection.is_none());
+        assert_eq!(profiles.default_profile().unwrap().unwrap().id, default.id);
+        assert_eq!(
+            state.provider_model.as_deref(),
+            Some("OpenRouter · openai/gpt-oss-20b")
+        );
+        fs::remove_dir_all(data_root).unwrap();
+    }
+
+    #[test]
+    fn unsupported_model_keeps_the_previous_selection_and_shows_a_friendly_error() {
+        let data_root = temp_root("model-switch-invalid");
+        let profiles = crate::profiles::ProviderProfiles::for_data_root(data_root.clone());
+        let default = profiles
+            .create(
+                "OpenRouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "openai/gpt-oss-20b",
+            )
+            .unwrap();
+        profiles
+            .create("Ollama", "https://ollama.com/api/chat", "minimax-m3:cloud")
+            .unwrap();
+        profiles.set_default(&default.id).unwrap();
+
+        let mut state = AppState::new();
+        state.provider_model = Some("OpenRouter · openai/gpt-oss-20b".to_owned());
+        super::open_model_switch_with(&mut state, &profiles, |_profile| {
+            crate::ui::state::ProviderAccessState::Ready
+        })
+        .unwrap();
+        super::handle_model_selection_key(
+            &mut state,
+            &profiles,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .unwrap();
+        super::handle_model_selection_key(
+            &mut state,
+            &profiles,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        match state.model_selection.as_mut().unwrap() {
+            ModelSelection::Model { value, .. } => *value = "llama3.1:8b".to_owned(),
+            selection => panic!("expected model entry, got {selection:?}"),
+        }
+
+        assert!(
+            !super::handle_model_selection_key(
+                &mut state,
+                &profiles,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )
+            .unwrap()
+        );
+        match state.model_selection.as_ref().unwrap() {
+            ModelSelection::Model { error, .. } => {
+                let error = error.as_deref().unwrap();
+                assert!(error.contains("llama3.1:8b"));
+                assert!(error.contains("Ollama"));
+                assert!(error.contains("supported"));
+            }
+            selection => panic!("expected model entry, got {selection:?}"),
+        }
+        assert_eq!(profiles.default_profile().unwrap().unwrap().id, default.id);
+        assert_eq!(
+            state.provider_model.as_deref(),
+            Some("OpenRouter · openai/gpt-oss-20b")
+        );
+        fs::remove_dir_all(data_root).unwrap();
     }
 }

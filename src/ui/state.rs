@@ -59,6 +59,49 @@ pub(crate) struct ResumeEntry {
     pub(crate) updated_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderAccessState {
+    Ready,
+    MissingApiKey,
+    CredentialStoreUnavailable,
+}
+
+impl ProviderAccessState {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::MissingApiKey => "API key missing",
+            Self::CredentialStoreUnavailable => "credential store unavailable",
+        }
+    }
+
+    pub(crate) fn is_ready(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderChoice {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) endpoint: String,
+    pub(crate) model: String,
+    pub(crate) access: ProviderAccessState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModelSelection {
+    Provider {
+        entries: Vec<ProviderChoice>,
+        index: usize,
+    },
+    Model {
+        choice: ProviderChoice,
+        value: String,
+        error: Option<String>,
+    },
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct AppState {
     pub(crate) messages: Vec<Message>,
@@ -71,10 +114,12 @@ pub(crate) struct AppState {
     pub(crate) running: bool,
     pub(crate) status: Option<String>,
     pub(crate) provider_model: Option<String>,
+    pub(crate) context_percent: Option<usize>,
     generation_start_index: usize,
     generation_started_at: Option<Instant>,
     pub(crate) resume_entries: Option<Vec<ResumeEntry>>,
     pub(crate) resume_index: usize,
+    pub(crate) model_selection: Option<ModelSelection>,
 }
 
 impl AppState {
@@ -90,25 +135,29 @@ impl AppState {
     }
 
     pub(crate) fn insert_char(&mut self, character: char) {
-        if self.resume_entries.is_none() {
+        if self.resume_entries.is_none() && self.model_selection.is_none() {
             self.input.push(character);
         }
     }
 
     pub(crate) fn backspace(&mut self) {
-        if self.resume_entries.is_none() {
+        if self.resume_entries.is_none() && self.model_selection.is_none() {
             self.input.pop();
         }
     }
 
     pub(crate) fn insert_newline(&mut self) {
-        if self.resume_entries.is_none() {
+        if self.resume_entries.is_none() && self.model_selection.is_none() {
             self.input.push('\n');
         }
     }
 
     pub(crate) fn submit(&mut self) -> bool {
-        if self.running || self.resume_entries.is_some() || self.input.trim().is_empty() {
+        if self.running
+            || self.resume_entries.is_some()
+            || self.model_selection.is_some()
+            || self.input.trim().is_empty()
+        {
             return false;
         }
 
@@ -127,6 +176,7 @@ impl AppState {
     pub(crate) fn start_agent(&mut self) {
         self.running = true;
         self.status = Some("Agent working...".to_owned());
+        self.context_percent = None;
         self.generation_start_index = self.messages.len();
         self.generation_started_at = Some(Instant::now());
     }
@@ -191,6 +241,67 @@ impl AppState {
         self.resume_entries = None;
     }
 
+    pub(crate) fn open_model_selection(
+        &mut self,
+        entries: Vec<ProviderChoice>,
+        default_profile_id: Option<&str>,
+    ) {
+        let index = default_profile_id
+            .and_then(|id| entries.iter().position(|entry| entry.id == id))
+            .unwrap_or(0);
+        self.model_selection = Some(ModelSelection::Provider { entries, index });
+    }
+
+    pub(crate) fn close_model_selection(&mut self) {
+        self.model_selection = None;
+    }
+
+    pub(crate) fn select_previous_model_provider(&mut self) {
+        if let Some(ModelSelection::Provider { index, .. }) = self.model_selection.as_mut() {
+            *index = index.saturating_sub(1);
+        }
+    }
+
+    pub(crate) fn select_next_model_provider(&mut self) {
+        if let Some(ModelSelection::Provider { entries, index }) = self.model_selection.as_mut() {
+            *index = (*index + 1).min(entries.len().saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn begin_model_entry(&mut self) {
+        let Some(ModelSelection::Provider { entries, index }) = &self.model_selection else {
+            return;
+        };
+        let Some(choice) = entries.get(*index).cloned() else {
+            return;
+        };
+        self.model_selection = Some(ModelSelection::Model {
+            value: choice.model.clone(),
+            choice,
+            error: None,
+        });
+    }
+
+    pub(crate) fn push_model_entry_char(&mut self, character: char) {
+        if let Some(ModelSelection::Model { value, error, .. }) = self.model_selection.as_mut() {
+            value.push(character);
+            *error = None;
+        }
+    }
+
+    pub(crate) fn backspace_model_entry(&mut self) {
+        if let Some(ModelSelection::Model { value, error, .. }) = self.model_selection.as_mut() {
+            value.pop();
+            *error = None;
+        }
+    }
+
+    pub(crate) fn set_model_entry_error(&mut self, message: String) {
+        if let Some(ModelSelection::Model { error, .. }) = self.model_selection.as_mut() {
+            *error = Some(message);
+        }
+    }
+
     pub(crate) fn selected_resume_id(&self) -> Option<&str> {
         self.resume_entries
             .as_ref()
@@ -202,35 +313,7 @@ impl AppState {
         self.messages = messages;
         self.scroll_offset = 0;
         self.close_resume();
-    }
-
-    pub(crate) fn context_usage_percent(&self) -> usize {
-        const MAX_CONTEXT_TOKENS: usize = 262_144;
-        let characters = self
-            .messages
-            .iter()
-            .map(|message| {
-                let tool_characters = match &message.kind {
-                    MessageKind::Text => 0,
-                    MessageKind::Tool {
-                        name,
-                        input,
-                        output,
-                    } => {
-                        name.chars().count()
-                            + serde_json::to_string(input).map_or(0, |value| value.chars().count())
-                            + serde_json::to_string(output).map_or(0, |value| value.chars().count())
-                    }
-                };
-                message.content.chars().count() + tool_characters
-            })
-            .sum::<usize>();
-        let estimated_tokens = characters.saturating_add(3) / 4;
-        estimated_tokens
-            .saturating_mul(100)
-            .checked_div(MAX_CONTEXT_TOKENS)
-            .unwrap_or(0)
-            .min(100)
+        self.close_model_selection();
     }
 
     pub(crate) fn generated_messages(&self) -> &[Message] {

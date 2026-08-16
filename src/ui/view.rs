@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use super::state::AppState;
+use super::state::{AppState, ModelSelection};
 use super::transcript::render_message;
 
 pub(crate) const MINIMUM_WIDTH: u16 = 40;
@@ -138,6 +138,11 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
         return;
     }
 
+    if let Some(selection) = &state.model_selection {
+        draw_model_selection(frame, area, selection);
+        return;
+    }
+
     let chat_area = area.inner(Margin {
         horizontal: 1,
         vertical: 0,
@@ -244,8 +249,76 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &AppState) {
         .provider_model
         .as_deref()
         .unwrap_or("No configured model");
-    let footer = format!("{model} · {}% context used", state.context_usage_percent());
+    let context = state.context_percent.map_or_else(
+        || "context unavailable".to_owned(),
+        |percent| format!("{percent}% context used"),
+    );
+    let footer = format!("{model} · {context}");
     frame.render_widget(Paragraph::new(footer).style(FOOTER_STYLE), area);
+}
+
+fn draw_model_selection(frame: &mut Frame, area: Rect, selection: &ModelSelection) {
+    match selection {
+        ModelSelection::Provider { entries, index } => {
+            let items = entries
+                .iter()
+                .enumerate()
+                .map(|(entry_index, entry)| {
+                    let marker = if entry_index == *index { ">" } else { " " };
+                    format!(
+                        "{marker} {} · {} · {}",
+                        entry.name,
+                        entry.model,
+                        entry.access.label()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Switch model\n\nChoose provider\n\n{items}\n\nEnter select   Esc cancel"
+                ))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(MUTED_STYLE),
+                ),
+                area,
+            );
+        }
+        ModelSelection::Model {
+            choice,
+            value,
+            error,
+        } => {
+            let body = format!(
+                "Switch model\n\nProvider: {}\nAccess: {}\nCurrent model: {}\n\nNew model ID\n> {}\n\n{}\n{}",
+                choice.name,
+                choice.access.label(),
+                choice.model,
+                value,
+                error.as_deref().unwrap_or(""),
+                "Enter save   blank Enter/Esc cancel"
+            );
+            frame.render_widget(
+                Paragraph::new(body)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(MUTED_STYLE),
+                    )
+                    .wrap(Wrap { trim: false }),
+                area,
+            );
+            let cursor_x = area
+                .x
+                .saturating_add(3)
+                .saturating_add(value.chars().count() as u16)
+                .min(area.x.saturating_add(area.width).saturating_sub(2));
+            let cursor_y = area.y.saturating_add(6);
+            frame.set_cursor_position((cursor_x, cursor_y));
+        }
+    }
 }
 
 fn composer_lines(input: &str) -> Vec<Line<'static>> {
@@ -287,7 +360,7 @@ mod tests {
     };
 
     use super::{MINIMUM_HEIGHT, MINIMUM_WIDTH, draw};
-    use crate::ui::state::AppState;
+    use crate::ui::state::{AppState, ModelSelection, ProviderAccessState, ProviderChoice};
 
     fn render(state: &mut AppState, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
@@ -332,7 +405,7 @@ mod tests {
 
         assert!(rendered.contains("You › Hello"));
         assert!(rendered.contains("→ Add a follow-up"));
-        assert!(rendered.contains("configured-model · 0% context used"));
+        assert!(rendered.contains("configured-model · context unavailable"));
         assert!(!rendered.contains("Roven"));
         assert!(!rendered.contains("Project agent"));
         assert!(!rendered.contains("The chat UI is ready"));
@@ -421,7 +494,7 @@ mod tests {
     fn footer_uses_only_the_configured_model_and_context_percent() {
         let mut state = AppState::new();
         state.trusted = true;
-        state.provider_model = Some("provider/model-v2".to_owned());
+        state.provider_model = Some("OpenRouter · provider/model-v2".to_owned());
         state.messages.push(crate::ui::state::Message::text(
             crate::ui::state::Role::User,
             "Hello".to_owned(),
@@ -430,8 +503,40 @@ mod tests {
 
         let rendered = render(&mut state, 100, 24);
 
-        assert!(rendered.contains("provider/model-v2 · 0% context used"));
+        assert!(rendered.contains("OpenRouter · provider/model-v2 · context unavailable"));
         assert!(!rendered.contains("tokens"));
         assert!(!rendered.contains("256K"));
+    }
+
+    #[test]
+    fn model_picker_lists_provider_access_without_showing_secrets() {
+        let mut state = AppState::new();
+        state.trusted = true;
+        state.model_selection = Some(ModelSelection::Provider {
+            entries: vec![
+                ProviderChoice {
+                    id: "openrouter".to_owned(),
+                    name: "OpenRouter".to_owned(),
+                    endpoint: "https://openrouter.ai/api/v1/chat/completions".to_owned(),
+                    model: "openai/gpt-oss-20b".to_owned(),
+                    access: ProviderAccessState::Ready,
+                },
+                ProviderChoice {
+                    id: "ollama".to_owned(),
+                    name: "Ollama".to_owned(),
+                    endpoint: "https://ollama.com/api/chat".to_owned(),
+                    model: "minimax-m3:cloud".to_owned(),
+                    access: ProviderAccessState::MissingApiKey,
+                },
+            ],
+            index: 1,
+        });
+
+        let rendered = render(&mut state, 100, 24);
+
+        assert!(rendered.contains("Switch model"));
+        assert!(rendered.contains("OpenRouter · openai/gpt-oss-20b · ready"));
+        assert!(rendered.contains("Ollama · minimax-m3:cloud · API key missing"));
+        assert!(!rendered.contains("secret"));
     }
 }

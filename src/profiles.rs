@@ -120,6 +120,27 @@ impl ProviderProfiles {
         self.write(&document)
     }
 
+    pub(crate) fn update_model(
+        &self,
+        id: &str,
+        model: &str,
+    ) -> Result<ProviderProfile, ProfileError> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(ProfileError::EmptyModel);
+        }
+        let mut document = self.read()?;
+        let profile = document
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == id)
+            .ok_or_else(|| ProfileError::NotFound(id.to_owned()))?;
+        profile.model = model.to_owned();
+        let updated = profile.clone();
+        self.write(&document)?;
+        Ok(updated)
+    }
+
     pub(crate) fn remove(&self, id: &str) -> Result<ProviderProfile, ProfileError> {
         let mut document = self.read()?;
         let position = document
@@ -254,6 +275,40 @@ mod tests {
 
         fs::write(data_root.join(PROFILES_FILE), b"not json").unwrap();
         assert!(profiles.list().is_err());
+        fs::remove_dir_all(data_root).unwrap();
+    }
+
+    #[test]
+    fn update_model_only_changes_the_selected_profile() {
+        let data_root = temp_root("provider-profile-update");
+        let profiles = ProviderProfiles::for_data_root(data_root.clone());
+        let first = profiles
+            .create(
+                "openrouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "openai/gpt-oss-20b",
+            )
+            .unwrap();
+        let second = profiles
+            .create("ollama", "https://ollama.com/api/chat", "minimax-m3:cloud")
+            .unwrap();
+
+        let updated = profiles.update_model(&second.id, "gpt-oss:120b-cloud").unwrap();
+        let listed = profiles.list().unwrap();
+
+        assert_eq!(updated.model, "gpt-oss:120b-cloud");
+        assert_eq!(
+            listed.iter().find(|profile| profile.id == first.id).unwrap().model,
+            "openai/gpt-oss-20b"
+        );
+        assert_eq!(
+            listed
+                .iter()
+                .find(|profile| profile.id == second.id)
+                .unwrap()
+                .model,
+            "gpt-oss:120b-cloud"
+        );
         fs::remove_dir_all(data_root).unwrap();
     }
 }
