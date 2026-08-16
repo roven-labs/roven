@@ -910,9 +910,9 @@ mod tests {
     use crate::storage::{ProjectRegistry, RegistrationLookup};
 
     use super::{
-        BlockedReason, ListDirectory, ListDirectoryInput, PrepareProject, PrepareProjectInput,
-        PrepareProjectResult, ReadFile, ReadFileInput, RovenToolCall, ToolContext, definitions,
-        dispatch,
+        BlockedReason, LIST_DIRECTORY_DESCRIPTION, ListDirectory, ListDirectoryInput,
+        PrepareProject, PrepareProjectInput, PrepareProjectResult, ReadFile, ReadFileInput,
+        RovenToolCall, ToolContext, definitions, dispatch,
     };
 
     fn temp_root(name: &str) -> PathBuf {
@@ -1663,6 +1663,27 @@ mod tests {
             json!({
                 "status": "ok",
                 "tools": expected,
+            })
+        );
+        let list_directory = result.result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "list_directory")
+            .expect("list_directory must be registered");
+        assert_eq!(list_directory["description"], LIST_DIRECTORY_DESCRIPTION);
+        assert_eq!(
+            list_directory["input_schema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative directory path; use `.` for the workspace root."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
             })
         );
         let invalid = dispatch(
