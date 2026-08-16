@@ -423,7 +423,7 @@ mod tests {
         assert!(rendered.contains("PROVIDER ACCESS"));
         assert!(rendered.contains("OpenRouter: missing"));
         assert!(rendered.contains("Ollama Cloud: missing"));
-        assert!(rendered.contains("pmemc auth set"));
+        assert!(rendered.contains("roven auth set"));
     }
 
     #[test]
@@ -435,7 +435,7 @@ mod tests {
 
         assert!(rendered.contains("OpenRouter: configured"));
         assert!(rendered.contains("Ollama Cloud: missing"));
-        assert!(!rendered.contains("Run `pmemc auth set`"));
+        assert!(!rendered.contains("Run `roven auth set`"));
     }
 
     #[test]
@@ -447,7 +447,7 @@ mod tests {
 
         assert!(rendered.contains("OpenRouter: missing"));
         assert!(rendered.contains("Ollama Cloud: configured"));
-        assert!(!rendered.contains("Run `pmemc auth set`"));
+        assert!(!rendered.contains("Run `roven auth set`"));
     }
 
     #[test]
@@ -459,7 +459,7 @@ mod tests {
 
         assert!(rendered.contains("OpenRouter: configured"));
         assert!(rendered.contains("Ollama Cloud: configured"));
-        assert!(!rendered.contains("pmemc auth set"));
+        assert!(!rendered.contains("roven auth set"));
     }
 
     #[test]

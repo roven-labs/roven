@@ -5,7 +5,7 @@
 # Roven
 
 Roven is a native terminal project-memory assistant. The shipped executable is
-`pmemc`. It keeps conversations
+`roven`. It keeps conversations
 scoped to the trusted project directory and can register that project for
 future resume and portfolio work.
 
@@ -17,14 +17,14 @@ commands.
 
 ## Current capabilities
 
-- `pmemc auth set` creates a named provider profile.
-- `pmemc auth list` shows saved names, endpoints, models, and the default marker.
-- `pmemc auth use` lets you choose the default profile by its displayed number.
-- `pmemc auth status` reports the selected profile without revealing its key.
-- `pmemc auth remove <name>` removes a profile and its operating-system credential.
+- `roven auth set` creates a named provider profile.
+- `roven auth list` shows saved names, endpoints, models, and the default marker.
+- `roven auth use` lets you choose the default profile by its displayed number.
+- `roven auth status` reports the selected profile without revealing its key.
+- `roven auth remove <name>` removes a profile and its operating-system credential.
 - Native Ollama Cloud profiles use `https://ollama.com/api/chat` and report the
   provider's real context-window usage as a percentage.
-- Bare `pmemc` asks whether to trust the canonical current directory for the
+- Bare `roven` asks whether to trust the canonical current directory for the
   current launch. Trust is not persisted between launches.
 - After trust, the optional root `ROVEN.md` is loaded as project instructions.
 - `/resume` opens sessions for the current workspace. `Esc` cancels an active
@@ -91,7 +91,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 Open a new PowerShell session, change to the project directory, and run:
 
 ```powershell
-pmemc
+roven
 ```
 
 See [docs/SETUP.md](docs/SETUP.md) for provider profiles and API-key setup.

@@ -380,7 +380,7 @@ fn spawn_worker(
             let profile = profiles
                 .default_profile()
                 .map_err(|error| error.to_string())?
-                .ok_or_else(|| "No default provider profile. Run `pmemc auth set`.".to_owned())?;
+                .ok_or_else(|| "No default provider profile. Run `roven auth set`.".to_owned())?;
             let key = resolve_profile_api_key(
                 &profile,
                 &credentials::OsCredentialStore::for_profile_id(&profile.id),
@@ -447,7 +447,7 @@ fn resolve_profile_api_key(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| {
             format!(
-                "API key missing for provider profile `{}`. Run `pmemc auth set`.",
+                "API key missing for provider profile `{}`. Run `roven auth set`.",
                 profile.name
             )
         })
@@ -482,7 +482,7 @@ where
         })
         .collect::<Vec<_>>();
     if entries.is_empty() {
-        return Err("No provider profiles. Run `pmemc auth set`.".to_owned());
+        return Err("No provider profiles. Run `roven auth set`.".to_owned());
     }
     let default_profile_id = profiles
         .default_profile()
@@ -528,7 +528,7 @@ fn handle_model_selection_key(
                     if !choice.access.is_ready() {
                         state.set_model_entry_error(match choice.access {
                             ProviderAccessState::MissingApiKey => format!(
-                                "{} is missing an API key. Run `pmemc auth set` before switching to it.",
+                                "{} is missing an API key. Run `roven auth set` before switching to it.",
                                 choice.name
                             ),
                             ProviderAccessState::CredentialStoreUnavailable => format!(

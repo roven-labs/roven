@@ -15,11 +15,11 @@ native `/api/chat` endpoint are handled by separate protocol adapters.
 
 ## User-facing workflow
 
-- `pmemc auth set` creates a named profile from user-provided endpoint, model,
+- `roven auth set` creates a named profile from user-provided endpoint, model,
   and key values.
-- `pmemc auth list`, `use`, `status`, and `remove` manage profiles and the
+- `roven auth list`, `use`, `status`, and `remove` manage profiles and the
   explicit default without displaying secrets.
-- Bare `pmemc` opens the trust gate and terminal chat.
+- Bare `roven` opens the trust gate and terminal chat.
 - `/resume` lists sessions for the current canonical workspace.
 - `Esc` requests cancellation of an active provider stream.
 

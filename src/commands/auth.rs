@@ -41,7 +41,7 @@ fn create_profile(profiles: &ProviderProfiles) -> anyhow::Result<()> {
 fn list_profiles(profiles: &ProviderProfiles) -> anyhow::Result<()> {
     let items = profiles.list()?;
     if items.is_empty() {
-        println!("No provider profiles. Run `pmemc auth set`.");
+        println!("No provider profiles. Run `roven auth set`.");
         return Ok(());
     }
     let default_id = profiles.default_profile()?.map(|profile| profile.id);
@@ -52,7 +52,7 @@ fn list_profiles(profiles: &ProviderProfiles) -> anyhow::Result<()> {
 fn choose_default(profiles: &ProviderProfiles) -> anyhow::Result<()> {
     let items = profiles.list()?;
     if items.is_empty() {
-        bail!("no provider profiles exist; run `pmemc auth set` first");
+        bail!("no provider profiles exist; run `roven auth set` first");
     }
     print_numbered_profiles(&items);
     let selection = prompt_required("Choose default provider number: ")?;

@@ -17,7 +17,7 @@ https://ollama.com/api/chat
 Create the profile:
 
 ```powershell
-pmemc auth set
+roven auth set
 ```
 
 Enter values similar to these when prompted:
@@ -32,13 +32,13 @@ API key: <your Ollama API key>
 Select it as the default:
 
 ```powershell
-pmemc auth use
+roven auth use
 ```
 
 Choose `Ollama Cloud` by its number, then start Roven:
 
 ```powershell
-pmemc
+roven
 ```
 
 Do not use this endpoint for native Ollama usage:
@@ -55,7 +55,7 @@ not the native route used for Ollama context-window metadata in Roven.
 Create a profile with OpenRouter's complete chat-completions endpoint:
 
 ```powershell
-pmemc auth set
+roven auth set
 ```
 
 Use values similar to these:
@@ -70,16 +70,16 @@ API key: <your OpenRouter API key>
 Select and start it:
 
 ```powershell
-pmemc auth use
-pmemc
+roven auth use
+roven
 ```
 
 ## Check or change the active provider
 
 ```powershell
-pmemc auth list
-pmemc auth status
-pmemc auth use
+roven auth list
+roven auth status
+roven auth use
 ```
 
 `auth list` shows the endpoint and model for every profile. Confirm that the
@@ -87,7 +87,7 @@ selected Ollama profile says exactly `https://ollama.com/api/chat`.
 
 The executable update does not rewrite existing profiles. If an older Ollama
 profile still points to `/v1/chat/completions`, create a new native profile and
-select it with `pmemc auth use`.
+select it with `roven auth use`.
 
 ## Context usage
 
@@ -106,8 +106,8 @@ change after each model response, including responses that call tools.
 
 If the footer says `context unavailable`:
 
-1. Run `pmemc auth status`.
-2. Run `pmemc auth list` and check the selected endpoint.
+1. Run `roven auth status`.
+2. Run `roven auth list` and check the selected endpoint.
 3. For Ollama Cloud, recreate or select a profile using exactly
    `https://ollama.com/api/chat`.
 4. Confirm that the API key and model ID are valid.

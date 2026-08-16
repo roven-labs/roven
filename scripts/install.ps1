@@ -2,18 +2,18 @@
 param(
     [switch]$Uninstall,
     [switch]$SkipBuild,
-    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "Programs\PMEMC")
+    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "Programs\Roven")
 )
 
 $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-    throw "LOCALAPPDATA is required for a per-user PMEMC installation"
+    throw "LOCALAPPDATA is required for a per-user Roven installation"
 }
 
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $resolvedInstallRoot = [IO.Path]::GetFullPath($InstallRoot)
-$installedBinary = Join-Path $resolvedInstallRoot "pmemc.exe"
+$installedBinary = Join-Path $resolvedInstallRoot "roven.exe"
 $releaseBinary = Join-Path $repositoryRoot "target\release\roven.exe"
 
 function Get-PathEntries([string]$pathValue) {
@@ -71,7 +71,7 @@ if ($Uninstall) {
             Remove-Item -LiteralPath $resolvedInstallRoot -Force
         }
     }
-    Write-Output "PMEMC uninstalled from $resolvedInstallRoot"
+    Write-Output "Roven uninstalled from $resolvedInstallRoot"
     Write-Output "Open a new PowerShell session for PATH changes to take effect"
     exit 0
 }
@@ -95,15 +95,15 @@ if ($updatedUserPath -ne $originalUserPath) {
     try {
         [Environment]::SetEnvironmentVariable("Path", $updatedUserPath, "User")
     } catch {
-        throw "PMEMC was copied to $installedBinary, but user PATH registration failed. Run this script in a normal user PowerShell session, then add $resolvedInstallRoot to your user PATH. $($_.Exception.Message)"
+        throw "Roven was copied to $installedBinary, but user PATH registration failed. Run this script in a normal user PowerShell session, then add $resolvedInstallRoot to your user PATH. $($_.Exception.Message)"
     }
     $env:Path = Add-UserPathEntry $env:Path $resolvedInstallRoot
 }
 
 & $installedBinary --version
 if ($LASTEXITCODE -ne 0) {
-    throw "The installed PMEMC binary failed its version check"
+    throw "The installed Roven binary failed its version check"
 }
 
-Write-Output "PMEMC installed at $installedBinary"
-Write-Output "Open a new PowerShell session, then run: pmemc --help"
+Write-Output "Roven installed at $installedBinary"
+Write-Output "Open a new PowerShell session, then run: roven --help"

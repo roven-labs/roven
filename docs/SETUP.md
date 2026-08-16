@@ -9,7 +9,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
 
 The script builds the release binary, installs it under
-`%LOCALAPPDATA%\Programs\PMEMC`, and adds that directory to the user PATH.
+`%LOCALAPPDATA%\Programs\Roven`, and adds that directory to the user PATH.
 Open a new PowerShell session after installation.
 
 ## Create a provider profile
@@ -17,7 +17,7 @@ Open a new PowerShell session after installation.
 Run:
 
 ```powershell
-pmemc auth set
+roven auth set
 ```
 
 Roven asks for:
@@ -50,14 +50,14 @@ written to JSON, logs, prompts, or chat messages.
 ## Manage profiles
 
 ```powershell
-pmemc auth list
-pmemc auth use
-pmemc auth status
-pmemc auth remove <profile-name>
+roven auth list
+roven auth use
+roven auth status
+roven auth remove <profile-name>
 ```
 
 The first created profile becomes the default when no default exists. Use
-`pmemc auth use` to change it explicitly. If removing the default while other
+`roven auth use` to change it explicitly. If removing the default while other
 profiles remain, Roven asks you to choose its replacement.
 
 `auth list` and `auth status` show profile names, endpoints, and model IDs, but
@@ -68,7 +68,7 @@ never API keys.
 Change to the project directory and run:
 
 ```powershell
-pmemc
+roven
 ```
 
 Roven shows a trust prompt for the canonical current directory. The trust is
@@ -97,8 +97,8 @@ Each session directory contains `meta.json` and
 - HTTP 429 means the provider rate limit was reached; wait and try again.
 - HTTP 404 usually means the endpoint or model ID is wrong. Check that the
   complete provider endpoint was entered exactly.
-- If no default profile or API key exists, run `pmemc auth list`,
-  `pmemc auth use`, or `pmemc auth set` as appropriate.
+- If no default profile or API key exists, run `roven auth list`,
+  `roven auth use`, or `roven auth set` as appropriate.
 
 API keys are stored in the operating-system credential store. Do not put
 secrets in project files, command-line arguments, Roven's local conversation
