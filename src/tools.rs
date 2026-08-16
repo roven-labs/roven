@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use crate::storage::{ProjectRegistration, ProjectRegistry, RegistrationLookup};
 
 pub(crate) const PREPARE_PROJECT_DESCRIPTION: &str = "Validate and register the currently trusted project for first-time use with Roven. Use this when the user asks to add/register the current project for future project understanding, resume generation, or portfolio updates. Pass `.` as the path for the current trusted workspace. The tool validates the project path, existing Roven registration, Git repository, GitHub remote, committed baseline, and clean working state, then stores the minimal project registration. It does not inspect source code or initialize code-intelligence systems.";
-pub(crate) const LIST_DIRECTORY_DESCRIPTION: &str = "List the immediate contents of a directory inside the currently trusted Roven workspace. Use this to inspect the workspace structure and locate files or subdirectories before choosing another filesystem tool. Paths are relative to the trusted workspace; use `.` for the workspace root. This tool does not read file contents, search recursively, modify files, register projects, or access paths outside the trusted workspace.";
+pub(crate) const LIST_DIRECTORY_DESCRIPTION: &str = "List the immediate contents of a directory inside the currently trusted Roven workspace. Use this when you need to inspect workspace structure or locate a file or subdirectory before calling another filesystem tool. Pass a workspace-relative directory path such as `.` or `src`; do not pass an absolute path or a path containing `..`. Returns up to 100 immediate entries in deterministic order with `status`, `path`, `workspace_path`, `entries`, and `truncated`; if more entries exist, `truncated` is true. Each entry includes `name`, workspace-relative `path`, and `kind`. Every regular file also includes `size_kb`, measured as bytes divided by 1024 and rounded to two decimal places. Directories and other entries omit size fields. Symlinks are not followed and include `size_error: \"symlink_not_followed\"`; regular-file metadata failures keep the entry and include `size_error: \"permission_denied\"` or \"io_error\". For `invalid_path` or `path_not_allowed`, retry with a relative path under the workspace; for `not_directory`, pass a directory path. This tool does not read file contents, search recursively, modify files, register projects, or access paths outside the trusted workspace.";
 pub(crate) const READ_FILE_DESCRIPTION: &str = "Read a known workspace-relative text file after locating it with `list_directory`. Paths are relative to the trusted workspace. This tool reads only regular UTF-8 text files up to 50 KiB and does not modify files or access paths outside the trusted workspace.";
 pub(crate) const LIST_TOOLS_DESCRIPTION: &str = "List the Roven tools available to you in this turn, with their exact descriptions and input schemas. Use this when you need to check which Roven capabilities are currently available before selecting a tool. This reports the live Roven tool registry and does not access the workspace or modify anything.";
 
@@ -373,7 +373,7 @@ fn opened_path_is_within_workspace(
             || has_component_boundary))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum ListDirectoryResult {
     Ok {
@@ -397,11 +397,15 @@ impl ListDirectoryResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ListDirectoryEntry {
     name: String,
     path: String,
     kind: DirectoryEntryKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_kb: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_error: Option<DirectoryEntrySizeError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -411,6 +415,14 @@ pub(crate) enum DirectoryEntryKind {
     Directory,
     Symlink,
     Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DirectoryEntrySizeError {
+    PermissionDenied,
+    IoError,
+    SymlinkNotFollowed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -453,6 +465,16 @@ impl ListDirectory {
                 Err(error) => return ListDirectoryResult::error(io_reason(&error), relative_path),
             };
             let name = entry.file_name().to_string_lossy().into_owned();
+            let (size_kb, size_error) = if file_type.is_file() {
+                match entry.metadata() {
+                    Ok(metadata) => (Some(file_size_kb(metadata.len())), None),
+                    Err(error) => (None, Some(size_error_reason(&error))),
+                }
+            } else if file_type.is_symlink() {
+                (None, Some(DirectoryEntrySizeError::SymlinkNotFollowed))
+            } else {
+                (None, None)
+            };
             let child_relative = target
                 .strip_prefix(&context.trusted_workspace)
                 .expect("authorized target remains under trusted workspace")
@@ -461,6 +483,8 @@ impl ListDirectory {
                 name,
                 path: workspace_relative_path_from_relative(&child_relative),
                 kind: entry_kind(&file_type),
+                size_kb,
+                size_error,
             });
         }
         listed_entries.sort_by(|left, right| {
@@ -592,6 +616,17 @@ fn entry_kind_rank(kind: DirectoryEntryKind) -> u8 {
         DirectoryEntryKind::Directory => 0,
         DirectoryEntryKind::File => 1,
         DirectoryEntryKind::Symlink | DirectoryEntryKind::Other => 2,
+    }
+}
+
+fn file_size_kb(bytes: u64) -> f64 {
+    (bytes as f64 / 1024.0 * 100.0).round() / 100.0
+}
+
+fn size_error_reason(error: &io::Error) -> DirectoryEntrySizeError {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => DirectoryEntrySizeError::PermissionDenied,
+        _ => DirectoryEntrySizeError::IoError,
     }
 }
 
@@ -875,9 +910,9 @@ mod tests {
     use crate::storage::{ProjectRegistry, RegistrationLookup};
 
     use super::{
-        BlockedReason, ListDirectory, ListDirectoryInput, PrepareProject, PrepareProjectInput,
-        PrepareProjectResult, READ_FILE_DESCRIPTION, ReadFile, ReadFileInput, RovenToolCall,
-        ToolContext, definitions, dispatch,
+        BlockedReason, LIST_DIRECTORY_DESCRIPTION, ListDirectory, ListDirectoryInput,
+        PrepareProject, PrepareProjectInput, PrepareProjectResult, READ_FILE_DESCRIPTION, ReadFile,
+        ReadFileInput, RovenToolCall, ToolContext, definitions, dispatch,
     };
 
     fn temp_root(name: &str) -> PathBuf {
@@ -1324,10 +1359,46 @@ mod tests {
                 "entries": [
                     { "name": "alpha", "path": "alpha", "kind": "directory" },
                     { "name": "zeta", "path": "zeta", "kind": "directory" },
-                    { "name": "middle.txt", "path": "middle.txt", "kind": "file" }
+                    { "name": "middle.txt", "path": "middle.txt", "kind": "file", "size_kb": 0.0 }
                 ],
                 "truncated": false
             })
+        );
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn list_directory_reports_sizes_for_every_regular_file_in_kilobytes() {
+        let workspace = temp_root("list-file-sizes");
+        fs::create_dir_all(workspace.join("source")).unwrap();
+        fs::write(workspace.join("source.rs"), vec![b'a'; 1024]).unwrap();
+        fs::write(workspace.join("program.exe"), vec![0u8; 1536]).unwrap();
+        fs::write(workspace.join("weights.bin"), vec![0u8; 2048]).unwrap();
+
+        let value = serde_json::to_value(ListDirectory.execute(
+            &context(&workspace),
+            ListDirectoryInput {
+                path: ".".to_owned(),
+            },
+        ))
+        .unwrap();
+        let entries = value["entries"].as_array().unwrap();
+        let entry = |name: &str| {
+            entries
+                .iter()
+                .find(|entry| entry["name"] == name)
+                .unwrap_or_else(|| panic!("missing entry {name}"))
+        };
+
+        assert_eq!(entry("source.rs")["size_kb"], 1.0);
+        assert_eq!(entry("program.exe")["size_kb"], 1.5);
+        assert_eq!(entry("weights.bin")["size_kb"], 2.0);
+        assert!(!entry("source").as_object().unwrap().contains_key("size_kb"));
+        assert!(
+            !entry("source")
+                .as_object()
+                .unwrap()
+                .contains_key("size_error")
         );
         fs::remove_dir_all(workspace).unwrap();
     }
@@ -1407,6 +1478,25 @@ mod tests {
                 "recursive": true
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn list_directory_size_errors_use_stable_codes() {
+        assert_eq!(
+            serde_json::to_value(super::size_error_reason(&io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "denied",
+            )))
+            .unwrap(),
+            "permission_denied"
+        );
+        assert_eq!(
+            serde_json::to_value(super::size_error_reason(&io::Error::other(
+                "metadata failed",
+            )))
+            .unwrap(),
+            "io_error"
         );
     }
 
@@ -1596,6 +1686,27 @@ mod tests {
                 "additionalProperties": false
             })
         );
+        let list_directory = result.result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "list_directory")
+            .expect("list_directory must be registered");
+        assert_eq!(list_directory["description"], LIST_DIRECTORY_DESCRIPTION);
+        assert_eq!(
+            list_directory["input_schema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative directory path; use `.` for the workspace root."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            })
+        );
         let invalid = dispatch(
             &trusted,
             RovenToolCall {
@@ -1648,13 +1759,12 @@ mod tests {
             },
         ))
         .unwrap();
-        assert!(
-            listed["entries"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| { entry["name"] == "internal-link" && entry["kind"] == "symlink" })
-        );
+        assert!(listed["entries"].as_array().unwrap().iter().any(|entry| {
+            entry["name"] == "internal-link"
+                && entry["kind"] == "symlink"
+                && !entry.as_object().unwrap().contains_key("size_kb")
+                && entry["size_error"] == "symlink_not_followed"
+        }));
         fs::remove_dir_all(workspace).unwrap();
         fs::remove_dir_all(outside).unwrap();
     }
