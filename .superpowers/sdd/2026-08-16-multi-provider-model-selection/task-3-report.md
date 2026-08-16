@@ -116,3 +116,45 @@ Result: all tests passed.
 
 - The repository still contains unrelated dirty changes outside Task 3, including `src/tools.rs`. They were left untouched.
 - The startup banner intentionally reflects only the trust/startup screen; it does not alter the existing trusted chat footer or `/model` flow.
+
+## Fix round 1 — 2026-08-16
+
+Reviewer findings addressed:
+
+1. Startup status now recognizes provider-level environment access even when there is no saved profile for that provider.
+2. Added real startup-status tests that exercise the refresh/detection path against an empty profile store with provider env vars set and restored under an env lock.
+
+### What changed
+
+- Added provider-level environment helpers in `src/credentials.rs`:
+  - `provider_env_api_key(...)`
+  - `has_provider_env_api_key(...)`
+- Kept saved-profile runtime resolution behavior intact by reusing the same env lookup inside `resolve_api_key(...)`.
+- Extended `src/ui/startup.rs::detect_provider_status(...)` to seed status from provider-level env access before merging saved-profile access.
+- Added `refresh_startup_provider_status_from(...)` in `src/ui/terminal.rs` so tests can exercise the real refresh path with a temporary empty profile store.
+- When the current-user profile store is unavailable, startup status still reflects env-only provider access instead of collapsing to `NoProviderAccess`.
+
+### Tests added
+
+- `ui::terminal::tests::startup_status_detects_openrouter_env_without_saved_profile`
+- `ui::terminal::tests::startup_status_detects_ollama_env_without_saved_profile`
+- `ui::terminal::tests::startup_status_detects_both_envs_without_saved_profiles`
+- `ui::startup::tests::detects_provider_level_access_without_saved_profiles`
+
+### Verification
+
+Focused tests:
+
+```powershell
+cargo test startup_status_detects_openrouter_env_without_saved_profile -- --nocapture
+cargo test detects_provider_level_access_without_saved_profiles -- --nocapture
+cargo test startup_status_detects -- --nocapture
+```
+
+Full suite:
+
+```powershell
+cargo test -- --nocapture
+```
+
+Result: all tests passed.

@@ -195,9 +195,11 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
         }
         if state.model_selection.is_some() {
             if let Event::Key(key) = event {
-                if let Err(error) =
-                    handle_model_selection_key(&mut state, &ProviderProfiles::for_current_user()?, key)
-                {
+                if let Err(error) = handle_model_selection_key(
+                    &mut state,
+                    &ProviderProfiles::for_current_user()?,
+                    key,
+                ) {
                     state.activity(error);
                 }
             }
@@ -660,23 +662,33 @@ fn refresh_provider_model(state: &mut AppState) {
 }
 
 fn refresh_startup_provider_status(state: &mut AppState) {
-    state.startup_provider_status = Some(
-        ProviderProfiles::for_current_user()
+    match ProviderProfiles::for_current_user() {
+        Ok(profiles) => refresh_startup_provider_status_from(state, &profiles),
+        Err(_) => {
+            state.startup_provider_status = Some(startup::detect_provider_status(
+                &[],
+                |_| false,
+                credentials::has_provider_env_api_key,
+            ));
+        }
+    }
+}
+
+fn refresh_startup_provider_status_from(state: &mut AppState, profiles: &ProviderProfiles) {
+    let profiles = profiles.list().unwrap_or_default();
+    state.startup_provider_status = Some(startup::detect_provider_status(
+        &profiles,
+        |profile| {
+            credentials::resolve_api_key(
+                profile,
+                &credentials::OsCredentialStore::for_profile_id(&profile.id),
+            )
             .ok()
-            .and_then(|profiles| profiles.list().ok())
-            .map(|profiles| {
-                startup::detect_provider_status(&profiles, |profile| {
-                    credentials::resolve_api_key(
-                        profile,
-                        &credentials::OsCredentialStore::for_profile_id(&profile.id),
-                    )
-                    .ok()
-                    .flatten()
-                    .is_some()
-                })
-            })
-            .unwrap_or(startup::StartupProviderStatus::NoProviderAccess),
-    );
+            .flatten()
+            .is_some()
+        },
+        credentials::has_provider_env_api_key,
+    ));
 }
 
 fn refresh_provider_model_from(state: &mut AppState, profiles: &ProviderProfiles) {
@@ -913,9 +925,12 @@ mod tests {
 
     use crate::{
         credentials::{CredentialError, SecretStore},
-        profiles::ProviderProfile,
+        profiles::{ProviderProfile, ProviderProfiles},
         storage::{ConversationEvent, EventKind, ProjectStore},
-        ui::state::{AppState, ModelSelection, Role},
+        ui::{
+            startup::StartupProviderStatus,
+            state::{AppState, ModelSelection, Role},
+        },
     };
 
     use super::{WorkerEvent, apply_worker_event};
@@ -964,6 +979,54 @@ mod tests {
             .expect("env lock should not be poisoned")
     }
 
+    fn with_provider_envs<T>(
+        openrouter: Option<&str>,
+        ollama: Option<&str>,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        let previous_openrouter = std::env::var_os("OPENROUTER_API_KEY");
+        let previous_ollama = std::env::var_os("OLLAMA_API_KEY");
+        match openrouter {
+            Some(value) => unsafe { std::env::set_var("OPENROUTER_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
+        }
+        match ollama {
+            Some(value) => unsafe { std::env::set_var("OLLAMA_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OLLAMA_API_KEY") },
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+        match previous_openrouter {
+            Some(value) => unsafe { std::env::set_var("OPENROUTER_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
+        }
+        match previous_ollama {
+            Some(value) => unsafe { std::env::set_var("OLLAMA_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OLLAMA_API_KEY") },
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn refreshed_startup_provider_status(
+        openrouter: Option<&str>,
+        ollama: Option<&str>,
+    ) -> StartupProviderStatus {
+        let _guard = env_lock();
+        let data_root = temp_root("startup-provider-status");
+        let profiles = ProviderProfiles::for_data_root(data_root.clone());
+        let mut state = AppState::new();
+        let status = with_provider_envs(openrouter, ollama, || {
+            super::refresh_startup_provider_status_from(&mut state, &profiles);
+            state
+                .startup_provider_status
+                .expect("startup provider status should be set")
+        });
+        fs::remove_dir_all(data_root).expect("temporary root should be removed");
+        status
+    }
+
     #[test]
     fn runtime_key_resolution_prefers_environment_and_falls_back_to_store() {
         let _guard = env_lock();
@@ -992,6 +1055,33 @@ mod tests {
             Some(value) => unsafe { std::env::set_var("OPENROUTER_API_KEY", value) },
             None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
         }
+    }
+
+    #[test]
+    fn startup_status_detects_openrouter_env_without_saved_profile() {
+        assert_eq!(
+            refreshed_startup_provider_status(Some("openrouter-env-secret"), None),
+            StartupProviderStatus::OpenRouterOnly
+        );
+    }
+
+    #[test]
+    fn startup_status_detects_ollama_env_without_saved_profile() {
+        assert_eq!(
+            refreshed_startup_provider_status(None, Some("ollama-env-secret")),
+            StartupProviderStatus::OllamaOnly
+        );
+    }
+
+    #[test]
+    fn startup_status_detects_both_envs_without_saved_profiles() {
+        assert_eq!(
+            refreshed_startup_provider_status(
+                Some("openrouter-env-secret"),
+                Some("ollama-env-secret")
+            ),
+            StartupProviderStatus::BothConfigured
+        );
     }
 
     #[test]

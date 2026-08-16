@@ -8,15 +8,17 @@ pub(crate) enum StartupProviderStatus {
     BothConfigured,
 }
 
-pub(crate) fn detect_provider_status<F>(
+pub(crate) fn detect_provider_status<F, G>(
     profiles: &[ProviderProfile],
     mut has_access: F,
+    mut has_provider_access: G,
 ) -> StartupProviderStatus
 where
     F: FnMut(&ProviderProfile) -> bool,
+    G: FnMut(ProviderKind) -> bool,
 {
-    let mut openrouter = false;
-    let mut ollama = false;
+    let mut openrouter = has_provider_access(ProviderKind::OpenRouter);
+    let mut ollama = has_provider_access(ProviderKind::OllamaCloud);
 
     for profile in profiles {
         if !has_access(profile) {
@@ -37,6 +39,32 @@ where
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{StartupProviderStatus, detect_provider_status};
+    use crate::model_catalog::ProviderKind;
+
+    #[test]
+    fn detects_provider_level_access_without_saved_profiles() {
+        assert_eq!(
+            detect_provider_status(&[], |_| false, |kind| kind == ProviderKind::OpenRouter),
+            StartupProviderStatus::OpenRouterOnly
+        );
+        assert_eq!(
+            detect_provider_status(&[], |_| false, |kind| kind == ProviderKind::OllamaCloud),
+            StartupProviderStatus::OllamaOnly
+        );
+        assert_eq!(
+            detect_provider_status(&[], |_| false, |_| true),
+            StartupProviderStatus::BothConfigured
+        );
+        assert_eq!(
+            detect_provider_status(&[], |_| false, |_| false),
+            StartupProviderStatus::NoProviderAccess
+        );
+    }
+}
+
 pub(crate) fn banner_lines(status: StartupProviderStatus) -> Vec<&'static str> {
     match status {
         StartupProviderStatus::NoProviderAccess => vec![
@@ -50,9 +78,8 @@ pub(crate) fn banner_lines(status: StartupProviderStatus) -> Vec<&'static str> {
         StartupProviderStatus::OllamaOnly => {
             vec!["OpenRouter: missing", "Ollama Cloud: configured"]
         }
-        StartupProviderStatus::BothConfigured => vec![
-            "OpenRouter: configured",
-            "Ollama Cloud: configured",
-        ],
+        StartupProviderStatus::BothConfigured => {
+            vec!["OpenRouter: configured", "Ollama Cloud: configured"]
+        }
     }
 }

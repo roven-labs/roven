@@ -79,6 +79,16 @@ fn credential_account(profile_id: &str) -> String {
     format!("provider-profile:{profile_id}")
 }
 
+pub(crate) fn provider_env_api_key(kind: ProviderKind) -> Option<String> {
+    std::env::var(kind.api_key_env_var())
+        .ok()
+        .filter(|secret| !secret.trim().is_empty())
+}
+
+pub(crate) fn has_provider_env_api_key(kind: ProviderKind) -> bool {
+    provider_env_api_key(kind).is_some()
+}
+
 pub(crate) fn store_confirmed_api_key(
     store: &impl SecretStore,
     secret: &str,
@@ -96,9 +106,8 @@ pub(crate) fn resolve_api_key(
     profile: &ProviderProfile,
     store: &impl SecretStore,
 ) -> Result<Option<String>, CredentialError> {
-    if let Some(secret) = ProviderKind::from_endpoint(&profile.endpoint)
-        .and_then(|kind| std::env::var(kind.api_key_env_var()).ok())
-        .filter(|secret| !secret.trim().is_empty())
+    if let Some(secret) =
+        ProviderKind::from_endpoint(&profile.endpoint).and_then(provider_env_api_key)
     {
         return Ok(Some(secret));
     }
