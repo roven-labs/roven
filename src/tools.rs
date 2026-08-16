@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use crate::storage::{ProjectRegistration, ProjectRegistry, RegistrationLookup};
 
 pub(crate) const PREPARE_PROJECT_DESCRIPTION: &str = "Validate and register the currently trusted project for first-time use with Roven. Use this when the user asks to add/register the current project for future project understanding, resume generation, or portfolio updates. Pass `.` as the path for the current trusted workspace. The tool validates the project path, existing Roven registration, Git repository, GitHub remote, committed baseline, and clean working state, then stores the minimal project registration. It does not inspect source code or initialize code-intelligence systems.";
-pub(crate) const LIST_DIRECTORY_DESCRIPTION: &str = "List the immediate contents of a directory inside the currently trusted Roven workspace. Use this to locate a file or subdirectory before choosing another filesystem tool. Pass a workspace-relative path such as `.` or `src`; do not pass an absolute path or `..`. The result is `{status: \"ok\", path, workspace_path, entries, truncated}` with at most 100 immediate entries. If `truncated` is true, do not assume an unlisted entry is absent. Errors are `invalid_path`, `path_not_allowed`, `not_directory`, `permission_denied`, or `io_error`; correct the path before retrying. This tool does not read file contents, recurse, modify files, register projects, or access paths outside the trusted workspace.";
-pub(crate) const READ_FILE_DESCRIPTION: &str = "Read a known workspace-relative text file after locating it with `list_directory`. Pass one field such as `{\"path\":\"src/main.rs\"}`; do not pass an absolute path, `..`, or an empty path. The result is `{status: \"ok\", path, content}` or `{status: \"error\", reason, path}`. It reads only regular UTF-8 text files up to 50 KiB and does not modify files or access paths outside the trusted workspace. Errors are `invalid_path`, `path_not_allowed`, `not_file`, `file_too_large`, `not_text`, `permission_denied`, or `io_error`; use the reason to correct the request and do not claim success without an `ok` result.";
+pub(crate) const LIST_DIRECTORY_DESCRIPTION: &str = "List the immediate contents of a directory inside the currently trusted Roven workspace. Use this when you need to inspect workspace structure or locate a file or subdirectory before calling another filesystem tool. Pass a workspace-relative directory path such as `.` or `src`; do not pass an absolute path or a path containing `..`. Returns up to 100 immediate entries in deterministic order with `status`, `path`, `workspace_path`, `entries`, and `truncated`; if more entries exist, `truncated` is true. Each entry includes `name`, workspace-relative `path`, and `kind`. Every regular file also includes `size_kb`, measured as bytes divided by 1024 and rounded to two decimal places. Directories and other entries omit size fields. Symlinks are not followed and include `size_error: \"symlink_not_followed\"`; regular-file metadata failures keep the entry and include `size_error: \"permission_denied\"` or \"io_error\". For `invalid_path` or `path_not_allowed`, retry with a relative path under the workspace; for `not_directory`, pass a directory path. This tool does not read file contents, search recursively, modify files, register projects, or access paths outside the trusted workspace.";
+pub(crate) const READ_FILE_DESCRIPTION: &str = "Read a known workspace-relative text file after locating it with `list_directory`. Paths are relative to the trusted workspace. This tool reads only regular UTF-8 text files up to 50 KiB and does not modify files or access paths outside the trusted workspace.";
 pub(crate) const LIST_TOOLS_DESCRIPTION: &str = "List the Roven tools available to you in this turn, with their exact descriptions and input schemas. Use this when you need to check which Roven capabilities are currently available before selecting a tool. This reports the live Roven tool registry and does not access the workspace or modify anything.";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -49,7 +49,7 @@ pub(crate) fn definitions() -> Vec<RovenToolDefinition> {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative directory path, such as `.` or `src`; absolute paths and `..` are invalid."
+                        "description": "Workspace-relative directory path; use `.` for the workspace root."
                     }
                 },
                 "required": ["path"],
@@ -64,7 +64,7 @@ pub(crate) fn definitions() -> Vec<RovenToolDefinition> {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative regular UTF-8 text file path, such as `src/main.rs`; absolute paths, `..`, and empty paths are invalid."
+                        "description": "Workspace-relative text file path."
                     }
                 },
                 "required": ["path"],
@@ -120,14 +120,14 @@ pub(crate) fn dispatch(context: &ToolContext, call: RovenToolCall) -> RovenToolR
             }
         },
         "list_directory" => match serde_json::from_value::<ListDirectoryInput>(call.arguments) {
-            Ok(input) => serde_json::to_value(list_directory(context, input)),
+            Ok(input) => serde_json::to_value(ListDirectory.execute(context, input)),
             Err(_) => serde_json::to_value(ListDirectoryResult::error(
                 ListDirectoryErrorReason::InvalidPath,
                 "",
             )),
         },
         "read_file" => match serde_json::from_value::<ReadFileInput>(call.arguments) {
-            Ok(input) => serde_json::to_value(read_file(context, input)),
+            Ok(input) => serde_json::to_value(ReadFile.execute(context, input)),
             Err(_) => {
                 serde_json::to_value(ReadFileResult::error(ReadFileErrorReason::InvalidPath, ""))
             }
@@ -213,29 +213,33 @@ pub(crate) enum ReadFileErrorReason {
     IoError,
 }
 
-pub(crate) fn read_file(context: &ToolContext, input: ReadFileInput) -> ReadFileResult {
-    let target = match resolve_workspace_file(context, &input.path) {
-        Ok(path) => path,
-        Err(reason) => return ReadFileResult::error(reason, input.path),
-    };
-    let path = workspace_relative_path(&context.trusted_workspace, &target);
-    let mut file = match open_workspace_file(context, &target) {
-        Ok(file) => file,
-        Err(reason) => return ReadFileResult::error(reason, path),
-    };
-    let metadata = match file.metadata() {
-        Ok(metadata) => metadata,
-        Err(error) => return ReadFileResult::error(read_file_io_reason(&error), path),
-    };
-    if !metadata.is_file() {
-        return ReadFileResult::error(ReadFileErrorReason::NotFile, path);
-    }
-    if metadata.len() > READ_FILE_SIZE_LIMIT {
-        return ReadFileResult::error(ReadFileErrorReason::FileTooLarge, path);
-    }
-    match read_file_contents(&mut file) {
-        Ok(content) => ReadFileResult::Ok { path, content },
-        Err(reason) => ReadFileResult::error(reason, path),
+pub(crate) struct ReadFile;
+
+impl ReadFile {
+    pub(crate) fn execute(&self, context: &ToolContext, input: ReadFileInput) -> ReadFileResult {
+        let target = match resolve_workspace_file(context, &input.path) {
+            Ok(path) => path,
+            Err(reason) => return ReadFileResult::error(reason, input.path),
+        };
+        let path = workspace_relative_path(&context.trusted_workspace, &target);
+        let mut file = match open_workspace_file(context, &target) {
+            Ok(file) => file,
+            Err(reason) => return ReadFileResult::error(reason, path),
+        };
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => return ReadFileResult::error(read_file_io_reason(&error), path),
+        };
+        if !metadata.is_file() {
+            return ReadFileResult::error(ReadFileErrorReason::NotFile, path);
+        }
+        if metadata.len() > READ_FILE_SIZE_LIMIT {
+            return ReadFileResult::error(ReadFileErrorReason::FileTooLarge, path);
+        }
+        match read_file_contents(&mut file) {
+            Ok(content) => ReadFileResult::Ok { path, content },
+            Err(reason) => ReadFileResult::error(reason, path),
+        }
     }
 }
 
@@ -369,7 +373,7 @@ fn opened_path_is_within_workspace(
             || has_component_boundary))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum ListDirectoryResult {
     Ok {
@@ -393,11 +397,15 @@ impl ListDirectoryResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ListDirectoryEntry {
     name: String,
     path: String,
     kind: DirectoryEntryKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_kb: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_error: Option<DirectoryEntrySizeError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -411,6 +419,14 @@ pub(crate) enum DirectoryEntryKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub(crate) enum DirectoryEntrySizeError {
+    PermissionDenied,
+    IoError,
+    SymlinkNotFollowed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ListDirectoryErrorReason {
     InvalidPath,
     PathNotAllowed,
@@ -419,54 +435,71 @@ pub(crate) enum ListDirectoryErrorReason {
     IoError,
 }
 
-pub(crate) fn list_directory(
-    context: &ToolContext,
-    input: ListDirectoryInput,
-) -> ListDirectoryResult {
-    let target = match resolve_workspace_directory(context, &input.path) {
-        Ok(path) => path,
-        Err(reason) => return ListDirectoryResult::error(reason, input.path),
-    };
-    let relative_path = workspace_relative_path(&context.trusted_workspace, &target);
-    let entries = match fs::read_dir(&target) {
-        Ok(entries) => entries,
-        Err(error) => {
-            return ListDirectoryResult::error(io_reason(&error), relative_path);
+pub(crate) struct ListDirectory;
+
+impl ListDirectory {
+    pub(crate) fn execute(
+        &self,
+        context: &ToolContext,
+        input: ListDirectoryInput,
+    ) -> ListDirectoryResult {
+        let target = match resolve_workspace_directory(context, &input.path) {
+            Ok(path) => path,
+            Err(reason) => return ListDirectoryResult::error(reason, input.path),
+        };
+        let relative_path = workspace_relative_path(&context.trusted_workspace, &target);
+        let entries = match fs::read_dir(&target) {
+            Ok(entries) => entries,
+            Err(error) => {
+                return ListDirectoryResult::error(io_reason(&error), relative_path);
+            }
+        };
+        let mut listed_entries = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => return ListDirectoryResult::error(io_reason(&error), relative_path),
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => return ListDirectoryResult::error(io_reason(&error), relative_path),
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let (size_kb, size_error) = if file_type.is_file() {
+                match entry.metadata() {
+                    Ok(metadata) => (Some(file_size_kb(metadata.len())), None),
+                    Err(error) => (None, Some(size_error_reason(&error))),
+                }
+            } else if file_type.is_symlink() {
+                (None, Some(DirectoryEntrySizeError::SymlinkNotFollowed))
+            } else {
+                (None, None)
+            };
+            let child_relative = target
+                .strip_prefix(&context.trusted_workspace)
+                .expect("authorized target remains under trusted workspace")
+                .join(&name);
+            listed_entries.push(ListDirectoryEntry {
+                name,
+                path: workspace_relative_path_from_relative(&child_relative),
+                kind: entry_kind(&file_type),
+                size_kb,
+                size_error,
+            });
         }
-    };
-    let mut listed_entries = Vec::new();
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => return ListDirectoryResult::error(io_reason(&error), relative_path),
-        };
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(error) => return ListDirectoryResult::error(io_reason(&error), relative_path),
-        };
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let child_relative = target
-            .strip_prefix(&context.trusted_workspace)
-            .expect("authorized target remains under trusted workspace")
-            .join(&name);
-        listed_entries.push(ListDirectoryEntry {
-            name,
-            path: workspace_relative_path_from_relative(&child_relative),
-            kind: entry_kind(&file_type),
+        listed_entries.sort_by(|left, right| {
+            entry_kind_rank(left.kind)
+                .cmp(&entry_kind_rank(right.kind))
+                .then_with(|| left.name.cmp(&right.name))
         });
-    }
-    listed_entries.sort_by(|left, right| {
-        entry_kind_rank(left.kind)
-            .cmp(&entry_kind_rank(right.kind))
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    let truncated = listed_entries.len() > DIRECTORY_LIST_LIMIT;
-    listed_entries.truncate(DIRECTORY_LIST_LIMIT);
-    ListDirectoryResult::Ok {
-        path: relative_path,
-        workspace_path: human_workspace_path(&context.trusted_workspace),
-        entries: listed_entries,
-        truncated,
+        let truncated = listed_entries.len() > DIRECTORY_LIST_LIMIT;
+        listed_entries.truncate(DIRECTORY_LIST_LIMIT);
+        ListDirectoryResult::Ok {
+            path: relative_path,
+            workspace_path: human_workspace_path(&context.trusted_workspace),
+            entries: listed_entries,
+            truncated,
+        }
     }
 }
 
@@ -511,9 +544,6 @@ fn resolve_workspace_file(
     context: &ToolContext,
     path: &str,
 ) -> Result<PathBuf, ReadFileErrorReason> {
-    if path.is_empty() {
-        return Err(ReadFileErrorReason::InvalidPath);
-    }
     let relative = Path::new(path);
     if relative
         .components()
@@ -586,6 +616,17 @@ fn entry_kind_rank(kind: DirectoryEntryKind) -> u8 {
         DirectoryEntryKind::Directory => 0,
         DirectoryEntryKind::File => 1,
         DirectoryEntryKind::Symlink | DirectoryEntryKind::Other => 2,
+    }
+}
+
+fn file_size_kb(bytes: u64) -> f64 {
+    (bytes as f64 / 1024.0 * 100.0).round() / 100.0
+}
+
+fn size_error_reason(error: &io::Error) -> DirectoryEntrySizeError {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => DirectoryEntrySizeError::PermissionDenied,
+        _ => DirectoryEntrySizeError::IoError,
     }
 }
 
@@ -869,9 +910,9 @@ mod tests {
     use crate::storage::{ProjectRegistry, RegistrationLookup};
 
     use super::{
-        BlockedReason, ListDirectoryInput, PrepareProject, PrepareProjectInput,
-        PrepareProjectResult, ReadFileInput, RovenToolCall, ToolContext, definitions, dispatch,
-        list_directory, read_file,
+        BlockedReason, LIST_DIRECTORY_DESCRIPTION, ListDirectory, ListDirectoryInput,
+        PrepareProject, PrepareProjectInput, PrepareProjectResult, READ_FILE_DESCRIPTION, ReadFile,
+        ReadFileInput, RovenToolCall, ToolContext, definitions, dispatch,
     };
 
     fn temp_root(name: &str) -> PathBuf {
@@ -1302,7 +1343,7 @@ mod tests {
         fs::write(workspace.join("middle.txt"), "file").unwrap();
         fs::write(workspace.join("alpha/nested.txt"), "nested").unwrap();
 
-        let result = list_directory(
+        let result = ListDirectory.execute(
             &context(&workspace),
             ListDirectoryInput {
                 path: ".".to_owned(),
@@ -1318,10 +1359,46 @@ mod tests {
                 "entries": [
                     { "name": "alpha", "path": "alpha", "kind": "directory" },
                     { "name": "zeta", "path": "zeta", "kind": "directory" },
-                    { "name": "middle.txt", "path": "middle.txt", "kind": "file" }
+                    { "name": "middle.txt", "path": "middle.txt", "kind": "file", "size_kb": 0.0 }
                 ],
                 "truncated": false
             })
+        );
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn list_directory_reports_sizes_for_every_regular_file_in_kilobytes() {
+        let workspace = temp_root("list-file-sizes");
+        fs::create_dir_all(workspace.join("source")).unwrap();
+        fs::write(workspace.join("source.rs"), vec![b'a'; 1024]).unwrap();
+        fs::write(workspace.join("program.exe"), vec![0u8; 1536]).unwrap();
+        fs::write(workspace.join("weights.bin"), vec![0u8; 2048]).unwrap();
+
+        let value = serde_json::to_value(ListDirectory.execute(
+            &context(&workspace),
+            ListDirectoryInput {
+                path: ".".to_owned(),
+            },
+        ))
+        .unwrap();
+        let entries = value["entries"].as_array().unwrap();
+        let entry = |name: &str| {
+            entries
+                .iter()
+                .find(|entry| entry["name"] == name)
+                .unwrap_or_else(|| panic!("missing entry {name}"))
+        };
+
+        assert_eq!(entry("source.rs")["size_kb"], 1.0);
+        assert_eq!(entry("program.exe")["size_kb"], 1.5);
+        assert_eq!(entry("weights.bin")["size_kb"], 2.0);
+        assert!(!entry("source").as_object().unwrap().contains_key("size_kb"));
+        assert!(
+            !entry("source")
+                .as_object()
+                .unwrap()
+                .contains_key("size_error")
         );
         fs::remove_dir_all(workspace).unwrap();
     }
@@ -1338,7 +1415,7 @@ mod tests {
             ("src/../other", "path_not_allowed"),
             ("named:stream", "invalid_path"),
         ] {
-            let result = list_directory(
+            let result = ListDirectory.execute(
                 &context(&workspace),
                 ListDirectoryInput {
                     path: path.to_owned(),
@@ -1361,7 +1438,7 @@ mod tests {
             fs::write(workspace.join(format!("file-{number:03}.txt")), "file").unwrap();
         }
 
-        let file_result = list_directory(
+        let file_result = ListDirectory.execute(
             &context(&workspace),
             ListDirectoryInput {
                 path: "not-a-directory.txt".to_owned(),
@@ -1376,7 +1453,7 @@ mod tests {
             })
         );
 
-        let directory_result = list_directory(
+        let directory_result = ListDirectory.execute(
             &context(&workspace),
             ListDirectoryInput {
                 path: ".".to_owned(),
@@ -1405,11 +1482,30 @@ mod tests {
     }
 
     #[test]
+    fn list_directory_size_errors_use_stable_codes() {
+        assert_eq!(
+            serde_json::to_value(super::size_error_reason(&io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "denied",
+            )))
+            .unwrap(),
+            "permission_denied"
+        );
+        assert_eq!(
+            serde_json::to_value(super::size_error_reason(&io::Error::other(
+                "metadata failed",
+            )))
+            .unwrap(),
+            "io_error"
+        );
+    }
+
+    #[test]
     fn read_file_returns_utf8_contents_from_the_trusted_workspace() {
         let workspace = temp_root("read-file");
         fs::write(workspace.join("notes.txt"), "first line\nsecond line\n").unwrap();
 
-        let result = read_file(
+        let result = ReadFile.execute(
             &context(&workspace),
             ReadFileInput {
                 path: "notes.txt".to_owned(),
@@ -1428,37 +1524,12 @@ mod tests {
     }
 
     #[test]
-    fn read_file_rejects_empty_and_colon_containing_paths() {
-        let workspace = temp_root("read-file-paths");
-
-        for path in ["", "notes:name.txt"] {
-            let value = serde_json::to_value(read_file(
-                &context(&workspace),
-                ReadFileInput {
-                    path: path.to_owned(),
-                },
-            ))
-            .unwrap();
-            assert_eq!(
-                value,
-                json!({
-                    "status": "error",
-                    "reason": "invalid_path",
-                    "path": path
-                })
-            );
-        }
-
-        fs::remove_dir_all(workspace).unwrap();
-    }
-
-    #[test]
     fn read_file_accepts_a_file_exactly_at_the_fifty_kibibyte_limit() {
         let workspace = temp_root("read-file-limit");
         let content = "x".repeat(50 * 1024);
         fs::write(workspace.join("limit.txt"), &content).unwrap();
 
-        let result = read_file(
+        let result = ReadFile.execute(
             &context(&workspace),
             ReadFileInput {
                 path: "limit.txt".to_owned(),
@@ -1512,10 +1583,9 @@ mod tests {
             ("large.txt".to_owned(), "file_too_large"),
             ("binary.dat".to_owned(), "not_text"),
         ] {
-            let value = serde_json::to_value(read_file(
-                &context(&workspace),
-                ReadFileInput { path: path.clone() },
-            ))
+            let value = serde_json::to_value(
+                ReadFile.execute(&context(&workspace), ReadFileInput { path: path.clone() }),
+            )
             .unwrap();
             assert_eq!(value["status"], "error");
             assert_eq!(value["reason"], reason);
@@ -1562,67 +1632,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_rejects_malformed_read_file_input() {
-        let workspace = temp_root("read-file-invalid-input");
-
-        for arguments in [
-            json!({}),
-            json!({ "path": 42 }),
-            json!({
-                "path": "notes.txt",
-                "recursive": true
-            }),
-        ] {
-            let result = dispatch(
-                &context(&workspace),
-                RovenToolCall {
-                    id: "call_invalid_read_file".to_owned(),
-                    name: "read_file".to_owned(),
-                    arguments,
-                },
-            );
-            assert_eq!(
-                result.result,
-                json!({
-                    "status": "error",
-                    "reason": "invalid_path",
-                    "path": ""
-                })
-            );
-        }
-
-        fs::remove_dir_all(workspace).unwrap();
-    }
-
-    #[test]
-    fn dispatch_rejects_malformed_list_directory_input() {
-        let workspace = temp_root("list-directory-invalid-input");
-        let result = dispatch(
-            &context(&workspace),
-            RovenToolCall {
-                id: "call_invalid_list_directory".to_owned(),
-                name: "list_directory".to_owned(),
-                arguments: json!({ "path": 42 }),
-            },
-        );
-
-        assert_eq!(
-            result.result,
-            json!({
-                "status": "error",
-                "reason": "invalid_path",
-                "path": ""
-            })
-        );
-        fs::remove_dir_all(workspace).unwrap();
-    }
-
-    #[test]
     fn read_file_io_reason_classifies_permission_and_other_errors() {
-        assert_eq!(
-            super::read_file_io_reason(&io::Error::from(io::ErrorKind::NotFound)),
-            super::ReadFileErrorReason::InvalidPath
-        );
         assert_eq!(
             super::read_file_io_reason(&io::Error::from(io::ErrorKind::PermissionDenied)),
             super::ReadFileErrorReason::PermissionDenied
@@ -1655,23 +1665,48 @@ mod tests {
                 "tools": expected,
             })
         );
-        let tools = result.result["tools"].as_array().unwrap();
-        let list_directory = tools
-            .iter()
-            .find(|tool| tool["name"] == "list_directory")
-            .unwrap()["description"]
-            .as_str()
-            .unwrap();
-        assert!(list_directory.contains("truncated"));
-        assert!(list_directory.contains("not_directory"));
-        let read_file = tools
+        let read_file = result.result["tools"]
+            .as_array()
+            .unwrap()
             .iter()
             .find(|tool| tool["name"] == "read_file")
-            .unwrap()["description"]
-            .as_str()
-            .unwrap();
-        assert!(read_file.contains("file_too_large"));
-        assert!(read_file.contains("status: \"ok\""));
+            .expect("read_file must be registered");
+        assert_eq!(read_file["description"], READ_FILE_DESCRIPTION);
+        assert_eq!(
+            read_file["input_schema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative text file path."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            })
+        );
+        let list_directory = result.result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "list_directory")
+            .expect("list_directory must be registered");
+        assert_eq!(list_directory["description"], LIST_DIRECTORY_DESCRIPTION);
+        assert_eq!(
+            list_directory["input_schema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative directory path; use `.` for the workspace root."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            })
+        );
         let invalid = dispatch(
             &trusted,
             RovenToolCall {
@@ -1707,7 +1742,7 @@ mod tests {
             Err(error) => panic!("symlink setup failed: {error}"),
         }
 
-        let escaped = list_directory(
+        let escaped = ListDirectory.execute(
             &context(&workspace),
             ListDirectoryInput {
                 path: "outside-link".to_owned(),
@@ -1717,20 +1752,19 @@ mod tests {
             serde_json::to_value(escaped).unwrap()["reason"],
             "path_not_allowed"
         );
-        let listed = serde_json::to_value(list_directory(
+        let listed = serde_json::to_value(ListDirectory.execute(
             &context(&workspace),
             ListDirectoryInput {
                 path: ".".to_owned(),
             },
         ))
         .unwrap();
-        assert!(
-            listed["entries"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| { entry["name"] == "internal-link" && entry["kind"] == "symlink" })
-        );
+        assert!(listed["entries"].as_array().unwrap().iter().any(|entry| {
+            entry["name"] == "internal-link"
+                && entry["kind"] == "symlink"
+                && !entry.as_object().unwrap().contains_key("size_kb")
+                && entry["size_error"] == "symlink_not_followed"
+        }));
         fs::remove_dir_all(workspace).unwrap();
         fs::remove_dir_all(outside).unwrap();
     }
@@ -1755,7 +1789,7 @@ mod tests {
             Err(error) => panic!("symlink setup failed: {error}"),
         }
 
-        let value = serde_json::to_value(read_file(
+        let value = serde_json::to_value(ReadFile.execute(
             &context(&workspace),
             ReadFileInput {
                 path: "outside-link.txt".to_owned(),
@@ -1813,7 +1847,7 @@ mod tests {
             Err(error) => panic!("symlink setup failed: {error}"),
         }
 
-        let result = read_file(
+        let result = ReadFile.execute(
             &context(&workspace),
             ReadFileInput {
                 path: "outside-link".to_owned(),

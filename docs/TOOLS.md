@@ -25,10 +25,10 @@ Input:
 { "path": "." }
 ```
 
-The path is workspace-relative. Use `.` for the workspace root. Absolute paths,
-`..` traversal, and paths that resolve outside the trusted workspace are
-rejected. Only immediate entries are returned; the tool does not recurse or
-read file contents. Results are capped at 100 entries and include:
+The path is workspace-relative; absolute paths and `..` traversal are rejected.
+Results contain at most 100 immediate entries in deterministic order. When more
+entries exist, `truncated` is `true`; retry with a narrower directory path to
+inspect the rest. Results include:
 
 ```json
 {
@@ -36,23 +36,37 @@ read file contents. Results are capped at 100 entries and include:
   "path": ".",
   "workspace_path": "C:\\Projects\\my-app",
   "entries": [
-    { "name": "src", "path": "src", "kind": "directory" }
+    { "name": "src", "path": "src", "kind": "directory" },
+    { "name": "main.rs", "path": "src/main.rs", "kind": "file", "size_kb": 3.5 },
+    {
+      "name": "latest",
+      "path": "latest",
+      "kind": "symlink",
+      "size_error": "symlink_not_followed"
+    }
   ],
   "truncated": false
 }
 ```
 
-When `truncated` is `true`, the result contains only the first 100 entries; do
-not treat an unlisted entry as absent. Possible errors include `invalid_path`,
-`path_not_allowed`, `not_directory`, `permission_denied`, and `io_error`.
-Correct the path from the returned reason before retrying.
+Every regular file includes `size_kb`, calculated as `file_size_in_bytes / 1024`
+and rounded to two decimal places. This applies to all regular files, including
+executables, binaries, and model files; listing metadata does not read their
+contents. Directories and `other` entries omit size fields. Symlinks are never
+followed and report `size_error: "symlink_not_followed"`. If a regular file's
+metadata cannot be read, the entry remains in the result and reports either
+`size_error: "permission_denied"` or `size_error: "io_error"`.
+
+Possible errors include `invalid_path`, `path_not_allowed`, `not_directory`,
+`permission_denied`, and `io_error`. For `invalid_path` or `path_not_allowed`,
+retry with a relative path under the trusted workspace. For `not_directory`,
+pass a directory path.
 
 ## `read_file`
 
-Reads a known, non-empty workspace-relative file path after it has been located
-with `list_directory`. It reads only regular UTF-8 text files at most 50 KiB
-inside the trusted workspace and does not modify files or access paths outside
-it. Absolute paths, `..`, and empty paths are invalid.
+Reads a known workspace-relative file after it has been located with
+`list_directory`. It reads only regular UTF-8 text files at most 50 KiB inside
+the trusted workspace and does not modify files or access paths outside it.
 
 Input:
 
@@ -67,9 +81,7 @@ Successful result:
 ```
 
 Possible errors include `invalid_path`, `path_not_allowed`, `not_file`,
-`file_too_large`, `not_text`, `permission_denied`, and `io_error`. Use the
-returned reason to correct the request; do not claim the file was read unless
-the result has `status: "ok"`.
+`file_too_large`, `not_text`, `permission_denied`, and `io_error`.
 
 ## `prepare_project`
 
