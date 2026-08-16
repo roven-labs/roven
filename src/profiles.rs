@@ -304,7 +304,11 @@ mod tests {
         assert_eq!(updated.model, "gpt-oss:120b-cloud");
         assert_eq!(profiles.default_profile().unwrap().unwrap().id, second.id);
         assert_eq!(
-            listed.iter().find(|profile| profile.id == first.id).unwrap().model,
+            listed
+                .iter()
+                .find(|profile| profile.id == first.id)
+                .unwrap()
+                .model,
             "openai/gpt-oss-20b"
         );
         assert_eq!(

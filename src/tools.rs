@@ -1628,6 +1628,10 @@ mod tests {
     #[test]
     fn read_file_io_reason_classifies_permission_and_other_errors() {
         assert_eq!(
+            super::read_file_io_reason(&io::Error::from(io::ErrorKind::NotFound)),
+            super::ReadFileErrorReason::InvalidPath
+        );
+        assert_eq!(
             super::read_file_io_reason(&io::Error::from(io::ErrorKind::PermissionDenied)),
             super::ReadFileErrorReason::PermissionDenied
         );
