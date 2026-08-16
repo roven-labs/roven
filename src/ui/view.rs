@@ -6,11 +6,11 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
+use super::transcript::render_message;
 use super::{
     startup::{self, StartupProviderStatus},
     state::{AppState, ModelSelection},
 };
-use super::transcript::render_message;
 
 pub(crate) const MINIMUM_WIDTH: u16 = 40;
 pub(crate) const MINIMUM_HEIGHT: u16 = 8;
@@ -173,10 +173,7 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
     draw_footer(frame, footer_area, state);
 }
 
-fn startup_provider_line(
-    status: Option<StartupProviderStatus>,
-    index: usize,
-) -> Line<'static> {
+fn startup_provider_line(status: Option<StartupProviderStatus>, index: usize) -> Line<'static> {
     let Some(status) = status else {
         return Line::from("");
     };
@@ -426,7 +423,7 @@ mod tests {
         assert!(rendered.contains("PROVIDER ACCESS"));
         assert!(rendered.contains("OpenRouter: missing"));
         assert!(rendered.contains("Ollama Cloud: missing"));
-        assert!(rendered.contains("roven auth set"));
+        assert!(rendered.contains("pmemc auth set"));
     }
 
     #[test]
@@ -438,7 +435,7 @@ mod tests {
 
         assert!(rendered.contains("OpenRouter: configured"));
         assert!(rendered.contains("Ollama Cloud: missing"));
-        assert!(!rendered.contains("Run `roven auth set`"));
+        assert!(!rendered.contains("Run `pmemc auth set`"));
     }
 
     #[test]
@@ -450,7 +447,7 @@ mod tests {
 
         assert!(rendered.contains("OpenRouter: missing"));
         assert!(rendered.contains("Ollama Cloud: configured"));
-        assert!(!rendered.contains("Run `roven auth set`"));
+        assert!(!rendered.contains("Run `pmemc auth set`"));
     }
 
     #[test]
@@ -462,7 +459,7 @@ mod tests {
 
         assert!(rendered.contains("OpenRouter: configured"));
         assert!(rendered.contains("Ollama Cloud: configured"));
-        assert!(!rendered.contains("roven auth set"));
+        assert!(!rendered.contains("pmemc auth set"));
     }
 
     #[test]

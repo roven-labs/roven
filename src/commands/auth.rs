@@ -1,4 +1,4 @@
-//! Named OpenAI-compatible provider-profile commands.
+//! Named provider-profile commands.
 
 use std::io::{self, Write};
 
@@ -24,7 +24,7 @@ pub(crate) fn run(command: AuthCommand) -> anyhow::Result<()> {
 
 fn create_profile(profiles: &ProviderProfiles) -> anyhow::Result<()> {
     let name = prompt_required("Profile name: ")?;
-    let endpoint = prompt_required("OpenAI-compatible HTTPS chat-completions endpoint: ")?;
+    let endpoint = prompt_required("Provider HTTPS endpoint: ")?;
     let model = prompt_required("Model ID: ")?;
     let secret = rpassword::prompt_password("API key: ")?;
     let confirmation = rpassword::prompt_password("Confirm API key: ")?;
@@ -41,7 +41,7 @@ fn create_profile(profiles: &ProviderProfiles) -> anyhow::Result<()> {
 fn list_profiles(profiles: &ProviderProfiles) -> anyhow::Result<()> {
     let items = profiles.list()?;
     if items.is_empty() {
-        println!("No provider profiles. Run `roven auth set`.");
+        println!("No provider profiles. Run `pmemc auth set`.");
         return Ok(());
     }
     let default_id = profiles.default_profile()?.map(|profile| profile.id);
@@ -52,7 +52,7 @@ fn list_profiles(profiles: &ProviderProfiles) -> anyhow::Result<()> {
 fn choose_default(profiles: &ProviderProfiles) -> anyhow::Result<()> {
     let items = profiles.list()?;
     if items.is_empty() {
-        bail!("no provider profiles exist; run `roven auth set` first");
+        bail!("no provider profiles exist; run `pmemc auth set` first");
     }
     print_numbered_profiles(&items);
     let selection = prompt_required("Choose default provider number: ")?;

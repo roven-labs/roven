@@ -2,9 +2,10 @@ use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "roven",
+    name = "pmemc",
+    bin_name = "pmemc",
     version,
-    about = "Roven — Project Memory Assistant",
+    about = "PMEMC — Project Memory Assistant",
     long_about = None
 )]
 pub(crate) struct Cli {
@@ -14,7 +15,7 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Manage named OpenAI-compatible provider profiles without exposing API keys.
+    /// Manage named provider profiles without exposing API keys.
     Auth {
         #[command(subcommand)]
         command: AuthCommand,

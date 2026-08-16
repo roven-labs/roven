@@ -44,7 +44,7 @@ pub(crate) fn banner_lines(status: StartupProviderStatus) -> Vec<&'static str> {
         StartupProviderStatus::NoProviderAccess => vec![
             "OpenRouter: missing",
             "Ollama Cloud: missing",
-            "Next step: roven auth set",
+            "Next step: pmemc auth set",
         ],
         StartupProviderStatus::OpenRouterOnly => {
             vec!["OpenRouter: configured", "Ollama Cloud: missing"]
