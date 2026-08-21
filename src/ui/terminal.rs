@@ -54,6 +54,11 @@ enum WorkerEvent {
 }
 
 const TOOL_USE_POLICY: &str = r#"Treat every request as read-only unless the user explicitly asks to prepare, register, add, modify, delete, or configure something. Call `prepare_project` only when the user explicitly asks to prepare, register, or add a project; never call it merely because a trusted workspace is available. For an explicit prepare/register/add request about the current trusted workspace, use `prepare_project` with {"path":"."}. When the user asks which Roven tools or capabilities are available, call `list_tools` with {} and rely on its returned names, descriptions, and input schemas. When the user asks for the current workspace path, call `list_directory` with {"path":"."} and report its `workspace_path` value verbatim; never report `.` as the human-facing path. When the user asks about a file's contents, call `list_directory` to locate it, then call `read_file` with a non-empty workspace-relative path. `list_directory` lists only immediate entries and may return `truncated: true`; use returned entry paths as the next tool input. If a filesystem tool returns an error, correct the path from its reason and do not retry the unchanged request. Rely on the returned content and never claim that a file was read without a tool result."#;
+const REGISTER_PROJECT_PROMPT: &str = "Register the current trusted project for use with Roven. Call `prepare_project` exactly once with {\"path\":\".\"}. Do not call `list_directory` or `read_file`; this command is only for registration. After the tool returns, report the actual outcome concisely: distinguish `prepared`, `already_added`, and `blocked`, include the blocked reason when present, and never claim registration succeeded unless the tool result says so.";
+
+fn slash_command_prompt(input: &str) -> Option<&'static str> {
+    (input.trim() == "/register").then_some(REGISTER_PROJECT_PROMPT)
+}
 
 pub(crate) fn run(runtime_log: Option<RuntimeLog>) -> anyhow::Result<()> {
     log_event(runtime_log.as_ref(), "terminal_starting", "outcome=started");
@@ -266,6 +271,9 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                 ..
             }) => {
                 let raw = state.input.clone();
+                if let Some(prompt) = slash_command_prompt(&raw) {
+                    state.input = prompt.to_owned();
+                }
                 if raw.trim() == "/resume" {
                     state.input.clear();
                     let entries = store
@@ -1009,6 +1017,16 @@ mod tests {
             Ok(value) => value,
             Err(payload) => std::panic::resume_unwind(payload),
         }
+    }
+
+    #[test]
+    fn register_slash_command_expands_to_the_registration_prompt() {
+        let prompt = super::slash_command_prompt("  /register  ").expect("command should expand");
+
+        assert!(prompt.contains("prepare_project"));
+        assert!(prompt.contains("{\"path\":\".\"}"));
+        assert!(prompt.contains("exactly once"));
+        assert!(super::slash_command_prompt("/unknown").is_none());
     }
 
     fn refreshed_startup_provider_status(

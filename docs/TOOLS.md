@@ -4,6 +4,11 @@ This is a short reference for the tools implemented by Roven. It documents
 their public purpose, input, and result shape. It is not an agent prompt or a
 workflow definition.
 
+## Slash commands
+
+- `/register` submits Roven's built-in project-registration prompt for the
+  current trusted workspace and uses `prepare_project`.
+
 ## At a glance
 
 | Tool | Main purpose | Writes data |

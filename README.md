@@ -27,6 +27,8 @@ commands.
 - Bare `roven` asks whether to trust the canonical current directory for the
   current launch. Trust is not persisted between launches.
 - After trust, the optional root `ROVEN.md` is loaded as project instructions.
+- `/register` submits the built-in project-registration prompt and uses
+  `prepare_project` for the current trusted workspace.
 - `/resume` opens sessions for the current workspace. `Esc` cancels an active
   provider stream while retaining received content.
 
