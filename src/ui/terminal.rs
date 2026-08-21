@@ -1030,6 +1030,11 @@ mod tests {
         assert!(prompt.contains("\"path\": \".\""));
         assert!(prompt.contains("summary"));
         assert!(prompt.contains("summary_saved"));
+        assert!(prompt.contains("already_added"));
+        assert!(prompt.contains("If the result is `blocked`"));
+        assert!(prompt.contains("section_name\": \"summary\""));
+        assert!(prompt.contains("operation\": \"replace\""));
+        assert!(prompt.contains("Do not call arbitrary commands"));
         assert!(prompt.contains("exactly once"));
         assert!(super::slash_command_prompt("/unknown").is_none());
     }

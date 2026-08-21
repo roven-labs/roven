@@ -1232,7 +1232,7 @@ mod tests {
     #[test]
     fn summary_update_requires_a_registered_project_and_replaces_text() {
         let data = temp_root("summary-data");
-        let project = temp_root("summary-project");
+        let project = ready_project("summary-project");
         let registry = ProjectRegistry::for_data_root(&data);
         let tool = PrepareProject::for_data_root(&data);
         let update = |text: &str| PrepareProjectInput {
@@ -1248,13 +1248,10 @@ mod tests {
                 reason: BlockedReason::NotRegistered
             }
         );
-        registry
-            .register(
-                &project,
-                "https://github.com/roven/summary-project.git".to_owned(),
-                "abc123".to_owned(),
-            )
-            .unwrap();
+        assert!(matches!(
+            tool.execute(&context(&project), input_value(".")),
+            PrepareProjectResult::Prepared { .. }
+        ));
         let result = tool.execute(&context(&project), update("report"));
         assert_eq!(
             serde_json::to_value(result).unwrap()["status"],
@@ -1265,6 +1262,18 @@ mod tests {
             panic!("summary update should keep registration");
         };
         assert_eq!(saved.sections["summary"], "report");
+        let registration_files = fs::read_dir(data.join("projects"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    == Some("json")
+            })
+            .count();
+        assert_eq!(registration_files, 1);
         assert_eq!(
             tool.execute(
                 &context(&project),
@@ -1279,6 +1288,33 @@ mod tests {
                 reason: BlockedReason::InvalidSectionUpdate
             }
         );
+        for invalid in [
+            PrepareProjectInput {
+                path: ".".to_owned(),
+                section_name: Some("summary".to_owned()),
+                text: Some("report".to_owned()),
+                operation: None,
+            },
+            PrepareProjectInput {
+                path: ".".to_owned(),
+                section_name: Some("details".to_owned()),
+                text: Some("report".to_owned()),
+                operation: Some("replace".to_owned()),
+            },
+            PrepareProjectInput {
+                path: ".".to_owned(),
+                section_name: Some("summary".to_owned()),
+                text: Some("report".to_owned()),
+                operation: Some("append".to_owned()),
+            },
+        ] {
+            assert_eq!(
+                tool.execute(&context(&project), invalid),
+                PrepareProjectResult::Blocked {
+                    reason: BlockedReason::InvalidSectionUpdate
+                }
+            );
+        }
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(project).unwrap();
     }
