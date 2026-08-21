@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::storage::{ProjectRegistration, ProjectRegistry, RegistrationLookup};
 
-pub(crate) const PREPARE_PROJECT_DESCRIPTION: &str = "Validate and register the currently trusted project for first-time use with Roven. Use this when the user asks to add/register the current project for future project understanding, resume generation, or portfolio updates. Pass `.` as the path for the current trusted workspace. The tool validates the project path, existing Roven registration, Git repository, GitHub remote, committed baseline, and clean working state, then stores the minimal project registration. It does not inspect source code or initialize code-intelligence systems.";
+pub(crate) const PREPARE_PROJECT_DESCRIPTION: &str = "Validate and register the currently trusted project for first-time use with Roven, or replace its concise `summary` section after registration. Pass `.` as the path for the current trusted workspace on every call. Registration validates the project path, existing Roven registration, Git repository, GitHub remote, committed baseline, and clean working state, then stores the minimal project registration. Section updates accept only section_name `summary`, text, and operation `replace`; they update local Roven registration data and do not inspect or modify the project repository.";
 pub(crate) const LIST_DIRECTORY_DESCRIPTION: &str = "List the immediate contents of a directory inside the currently trusted Roven workspace. Use this when you need to inspect workspace structure or locate a file or subdirectory before calling another filesystem tool. Pass a workspace-relative directory path such as `.` or `src`; do not pass an absolute path or a path containing `..`. Returns up to 100 immediate entries in deterministic order with `status`, `path`, `workspace_path`, `entries`, and `truncated`; if more entries exist, `truncated` is true. Each entry includes `name`, workspace-relative `path`, and `kind`. Every regular file also includes `size_kb`, measured as bytes divided by 1024 and rounded to two decimal places. Directories and other entries omit size fields. Symlinks are not followed and include `size_error: \"symlink_not_followed\"`; regular-file metadata failures keep the entry and include `size_error: \"permission_denied\"` or \"io_error\". For `invalid_path` or `path_not_allowed`, retry with a relative path under the workspace; for `not_directory`, pass a directory path. This tool does not read file contents, search recursively, modify files, register projects, or access paths outside the trusted workspace.";
 pub(crate) const READ_FILE_DESCRIPTION: &str = "Read a known workspace-relative text file after locating it with `list_directory`. Paths are relative to the trusted workspace. This tool reads only regular UTF-8 text files up to 50 KiB and does not modify files or access paths outside the trusted workspace.";
 pub(crate) const LIST_TOOLS_DESCRIPTION: &str = "List the Roven tools available to you in this turn, with their exact descriptions and input schemas. Use this when you need to check which Roven capabilities are currently available before selecting a tool. This reports the live Roven tool registry and does not access the workspace or modify anything.";
@@ -35,6 +35,20 @@ pub(crate) fn definitions() -> Vec<RovenToolDefinition> {
                     "path": {
                         "type": "string",
                         "description": "Path to the currently trusted project directory."
+                    },
+                    "section_name": {
+                        "type": "string",
+                        "enum": ["summary"],
+                        "description": "Registration section to replace; version one accepts only summary."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Non-empty concise report text for the selected section."
+                    },
+                    "operation": {
+                        "type": "string",
+                        "enum": ["replace"],
+                        "description": "Update operation; version one accepts only replace."
                     }
                 },
                 "required": ["path"],
@@ -162,6 +176,9 @@ enum ListToolsResult {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PrepareProjectInput {
     pub(crate) path: String,
+    pub(crate) section_name: Option<String>,
+    pub(crate) text: Option<String>,
+    pub(crate) operation: Option<String>,
 }
 
 const DIRECTORY_LIST_LIMIT: usize = 100;
@@ -651,6 +668,7 @@ fn read_file_io_reason(error: &io::Error) -> ReadFileErrorReason {
 pub(crate) enum PrepareProjectResult {
     Prepared { project: PreparedProject },
     AlreadyAdded { project: ExistingProject },
+    SummarySaved { project: ExistingProject },
     Blocked { reason: BlockedReason },
 }
 
@@ -685,6 +703,8 @@ pub(crate) enum BlockedReason {
     NoGithubRemote,
     RepositoryNotClean,
     StorageFailure,
+    InvalidSectionUpdate,
+    NotRegistered,
 }
 
 pub(crate) struct PrepareProject {
@@ -721,6 +741,22 @@ impl PrepareProject {
             Ok(registry) => registry,
             Err(()) => return PrepareProjectResult::blocked(BlockedReason::StorageFailure),
         };
+        match (input.section_name, input.text, input.operation) {
+            (None, None, None) => {}
+            (Some(section_name), Some(text), Some(operation)) => {
+                if section_name != "summary" || operation != "replace" || text.trim().is_empty() {
+                    return PrepareProjectResult::blocked(BlockedReason::InvalidSectionUpdate);
+                }
+                return match registry.replace_section(&project_path, &section_name, &text) {
+                    Ok(Some(registration)) => PrepareProjectResult::SummarySaved {
+                        project: existing_project(registration),
+                    },
+                    Ok(None) => PrepareProjectResult::blocked(BlockedReason::NotRegistered),
+                    Err(_) => PrepareProjectResult::blocked(BlockedReason::StorageFailure),
+                };
+            }
+            _ => return PrepareProjectResult::blocked(BlockedReason::InvalidSectionUpdate),
+        }
         match registry.lookup(&project_path) {
             Ok(RegistrationLookup::Registered(registration)) => {
                 return PrepareProjectResult::AlreadyAdded {
@@ -928,12 +964,18 @@ mod tests {
     fn input(path: &Path) -> PrepareProjectInput {
         PrepareProjectInput {
             path: path.to_string_lossy().into_owned(),
+            section_name: None,
+            text: None,
+            operation: None,
         }
     }
 
     fn input_value(path: &str) -> PrepareProjectInput {
         PrepareProjectInput {
             path: path.to_owned(),
+            section_name: None,
+            text: None,
+            operation: None,
         }
     }
 
@@ -1167,6 +1209,78 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn prepare_project_schema_allows_only_the_summary_replace_update() {
+        let prepare_project = definitions()
+            .into_iter()
+            .find(|definition| definition.name == "prepare_project")
+            .expect("prepare_project must be registered");
+        assert_eq!(
+            prepare_project.input_schema["properties"]["section_name"]["enum"],
+            json!(["summary"])
+        );
+        assert_eq!(
+            prepare_project.input_schema["properties"]["operation"]["enum"],
+            json!(["replace"])
+        );
+        assert_eq!(prepare_project.input_schema["required"], json!(["path"]));
+        assert_eq!(prepare_project.input_schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn summary_update_requires_a_registered_project_and_replaces_text() {
+        let data = temp_root("summary-data");
+        let project = temp_root("summary-project");
+        let registry = ProjectRegistry::for_data_root(&data);
+        let tool = PrepareProject::for_data_root(&data);
+        let update = |text: &str| PrepareProjectInput {
+            path: ".".to_owned(),
+            section_name: Some("summary".to_owned()),
+            text: Some(text.to_owned()),
+            operation: Some("replace".to_owned()),
+        };
+
+        assert_eq!(
+            tool.execute(&context(&project), update("report")),
+            PrepareProjectResult::Blocked {
+                reason: BlockedReason::NotRegistered
+            }
+        );
+        registry
+            .register(
+                &project,
+                "https://github.com/roven/summary-project.git".to_owned(),
+                "abc123".to_owned(),
+            )
+            .unwrap();
+        let result = tool.execute(&context(&project), update("report"));
+        assert_eq!(
+            serde_json::to_value(result).unwrap()["status"],
+            "summary_saved"
+        );
+        let saved = registry.lookup(&project).unwrap();
+        let RegistrationLookup::Registered(saved) = saved else {
+            panic!("summary update should keep registration");
+        };
+        assert_eq!(saved.sections["summary"], "report");
+        assert_eq!(
+            tool.execute(
+                &context(&project),
+                PrepareProjectInput {
+                    path: ".".to_owned(),
+                    section_name: Some("summary".to_owned()),
+                    text: Some("  ".to_owned()),
+                    operation: Some("replace".to_owned()),
+                },
+            ),
+            PrepareProjectResult::Blocked {
+                reason: BlockedReason::InvalidSectionUpdate
+            }
+        );
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(project).unwrap();
     }
 
     #[test]

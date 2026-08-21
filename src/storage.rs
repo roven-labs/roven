@@ -1,6 +1,7 @@
 //! Project-scoped, crash-resistant conversation storage.
 
 use std::{
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -30,6 +31,8 @@ pub(crate) struct ProjectRegistration {
     pub(crate) canonical_path: String,
     pub(crate) github_remote: String,
     pub(crate) baseline_commit: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) sections: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +80,7 @@ impl ProjectRegistry {
             canonical_path: canonical_root.to_string_lossy().into_owned(),
             github_remote,
             baseline_commit,
+            sections: BTreeMap::new(),
         };
         let project_dir = self.projects_dir();
         fs::create_dir_all(&project_dir)?;
@@ -87,6 +91,23 @@ impl ProjectRegistry {
         Ok(registration)
     }
 
+    pub(crate) fn replace_section(
+        &self,
+        project_root: &Path,
+        section_name: &str,
+        text: &str,
+    ) -> Result<Option<ProjectRegistration>, StorageError> {
+        let canonical_root = project_root.canonicalize()?;
+        let Some((path, mut registration)) = self.find_registration_entry(&canonical_root)? else {
+            return Ok(None);
+        };
+        registration
+            .sections
+            .insert(section_name.to_owned(), text.to_owned());
+        write_json(&path, &registration)?;
+        Ok(Some(registration))
+    }
+
     fn projects_dir(&self) -> PathBuf {
         self.data_root.join("projects")
     }
@@ -95,6 +116,15 @@ impl ProjectRegistry {
         &self,
         project_root: &Path,
     ) -> Result<Option<ProjectRegistration>, StorageError> {
+        Ok(self
+            .find_registration_entry(project_root)?
+            .map(|(_, registration)| registration))
+    }
+
+    fn find_registration_entry(
+        &self,
+        project_root: &Path,
+    ) -> Result<Option<(PathBuf, ProjectRegistration)>, StorageError> {
         let projects_dir = self.projects_dir();
         if !projects_dir.exists() {
             return Ok(None);
@@ -107,7 +137,7 @@ impl ProjectRegistry {
             }
             let registration: ProjectRegistration = read_json(&path)?;
             if registration.canonical_path == canonical_path {
-                return Ok(Some(registration));
+                return Ok(Some((path, registration)));
             }
         }
         Ok(None)
@@ -439,6 +469,7 @@ mod tests {
         });
         let parsed = serde_json::from_value::<ProjectRegistration>(registration.clone()).unwrap();
         assert_eq!(parsed.name, "project");
+        assert!(parsed.sections.is_empty());
         for required in ["name", "canonical_path", "github_remote", "baseline_commit"] {
             let mut incomplete = registration.clone();
             incomplete.as_object_mut().unwrap().remove(required);
@@ -508,6 +539,40 @@ mod tests {
             registry.lookup(&project).unwrap(),
             RegistrationLookup::Registered(Box::new(registration))
         );
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn replacing_a_section_updates_the_existing_registration_file() {
+        let data = temp_root("section-data");
+        let project = temp_root("section-project");
+        let registry = ProjectRegistry::for_data_root(&data);
+        registry
+            .register(
+                &project,
+                "https://github.com/roven/section-project.git".to_owned(),
+                "abc123".to_owned(),
+            )
+            .unwrap();
+        let projects_dir = data.join("projects");
+        let original = projects_dir.join(format!(
+            "{}.json",
+            project.file_name().unwrap().to_string_lossy()
+        ));
+        let renamed = projects_dir.join("saved-report.json");
+        fs::rename(&original, &renamed).unwrap();
+
+        let updated = registry
+            .replace_section(&project, "summary", "concise report")
+            .unwrap()
+            .expect("registered project should update");
+
+        assert_eq!(updated.sections["summary"], "concise report");
+        assert!(!original.exists());
+        let saved: ProjectRegistration =
+            serde_json::from_slice(&fs::read(renamed).unwrap()).unwrap();
+        assert_eq!(saved.sections["summary"], "concise report");
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(project).unwrap();
     }
