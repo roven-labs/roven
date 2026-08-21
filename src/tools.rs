@@ -125,14 +125,25 @@ impl ToolContext {
 
 pub(crate) fn dispatch(context: &ToolContext, call: RovenToolCall) -> RovenToolResult {
     let result = match call.name.as_str() {
-        "prepare_project" => match serde_json::from_value::<PrepareProjectInput>(call.arguments) {
-            Ok(input) => {
-                serde_json::to_value(PrepareProject::for_current_user().execute(context, input))
+        "prepare_project" => {
+            let has_null_section_field = ["section_name", "text", "operation"]
+                .iter()
+                .any(|key| call.arguments.get(*key).is_some_and(Value::is_null));
+            if has_null_section_field {
+                serde_json::to_value(PrepareProjectResult::blocked(
+                    BlockedReason::InvalidSectionUpdate,
+                ))
+            } else {
+                match serde_json::from_value::<PrepareProjectInput>(call.arguments) {
+                    Ok(input) => serde_json::to_value(
+                        PrepareProject::for_current_user().execute(context, input),
+                    ),
+                    Err(_) => serde_json::to_value(PrepareProjectResult::blocked(
+                        BlockedReason::InvalidPath,
+                    )),
+                }
             }
-            Err(_) => {
-                serde_json::to_value(PrepareProjectResult::blocked(BlockedReason::InvalidPath))
-            }
-        },
+        }
         "list_directory" => match serde_json::from_value::<ListDirectoryInput>(call.arguments) {
             Ok(input) => serde_json::to_value(ListDirectory.execute(context, input)),
             Err(_) => serde_json::to_value(ListDirectoryResult::error(
@@ -1227,6 +1238,28 @@ mod tests {
         );
         assert_eq!(prepare_project.input_schema["required"], json!(["path"]));
         assert_eq!(prepare_project.input_schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn prepare_project_dispatch_blocks_explicit_null_section_fields() {
+        let workspace = temp_root("null-section-workspace");
+        let result = dispatch(
+            &context(&workspace),
+            RovenToolCall {
+                id: "null-section".to_owned(),
+                name: "prepare_project".to_owned(),
+                arguments: json!({ "path": ".", "section_name": null }),
+            },
+        );
+
+        assert_eq!(
+            result.result,
+            json!({
+                "status": "blocked",
+                "reason": "invalid_section_update"
+            })
+        );
+        fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]
