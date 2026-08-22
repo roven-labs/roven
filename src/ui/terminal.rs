@@ -53,7 +53,20 @@ enum WorkerEvent {
     Error(String),
 }
 
-const TOOL_USE_POLICY: &str = r#"Treat every request as read-only unless the user explicitly asks to prepare, register, add, modify, delete, or configure something. Call `prepare_project` only when the user explicitly asks to prepare, register, or add a project; never call it merely because a trusted workspace is available. For an explicit prepare/register/add request about the current trusted workspace, use `prepare_project` with {"path":"."}. When the user asks which Roven tools or capabilities are available, call `list_tools` with {} and rely on its returned names, descriptions, and input schemas. When the user asks for the current workspace path, call `list_directory` with {"path":"."} and report its `workspace_path` value verbatim; never report `.` as the human-facing path. When the user asks about a file's contents, call `list_directory` to locate it, then call `read_file` with a non-empty workspace-relative path. `list_directory` lists only immediate entries and may return `truncated: true`; use returned entry paths as the next tool input. If a filesystem tool returns an error, correct the path from its reason and do not retry the unchanged request. Rely on the returned content and never claim that a file was read without a tool result."#;
+fn load_system_prompt() -> String {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let prompt_path = std::path::Path::new(&manifest_dir)
+        .join("src")
+        .join("prompts")
+        .join("system.md");
+    
+    std::fs::read_to_string(&prompt_path)
+        .unwrap_or_else(|error| {
+            log::warn!("Failed to load system prompt from {:?}: {}", prompt_path, error);
+            // Fallback to minimal prompt if file cannot be loaded
+            "You are Roven, a concise, read-only project assistant running inside a trusted local workspace.".to_string()
+        })
+}
 
 pub(crate) fn run(runtime_log: Option<RuntimeLog>) -> anyhow::Result<()> {
     log_event(runtime_log.as_ref(), "terminal_starting", "outcome=started");
@@ -753,16 +766,14 @@ fn request_messages(
     session: &SessionMeta,
     project_instructions: &str,
 ) -> anyhow::Result<Vec<AgentMessage>> {
+    let runtime_context = if project_instructions.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n─── RUNTIME CONTEXT ────────────────────────────────────────────────\n\nProject instructions:\n{project_instructions}")
+    };
+    let system_prompt = load_system_prompt();
     let mut messages = vec![AgentMessage::System {
-        content: format!(
-            "You are Roven, a concise project assistant. The Roven harness authorizes and executes tools; do not claim a tool ran unless its result confirms it.\n\n{}{}",
-            TOOL_USE_POLICY,
-            if project_instructions.is_empty() {
-                String::new()
-            } else {
-                format!("\n\nProject instructions:\n{project_instructions}")
-            }
-        ),
+        content: format!("{}\n{}", system_prompt, runtime_context),
     }];
     let mut pending_reasoning: Option<String> = None;
     let events = store.events(&session.id)?;
