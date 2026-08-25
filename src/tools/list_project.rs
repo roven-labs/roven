@@ -67,3 +67,86 @@ impl ListProject {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
+    };
+
+    use serde_json::json;
+
+    use super::super::{RovenToolCall, ToolContext, definitions, dispatch};
+    use super::*;
+
+    fn temp_root(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("roven-{name}-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn context(path: &Path) -> ToolContext {
+        ToolContext::new(path.canonicalize().unwrap()).unwrap()
+    }
+
+    fn git(project: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(project)
+            .args(arguments)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("git should start");
+        assert!(status.success(), "git {arguments:?} should succeed");
+    }
+
+    fn ready_project(name: &str) -> PathBuf {
+        let project = temp_root(name);
+        git(&project, &["init"]);
+        git(
+            &project,
+            &[
+                "-c",
+                "user.name=Roven Test",
+                "-c",
+                "user.email=roven@example.test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        git(
+            &project,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:roven/example.git",
+            ],
+        );
+        project
+    }
+    #[test]
+    fn list_project_rejects_unknown_input_and_exposes_definition() {
+        let zeta = ready_project("zeta-project");
+
+        let invalid = dispatch(
+            &context(&zeta),
+            RovenToolCall {
+                id: "invalid-list-project".to_owned(),
+                name: "list_project".to_owned(),
+                arguments: json!({ "unexpected": true }),
+            },
+        );
+        assert_eq!(invalid.result, json!({ "status": "invalid_input" }));
+        assert!(definitions().iter().any(|tool| {
+            tool.name == "list_project" && tool.description == LIST_PROJECT_DESCRIPTION
+        }));
+
+        fs::remove_dir_all(zeta).unwrap();
+    }
+}
