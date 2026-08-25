@@ -274,9 +274,6 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                 ..
             }) => {
                 let raw = state.input.clone();
-                if let Some(prompt) = slash_command_prompt(&raw) {
-                    state.input = prompt.to_owned();
-                }
                 if raw.trim() == "/resume" {
                     state.input.clear();
                     let entries = store
@@ -784,7 +781,9 @@ fn request_messages(
             EventKind::User => {
                 pending_reasoning = None;
                 messages.push(AgentMessage::User {
-                    content: event.content,
+                    content: slash_command_prompt(&event.content)
+                        .unwrap_or(&event.content)
+                        .to_owned(),
                 });
             }
             EventKind::Thought => {
@@ -937,6 +936,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use crate::{
+        agent::AgentMessage,
         credentials::{CredentialError, SecretStore},
         profiles::{ProviderProfile, ProviderProfiles},
         storage::{ConversationEvent, EventKind, ProjectStore},
@@ -1027,16 +1027,36 @@ mod tests {
         let prompt = super::slash_command_prompt("  /register  ").expect("command should expand");
 
         assert!(prompt.contains("prepare_project"));
-        assert!(prompt.contains("\"path\": \".\""));
         assert!(prompt.contains("summary"));
-        assert!(prompt.contains("summary_saved"));
-        assert!(prompt.contains("already_added"));
-        assert!(prompt.contains("If the result is `blocked`"));
-        assert!(prompt.contains("section_name\": \"summary\""));
-        assert!(prompt.contains("operation\": \"replace\""));
-        assert!(prompt.contains("Do not call arbitrary commands"));
-        assert!(prompt.contains("exactly once"));
+        assert!(prompt.contains("read-only project tools"));
+        assert!(prompt.contains("Report success only when the summary has actually been saved"));
+        assert!(prompt.contains("Do not modify project files"));
         assert!(super::slash_command_prompt("/unknown").is_none());
+    }
+
+    #[test]
+    fn register_slash_command_stays_visible_while_only_the_agent_message_expands() {
+        let root = temp_root("register-command-display");
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let store = ProjectStore::for_project(&root, &project).unwrap();
+        let session = store.create_session("/register").unwrap();
+        store
+            .append_event(
+                &session.id,
+                &ConversationEvent::message(EventKind::User, "/register".to_owned(), None),
+            )
+            .unwrap();
+
+        let messages = super::request_messages(&store, &session, "").unwrap();
+
+        assert_eq!(session.title, "/register");
+        assert_eq!(store.events(&session.id).unwrap()[0].content, "/register");
+        assert!(matches!(
+            messages.last(),
+            Some(AgentMessage::User { content }) if content == super::REGISTER_PROJECT_PROMPT
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn refreshed_startup_provider_status(
