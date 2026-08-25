@@ -27,6 +27,8 @@ commands.
 - Bare `roven` asks whether to trust the canonical current directory for the
   current launch. Trust is not persisted between launches.
 - After trust, the optional root `ROVEN.md` is loaded as project instructions.
+- `/register` submits the built-in project-registration prompt, prepares the
+  current trusted workspace, reads the codebase, and stores a concise report.
 - `/resume` opens sessions for the current workspace. `Esc` cancels an active
   provider stream while retaining received content.
 
@@ -38,7 +40,7 @@ The Rust harness exposes four local tools:
 | --- | --- | --- |
 | `list_directory` | Lists immediate entries inside the trusted workspace. It cannot recurse, read file contents, or escape the workspace. | No |
 | `read_file` | Reads a regular UTF-8 text file up to 50 KiB using a workspace-relative path inside the trusted workspace. | No |
-| `prepare_project` | Independently canonicalizes and authorizes the requested path, then validates Git/GitHub state and registers the trusted project. | Yes, after validation |
+| `prepare_project` | Independently canonicalizes and authorizes the requested path, then registers it or replaces its local `summary` section. | Yes, after validation |
 | `list_tools` | Returns the available tool names, descriptions, and input schemas. | No |
 
 `prepare_project` rejects paths outside the launch-time trusted workspace before

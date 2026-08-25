@@ -4,13 +4,19 @@ This is a short reference for the tools implemented by Roven. It documents
 their public purpose, input, and result shape. It is not an agent prompt or a
 workflow definition.
 
+## Slash commands
+
+- `/register` submits Roven's built-in project-registration prompt, prepares
+  the current trusted workspace, reads the codebase, and stores a concise
+  report through `prepare_project`.
+
 ## At a glance
 
 | Tool | Main purpose | Writes data |
 | --- | --- | --- |
 | `list_directory` | List immediate entries in the trusted workspace | No |
 | `read_file` | Read a small UTF-8 text file in the trusted workspace | No |
-| `prepare_project` | Validate and register the trusted project | Yes, after validation |
+| `prepare_project` | Validate/register the trusted project or replace its local summary | Yes, after validation |
 | `list_tools` | Return the live tool catalog | No |
 
 ## `list_directory`
@@ -85,14 +91,26 @@ Possible errors include `invalid_path`, `path_not_allowed`, `not_file`,
 
 ## `prepare_project`
 
-Validates and registers the trusted project. The requested path must resolve to
-the exact workspace root trusted when Roven launched. The harness checks this
-boundary before project lookup, Git commands, or registration writes.
+Validates and registers the trusted project, or replaces its local `summary`
+section. The requested path must resolve to the exact workspace root trusted
+when Roven launched. The harness checks this boundary before project lookup,
+Git commands, or registration writes.
 
 Input:
 
 ```json
 { "path": "." }
+```
+
+After registration, the version-one section update accepts only this shape:
+
+```json
+{
+  "path": ".",
+  "section_name": "summary",
+  "text": "concise codebase report",
+  "operation": "replace"
+}
 ```
 
 Registration also requires a usable Git repository with:
@@ -115,17 +133,23 @@ Successful result:
 }
 ```
 
-If the project is already registered, the result is `already_added`. An
+If the project is already registered, the registration mode returns
+`already_added`. A successful section update returns `summary_saved`. An
 unauthorized path returns `blocked` with reason `path_not_allowed`; no Git
 command or registration write occurs. Other blocked reasons identify invalid
-paths, missing Git prerequisites, an unavailable Git executable, an unclean
-repository, or local storage failure.
+paths, invalid section updates, an unregistered update, missing Git
+prerequisites, an unavailable Git executable, an unclean repository, or local
+storage failure.
 
 The registration file is written to:
 
 ```text
 %LOCALAPPDATA%\Roven\data\projects\<project-name>.json
 ```
+
+The JSON keeps registration identity and an optional `sections` map. A saved
+report is stored as `sections.summary`; it is not written into the project
+repository.
 
 ## `list_tools`
 
