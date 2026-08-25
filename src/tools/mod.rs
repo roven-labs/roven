@@ -45,7 +45,7 @@ pub(crate) struct RovenToolResult {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolContext {
-    pub(super) trusted_workspace: PathBuf,
+    trusted_workspace: PathBuf,
 }
 
 impl ToolContext {

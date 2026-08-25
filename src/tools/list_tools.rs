@@ -83,7 +83,7 @@ mod tests {
             .expect("read_file must be registered");
         assert_eq!(
             read_file["description"],
-            super::super::read_file::READ_FILE_DESCRIPTION
+            "Read a known workspace-relative text file after locating it with `list_directory`. Paths are relative to the trusted workspace. This tool reads only regular UTF-8 text files up to 50 KiB and does not modify files or access paths outside the trusted workspace."
         );
         assert_eq!(
             read_file["input_schema"],
@@ -107,7 +107,7 @@ mod tests {
             .expect("list_directory must be registered");
         assert_eq!(
             list_directory["description"],
-            super::super::list_directory::LIST_DIRECTORY_DESCRIPTION
+            "List the immediate contents of a directory inside the currently trusted Roven workspace. Use this when you need to inspect workspace structure or locate a file or subdirectory before calling another filesystem tool. Pass a workspace-relative directory path such as `.` or `src`; do not pass an absolute path or a path containing `..`. Returns up to 100 immediate entries in deterministic order with `status`, `path`, `workspace_path`, `entries`, and `truncated`; if more entries exist, `truncated` is true. Each entry includes `name`, workspace-relative `path`, and `kind`. Every regular file also includes `size_kb`, measured as bytes divided by 1024 and rounded to two decimal places. Directories and other entries omit size fields. Symlinks are not followed and include `size_error: \"symlink_not_followed\"`; regular-file metadata failures keep the entry and include `size_error: \"permission_denied\"` or \"io_error\". For `invalid_path` or `path_not_allowed`, retry with a relative path under the workspace; for `not_directory`, pass a directory path. This tool does not read file contents, search recursively, modify files, register projects, or access paths outside the trusted workspace."
         );
         assert_eq!(
             list_directory["input_schema"],

@@ -14,7 +14,7 @@ use super::{
     },
 };
 
-pub(super) const LIST_DIRECTORY_DESCRIPTION: &str = "List the immediate contents of a directory inside the currently trusted Roven workspace. Use this when you need to inspect workspace structure or locate a file or subdirectory before calling another filesystem tool. Pass a workspace-relative directory path such as `.` or `src`; do not pass an absolute path or a path containing `..`. Returns up to 100 immediate entries in deterministic order with `status`, `path`, `workspace_path`, `entries`, and `truncated`; if more entries exist, `truncated` is true. Each entry includes `name`, workspace-relative `path`, and `kind`. Every regular file also includes `size_kb`, measured as bytes divided by 1024 and rounded to two decimal places. Directories and other entries omit size fields. Symlinks are not followed and include `size_error: \"symlink_not_followed\"`; regular-file metadata failures keep the entry and include `size_error: \"permission_denied\"` or \"io_error\". For `invalid_path` or `path_not_allowed`, retry with a relative path under the workspace; for `not_directory`, pass a directory path. This tool does not read file contents, search recursively, modify files, register projects, or access paths outside the trusted workspace.";
+const LIST_DIRECTORY_DESCRIPTION: &str = "List the immediate contents of a directory inside the currently trusted Roven workspace. Use this when you need to inspect workspace structure or locate a file or subdirectory before calling another filesystem tool. Pass a workspace-relative directory path such as `.` or `src`; do not pass an absolute path or a path containing `..`. Returns up to 100 immediate entries in deterministic order with `status`, `path`, `workspace_path`, `entries`, and `truncated`; if more entries exist, `truncated` is true. Each entry includes `name`, workspace-relative `path`, and `kind`. Every regular file also includes `size_kb`, measured as bytes divided by 1024 and rounded to two decimal places. Directories and other entries omit size fields. Symlinks are not followed and include `size_error: \"symlink_not_followed\"`; regular-file metadata failures keep the entry and include `size_error: \"permission_denied\"` or \"io_error\". For `invalid_path` or `path_not_allowed`, retry with a relative path under the workspace; for `not_directory`, pass a directory path. This tool does not read file contents, search recursively, modify files, register projects, or access paths outside the trusted workspace.";
 
 pub(super) fn definition() -> RovenToolDefinition {
     RovenToolDefinition {
@@ -43,13 +43,13 @@ const DIRECTORY_LIST_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ListDirectoryInput {
-    pub(super) path: String,
+struct ListDirectoryInput {
+    path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub(super) enum ListDirectoryResult {
+enum ListDirectoryResult {
     Ok {
         path: String,
         workspace_path: String,
@@ -72,7 +72,7 @@ impl ListDirectoryResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(super) struct ListDirectoryEntry {
+struct ListDirectoryEntry {
     name: String,
     path: String,
     kind: DirectoryEntryKind,
@@ -84,7 +84,7 @@ pub(super) struct ListDirectoryEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum DirectoryEntryKind {
+enum DirectoryEntryKind {
     File,
     Directory,
     Symlink,
@@ -93,7 +93,7 @@ pub(super) enum DirectoryEntryKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum DirectoryEntrySizeError {
+enum DirectoryEntrySizeError {
     PermissionDenied,
     IoError,
     SymlinkNotFollowed,
@@ -101,7 +101,7 @@ pub(super) enum DirectoryEntrySizeError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum ListDirectoryErrorReason {
+enum ListDirectoryErrorReason {
     InvalidPath,
     PathNotAllowed,
     NotDirectory,
@@ -109,14 +109,10 @@ pub(super) enum ListDirectoryErrorReason {
     IoError,
 }
 
-pub(super) struct ListDirectory;
+struct ListDirectory;
 
 impl ListDirectory {
-    pub(super) fn execute(
-        &self,
-        context: &ToolContext,
-        input: ListDirectoryInput,
-    ) -> ListDirectoryResult {
+    fn execute(&self, context: &ToolContext, input: ListDirectoryInput) -> ListDirectoryResult {
         let target = match resolve_workspace_directory(context, &input.path) {
             Ok(path) => path,
             Err(reason) => return ListDirectoryResult::error(reason, input.path),

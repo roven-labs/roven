@@ -52,16 +52,16 @@ pub(super) fn dispatch(context: &ToolContext, arguments: Value) -> serde_json::R
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct PrepareProjectInput {
-    pub(super) path: String,
-    pub(super) section_name: Option<String>,
-    pub(super) text: Option<String>,
-    pub(super) operation: Option<String>,
+struct PrepareProjectInput {
+    path: String,
+    section_name: Option<String>,
+    text: Option<String>,
+    operation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub(super) enum PrepareProjectResult {
+enum PrepareProjectResult {
     Prepared { project: PreparedProject },
     AlreadyAdded { project: ExistingProject },
     SummarySaved { project: ExistingProject },
@@ -75,7 +75,7 @@ impl PrepareProjectResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(super) struct PreparedProject {
+struct PreparedProject {
     name: String,
     path: String,
     github_remote: String,
@@ -83,14 +83,14 @@ pub(super) struct PreparedProject {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(super) struct ExistingProject {
+struct ExistingProject {
     name: String,
     path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum BlockedReason {
+enum BlockedReason {
     InvalidPath,
     PathNotAllowed,
     GitUnavailable,
@@ -103,12 +103,12 @@ pub(super) enum BlockedReason {
     NotRegistered,
 }
 
-pub(super) struct PrepareProject {
+struct PrepareProject {
     registry: Result<ProjectRegistry, ()>,
 }
 
 impl PrepareProject {
-    pub(super) fn for_current_user() -> Self {
+    fn for_current_user() -> Self {
         Self {
             registry: ProjectRegistry::for_current_user().map_err(|_| ()),
         }
@@ -121,11 +121,7 @@ impl PrepareProject {
         }
     }
 
-    pub(super) fn execute(
-        &self,
-        context: &ToolContext,
-        input: PrepareProjectInput,
-    ) -> PrepareProjectResult {
+    fn execute(&self, context: &ToolContext, input: PrepareProjectInput) -> PrepareProjectResult {
         let project_path = match canonical_project_path(context, &input.path) {
             Some(path) => path,
             None => return PrepareProjectResult::blocked(BlockedReason::InvalidPath),

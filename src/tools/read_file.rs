@@ -12,7 +12,7 @@ use super::{
     workspace::{WorkspacePathError, canonical_workspace_path, workspace_relative_path},
 };
 
-pub(super) const READ_FILE_DESCRIPTION: &str = "Read a known workspace-relative text file after locating it with `list_directory`. Paths are relative to the trusted workspace. This tool reads only regular UTF-8 text files up to 50 KiB and does not modify files or access paths outside the trusted workspace.";
+const READ_FILE_DESCRIPTION: &str = "Read a known workspace-relative text file after locating it with `list_directory`. Paths are relative to the trusted workspace. This tool reads only regular UTF-8 text files up to 50 KiB and does not modify files or access paths outside the trusted workspace.";
 
 pub(super) fn definition() -> RovenToolDefinition {
     RovenToolDefinition {
@@ -38,13 +38,13 @@ const READ_FILE_SIZE_LIMIT: u64 = 50 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ReadFileInput {
-    pub(super) path: String,
+struct ReadFileInput {
+    path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub(super) enum ReadFileResult {
+enum ReadFileResult {
     Ok {
         path: String,
         content: String,
@@ -66,7 +66,7 @@ impl ReadFileResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum ReadFileErrorReason {
+enum ReadFileErrorReason {
     InvalidPath,
     PathNotAllowed,
     NotFile,
@@ -76,10 +76,10 @@ pub(super) enum ReadFileErrorReason {
     IoError,
 }
 
-pub(super) struct ReadFile;
+struct ReadFile;
 
 impl ReadFile {
-    pub(super) fn execute(&self, context: &ToolContext, input: ReadFileInput) -> ReadFileResult {
+    fn execute(&self, context: &ToolContext, input: ReadFileInput) -> ReadFileResult {
         let target = match resolve_workspace_file(context, &input.path) {
             Ok(path) => path,
             Err(reason) => return ReadFileResult::error(reason, input.path),
