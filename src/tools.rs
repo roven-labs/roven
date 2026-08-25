@@ -16,6 +16,7 @@ pub(crate) const PREPARE_PROJECT_DESCRIPTION: &str = "Validate and register the 
 pub(crate) const LIST_DIRECTORY_DESCRIPTION: &str = "List the immediate contents of a directory inside the currently trusted Roven workspace. Use this when you need to inspect workspace structure or locate a file or subdirectory before calling another filesystem tool. Pass a workspace-relative directory path such as `.` or `src`; do not pass an absolute path or a path containing `..`. Returns up to 100 immediate entries in deterministic order with `status`, `path`, `workspace_path`, `entries`, and `truncated`; if more entries exist, `truncated` is true. Each entry includes `name`, workspace-relative `path`, and `kind`. Every regular file also includes `size_kb`, measured as bytes divided by 1024 and rounded to two decimal places. Directories and other entries omit size fields. Symlinks are not followed and include `size_error: \"symlink_not_followed\"`; regular-file metadata failures keep the entry and include `size_error: \"permission_denied\"` or \"io_error\". For `invalid_path` or `path_not_allowed`, retry with a relative path under the workspace; for `not_directory`, pass a directory path. This tool does not read file contents, search recursively, modify files, register projects, or access paths outside the trusted workspace.";
 pub(crate) const READ_FILE_DESCRIPTION: &str = "Read a known workspace-relative text file after locating it with `list_directory`. Paths are relative to the trusted workspace. This tool reads only regular UTF-8 text files up to 50 KiB and does not modify files or access paths outside the trusted workspace.";
 pub(crate) const LIST_TOOLS_DESCRIPTION: &str = "List the Roven tools available to you in this turn, with their exact descriptions and input schemas. Use this when you need to check which Roven capabilities are currently available before selecting a tool. This reports the live Roven tool registry and does not access the workspace or modify anything.";
+pub(crate) const LIST_PROJECT_DESCRIPTION: &str = "List the projects currently registered with Roven. Use this when the user asks which stored projects exist. Takes no arguments and returns only project names in deterministic alphabetical order; an empty registry returns an empty projects array. This does not inspect project directories or modify storage.";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct RovenToolDefinition {
@@ -94,6 +95,15 @@ pub(crate) fn definitions() -> Vec<RovenToolDefinition> {
                 "additionalProperties": false
             }),
         },
+        RovenToolDefinition {
+            name: "list_project".to_owned(),
+            description: LIST_PROJECT_DESCRIPTION.to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -163,6 +173,10 @@ pub(crate) fn dispatch(context: &ToolContext, call: RovenToolCall) -> RovenToolR
             }),
             Err(_) => serde_json::to_value(ListToolsResult::InvalidInput),
         },
+        "list_project" => match serde_json::from_value::<ListProjectInput>(call.arguments) {
+            Ok(_) => serde_json::to_value(ListProject::for_current_user().execute()),
+            Err(_) => serde_json::to_value(ListProjectResult::InvalidInput),
+        },
         _ => Ok(json!({ "status": "error", "reason": "unknown_tool" })),
     };
     RovenToolResult {
@@ -175,6 +189,52 @@ pub(crate) fn dispatch(context: &ToolContext, call: RovenToolCall) -> RovenToolR
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ListToolsInput {}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListProjectInput {}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ListProjectResult {
+    Ok { projects: Vec<String> },
+    Error { reason: ListProjectErrorReason },
+    InvalidInput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ListProjectErrorReason {
+    StorageFailure,
+}
+
+struct ListProject {
+    registry: Result<ProjectRegistry, ()>,
+}
+
+impl ListProject {
+    fn for_current_user() -> Self {
+        Self {
+            registry: ProjectRegistry::for_current_user().map_err(|_| ()),
+        }
+    }
+
+    fn execute(&self) -> ListProjectResult {
+        let Ok(registry) = &self.registry else {
+            return ListProjectResult::Error {
+                reason: ListProjectErrorReason::StorageFailure,
+            };
+        };
+        match registry.list() {
+            Ok(projects) => ListProjectResult::Ok {
+                projects: projects.into_iter().map(|project| project.name).collect(),
+            },
+            Err(_) => ListProjectResult::Error {
+                reason: ListProjectErrorReason::StorageFailure,
+            },
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -957,9 +1017,10 @@ mod tests {
     use crate::storage::{ProjectRegistry, RegistrationLookup};
 
     use super::{
-        BlockedReason, LIST_DIRECTORY_DESCRIPTION, ListDirectory, ListDirectoryInput,
-        PrepareProject, PrepareProjectInput, PrepareProjectResult, READ_FILE_DESCRIPTION, ReadFile,
-        ReadFileInput, RovenToolCall, ToolContext, definitions, dispatch,
+        BlockedReason, LIST_DIRECTORY_DESCRIPTION, LIST_PROJECT_DESCRIPTION, ListDirectory,
+        ListDirectoryInput, PrepareProject, PrepareProjectInput, PrepareProjectResult,
+        READ_FILE_DESCRIPTION, ReadFile, ReadFileInput, RovenToolCall, ToolContext, definitions,
+        dispatch,
     };
 
     fn temp_root(name: &str) -> PathBuf {
@@ -1900,6 +1961,26 @@ mod tests {
         );
         assert_eq!(invalid.result, json!({ "status": "invalid_input" }));
         fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn list_project_rejects_unknown_input_and_exposes_definition() {
+        let zeta = ready_project("zeta-project");
+
+        let invalid = dispatch(
+            &context(&zeta),
+            RovenToolCall {
+                id: "invalid-list-project".to_owned(),
+                name: "list_project".to_owned(),
+                arguments: json!({ "unexpected": true }),
+            },
+        );
+        assert_eq!(invalid.result, json!({ "status": "invalid_input" }));
+        assert!(definitions().iter().any(
+            |tool| tool.name == "list_project" && tool.description == LIST_PROJECT_DESCRIPTION
+        ));
+
+        fs::remove_dir_all(zeta).unwrap();
     }
 
     #[cfg(windows)]

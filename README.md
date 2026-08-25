@@ -34,7 +34,7 @@ commands.
 
 ## Agent tools
 
-The Rust harness exposes four local tools:
+The Rust harness exposes five local tools:
 
 | Tool | Capability | Writes data? |
 | --- | --- | --- |
@@ -42,6 +42,7 @@ The Rust harness exposes four local tools:
 | `read_file` | Reads a regular UTF-8 text file up to 50 KiB using a workspace-relative path inside the trusted workspace. | No |
 | `prepare_project` | Independently canonicalizes and authorizes the requested path, then registers it or replaces its local `summary` section. | Yes, after validation |
 | `list_tools` | Returns the available tool names, descriptions, and input schemas. | No |
+| `list_project` | Returns the names of stored projects in alphabetical order. | No |
 
 `prepare_project` rejects paths outside the launch-time trusted workspace before
 any Git command, project lookup, or registration write. A successful

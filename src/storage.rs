@@ -67,6 +67,23 @@ impl ProjectRegistry {
         Ok(RegistrationLookup::Absent)
     }
 
+    pub(crate) fn list(&self) -> Result<Vec<ProjectRegistration>, StorageError> {
+        let projects_dir = self.projects_dir();
+        if !projects_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut registrations = fs::read_dir(projects_dir)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension().and_then(|extension| extension.to_str()) == Some("json")
+            })
+            .map(|path| read_json::<ProjectRegistration>(&path))
+            .collect::<Result<Vec<_>, _>>()?;
+        registrations.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(registrations)
+    }
+
     pub(crate) fn register(
         &self,
         project_root: &Path,
@@ -541,6 +558,48 @@ mod tests {
         );
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn registry_lists_project_names_in_order_and_handles_empty_storage() {
+        let data = temp_root("list-projects");
+        let first = temp_root("zeta-project");
+        let second = temp_root("alpha-project");
+        let registry = ProjectRegistry::for_data_root(&data);
+
+        assert!(registry.list().unwrap().is_empty());
+        registry
+            .register(
+                &first,
+                "https://github.com/roven/zeta.git".to_owned(),
+                "abc".to_owned(),
+            )
+            .unwrap();
+        registry
+            .register(
+                &second,
+                "https://github.com/roven/alpha.git".to_owned(),
+                "def".to_owned(),
+            )
+            .unwrap();
+
+        let names = registry
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|project| project.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                second.file_name().unwrap().to_string_lossy().into_owned(),
+                first.file_name().unwrap().to_string_lossy().into_owned(),
+            ]
+        );
+
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(first).unwrap();
+        fs::remove_dir_all(second).unwrap();
     }
 
     #[test]

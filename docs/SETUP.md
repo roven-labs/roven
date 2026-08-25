@@ -75,6 +75,19 @@ Roven shows a trust prompt for the canonical current directory. The trust is
 valid only for that launch. After accepting it, the first user message creates
 a session and the agent can use the trusted-workspace tools.
 
+## Register the current project
+
+After accepting the trust prompt, enter:
+
+```text
+/register
+```
+
+Roven validates the current GitHub-backed project, inspects relevant files with
+its read-only tools, and saves a compact project summary under
+`%LOCALAPPDATA%\Roven\data\projects`. It does not modify the project
+repository. Registration requires a committed, clean working tree.
+
 ## Local data locations
 
 On Windows, Roven uses:

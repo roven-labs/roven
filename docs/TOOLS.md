@@ -18,6 +18,7 @@ workflow definition.
 | `read_file` | Read a small UTF-8 text file in the trusted workspace | No |
 | `prepare_project` | Validate/register the trusted project or replace its local summary | Yes, after validation |
 | `list_tools` | Return the live tool catalog | No |
+| `list_project` | Return stored project names in alphabetical order | No |
 
 ## `list_directory`
 
@@ -162,3 +163,15 @@ It takes an empty object:
 
 The result has `status: "ok"` and a `tools` array. It reads the live Roven
 tool catalog and does not access the workspace or modify data.
+
+## `list_project`
+
+Returns the names of projects already registered in local Roven storage, in
+alphabetical order. It takes an empty object:
+
+```json
+{}
+```
+
+The result has `status: "ok"` and a `projects` array. It does not access the
+workspace or modify data.

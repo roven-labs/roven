@@ -20,6 +20,8 @@ native `/api/chat` endpoint are handled by separate protocol adapters.
 - `roven auth list`, `use`, `status`, and `remove` manage profiles and the
   explicit default without displaying secrets.
 - Bare `roven` opens the trust gate and terminal chat.
+- `/register` validates the current trusted project, inspects it through the
+  read-only tools, and saves a compact evidence summary locally.
 - `/resume` lists sessions for the current canonical workspace.
 - `Esc` requests cancellation of an active provider stream.
 
@@ -33,6 +35,7 @@ The Rust harness, rather than the model prompt, enforces filesystem authority:
 - `prepare_project` independently canonicalizes and compares its requested path
   with the trusted workspace before project lookup, Git validation, or writes.
 - `list_tools` reports the live tool registry.
+- `list_project` reports stored project names in alphabetical order.
 
 `prepare_project` validates the trusted project’s GitHub remote, committed
 baseline, and clean working state before writing
