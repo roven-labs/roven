@@ -1,12 +1,35 @@
-Register the current trusted project and write its concise codebase report for future Roven context.
+Register the current trusted project and build a compact evidence profile that Roven can later use to generate tailored resumes.
 
-Follow this exact workflow:
+Use `prepare_project` to begin registration. If the project is already registered or registration is blocked, report the result and stop. Continue only when the project is ready for inspection.
 
-1. Call `prepare_project` exactly once with `{ "path": "." }`.
-2. If the result is `already_added`, report that the project is already registered and stop. Do not inspect the repository or call the tool again. If the result is `blocked`, report the blocked reason and stop.
-3. Continue only when the result is `prepared`. Read the repository end to end with `list_directory` and `read_file`. Start at `.` and follow returned directory paths. Inspect source, configuration, documentation, and tests. Skip `.git`, `target`, dependency/vendor directories, generated output, binary files, and files too large for `read_file`. Do not claim a file was read without a successful tool result.
-4. Write a concise codebase report covering the project purpose, structure, technology choices, important runtime flow, and test/build conventions. Keep it evidence-based and useful as future agent context; do not turn it into an exhaustive file listing.
-5. Call `prepare_project` exactly once more with `{ "path": ".", "section_name": "summary", "text": "<the concise codebase report>", "operation": "replace" }`. The path is required again because each tool call independently validates the trusted workspace.
-6. Report success only when the result is `summary_saved`. If the second call is blocked, report its actual reason and do not claim the report was saved.
+Inspect the repository using the available read-only project tools. Read enough relevant source code, configuration, documentation, and tests to understand the important parts of the project. Do not attempt to document the repository file by file.
 
-Do not call arbitrary commands, write project files, use another section name, or use another operation.
+The saved summary should preserve high-value project evidence, not general codebase documentation.
+
+Capture information that establishes:
+
+* **Project purpose** — the problem being solved and the intended use of the system.
+* **Core capabilities** — the most meaningful things the implemented system can do.
+* **Technical architecture** — the important components and how they work together.
+* **Engineering highlights** — significant implementation challenges, technical mechanisms, architectural decisions, algorithms, workflows, integrations, or other non-trivial engineering.
+* **Technology usage** — important languages, frameworks, platforms, databases, models, APIs, protocols, or infrastructure together with how they are meaningfully used.
+* **Quality and reliability evidence** — meaningful testing, security, performance, reliability, validation, deployment, or operational engineering.
+* **Measurable evidence** — concrete numbers, limits, scale, performance results, test results, or other measurements only when supported by repository evidence.
+
+Prefer facts that can later provide the building blocks of a strong resume bullet: what was built, how it was implemented, what makes it technically significant, and any verified result or scale.
+
+Omit repository details that do not contribute to those categories. Do not preserve file-by-file descriptions, routine boilerplate, ordinary configuration, exhaustive endpoint or component lists, dependency inventories, development trivia, or repeated implementation details merely because they exist in the repository.
+
+Describe technologies in the context of what they accomplish rather than listing them without meaning.
+
+Distill low-level implementation details into the engineering capability they demonstrate while preserving technically important specifics.
+
+Do not invent impact, metrics, scale, technical decisions, or capabilities. Base every saved fact on successfully inspected repository evidence.
+
+Do not infer that the user personally implemented a feature merely because it exists in the repository. Record project evidence only; personal contribution can be established separately.
+
+Keep the final evidence profile compact and information-dense. If a category has no meaningful evidence, omit it rather than filling it with weak information.
+
+After the evidence profile is complete, use `prepare_project` according to its tool contract to save it as the project summary.
+
+Report success only when the summary has actually been saved. Do not modify project files or perform unrelated actions.
