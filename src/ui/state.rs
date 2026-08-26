@@ -161,6 +161,9 @@ pub(crate) struct AppState {
     generation_started_at: Option<Instant>,
     pub(crate) resume_entries: Option<Vec<ResumeEntry>>,
     pub(crate) resume_index: usize,
+    pub(crate) resume_offset: usize,
+    pub(crate) resume_first_row: u16,
+    pub(crate) resume_visible_rows: u16,
     pub(crate) model_selection: Option<ModelSelection>,
     pub(crate) startup_provider_status: Option<StartupProviderStatus>,
     slash_command_menu_open: bool,
@@ -318,6 +321,7 @@ impl AppState {
     pub(crate) fn open_resume(&mut self, entries: Vec<ResumeEntry>) {
         self.resume_entries = Some(entries);
         self.resume_index = 0;
+        self.resume_offset = 0;
     }
 
     pub(crate) fn close_resume(&mut self) {
@@ -413,6 +417,33 @@ impl AppState {
         }
     }
 
+    pub(crate) fn select_resume(&mut self, index: usize) {
+        if self
+            .resume_entries
+            .as_ref()
+            .is_some_and(|entries| index < entries.len())
+        {
+            self.resume_index = index;
+        }
+    }
+
+    pub(crate) fn set_resume_viewport(&mut self, first_row: u16, visible_rows: u16, offset: usize) {
+        self.resume_first_row = first_row;
+        self.resume_visible_rows = visible_rows;
+        self.resume_offset = offset;
+    }
+
+    pub(crate) fn resume_index_at_row(&self, row: u16) -> Option<usize> {
+        let relative_row = row.checked_sub(self.resume_first_row)?;
+        if relative_row >= self.resume_visible_rows {
+            return None;
+        }
+        let index = self.resume_offset + usize::from(relative_row);
+        self.resume_entries
+            .as_ref()
+            .and_then(|entries| (index < entries.len()).then_some(index))
+    }
+
     pub(crate) fn scroll_up(&mut self, lines: u16) {
         self.scroll_offset = self
             .scroll_offset
@@ -463,7 +494,7 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, MessageKind, Role};
+    use super::{AppState, MessageKind, ResumeEntry, Role};
 
     #[test]
     fn slash_commands_filter_navigate_and_insert_without_submitting() {
@@ -478,6 +509,27 @@ mod tests {
         assert_eq!(state.input, "/model");
         assert!(!state.slash_command_menu_open());
         assert!(state.messages.is_empty());
+    }
+
+    #[test]
+    fn resume_picker_selects_entry_by_index() {
+        let mut state = AppState::new();
+        state.open_resume(vec![
+            ResumeEntry {
+                id: "first".to_owned(),
+                title: "First".to_owned(),
+                updated_at_ms: 0,
+            },
+            ResumeEntry {
+                id: "second".to_owned(),
+                title: "Second".to_owned(),
+                updated_at_ms: 0,
+            },
+        ]);
+
+        state.select_resume(1);
+
+        assert_eq!(state.selected_resume_id(), Some("second"));
     }
 
     #[test]

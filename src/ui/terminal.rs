@@ -13,7 +13,7 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEventKind,
+        KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
@@ -184,6 +184,15 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                     code: KeyCode::Down,
                     ..
                 }) => state.select_next_resume(),
+                Event::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    row,
+                    ..
+                }) => {
+                    if let Some(index) = state.resume_index_at_row(row) {
+                        state.select_resume(index);
+                    }
+                }
                 Event::Key(KeyEvent {
                     code: KeyCode::Enter,
                     ..
@@ -980,7 +989,7 @@ mod tests {
         storage::{ConversationEvent, EventKind, ProjectStore},
         ui::{
             startup::StartupProviderStatus,
-            state::{AppState, ModelSelection, Role},
+            state::{AppState, ModelSelection, ResumeEntry, Role},
         },
     };
 
@@ -1075,6 +1084,29 @@ mod tests {
             super::slash_command("/model"),
             Some(super::SlashCommand::Model)
         );
+    }
+
+    #[test]
+    fn resume_picker_maps_session_rows_to_indices() {
+        let mut state = AppState::new();
+        state.open_resume(vec![
+            ResumeEntry {
+                id: "first".to_owned(),
+                title: "First".to_owned(),
+                updated_at_ms: 0,
+            },
+            ResumeEntry {
+                id: "second".to_owned(),
+                title: "Second".to_owned(),
+                updated_at_ms: 0,
+            },
+        ]);
+        state.set_resume_viewport(6, 2, 0);
+
+        assert_eq!(state.resume_index_at_row(6), Some(0));
+        assert_eq!(state.resume_index_at_row(7), Some(1));
+        assert_eq!(state.resume_index_at_row(5), None);
+        assert_eq!(state.resume_index_at_row(8), None);
     }
 
     #[test]

@@ -766,6 +766,42 @@ mod tests {
     }
 
     #[test]
+    fn sessions_remain_scoped_to_the_canonical_project_workspace() {
+        let data = temp_root("scoped-session-data");
+        let current_project = temp_root("current-session-project");
+        let other_project = temp_root("other-session-project");
+        let current = ProjectStore::for_project(&data, &current_project).unwrap();
+        let same_current = ProjectStore::for_project(&data, &current_project.join(".")).unwrap();
+        let other = ProjectStore::for_project(&data, &other_project).unwrap();
+
+        let current_session = current.create_session("Current session").unwrap();
+        let other_session = other.create_session("Other session").unwrap();
+
+        assert_eq!(
+            same_current
+                .list_sessions()
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![current_session.id]
+        );
+        assert_eq!(
+            other
+                .list_sessions()
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![other_session.id]
+        );
+
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(current_project).unwrap();
+        fs::remove_dir_all(other_project).unwrap();
+    }
+
+    #[test]
     fn function_call_output_is_stored_as_structured_json() {
         let data = temp_root("function-call-data");
         let project = temp_root("function-call-project");

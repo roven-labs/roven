@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use super::transcript::render_message;
@@ -116,33 +116,39 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
     }
 
     if let Some(entries) = &state.resume_entries {
+        let list_area = Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 3);
+        let footer_area = Rect::new(area.x + 1, area.bottom() - 2, area.width - 2, 1);
         let items = if entries.is_empty() {
-            "No previous sessions for this project".to_owned()
+            vec![ListItem::new("No previous sessions for this project")]
         } else {
             entries
                 .iter()
-                .enumerate()
-                .map(|(index, entry)| {
-                    let marker = if index == state.resume_index {
-                        ">"
-                    } else {
-                        " "
-                    };
-                    format!("{marker} {}", entry.title)
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+                .map(|entry| ListItem::new(entry.title.as_str()))
+                .collect()
         };
+        let mut list_state = ListState::default()
+            .with_offset(state.resume_offset)
+            .with_selected((!entries.is_empty()).then_some(state.resume_index));
+        frame.render_widget(Clear, area);
         frame.render_widget(
-            Paragraph::new(format!(
-                "Resume conversation\n\n{items}\n\nEnter resume   Esc back"
-            ))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(MUTED_STYLE),
-            ),
+            Block::default()
+                .title("Resume conversation")
+                .borders(Borders::ALL)
+                .border_style(MUTED_STYLE),
             area,
+        );
+        frame.render_stateful_widget(
+            List::new(items)
+                .style(SCREEN_STYLE)
+                .highlight_style(PRIMARY_STYLE)
+                .highlight_symbol("> "),
+            list_area,
+            &mut list_state,
+        );
+        state.set_resume_viewport(list_area.y, list_area.height, list_state.offset());
+        frame.render_widget(
+            Paragraph::new("Click or ↑/↓ select   Enter resume   Esc back").style(MUTED_STYLE),
+            footer_area,
         );
         return;
     }
@@ -411,7 +417,7 @@ mod tests {
     use super::{MINIMUM_HEIGHT, MINIMUM_WIDTH, draw};
     use crate::ui::{
         startup::StartupProviderStatus,
-        state::{AppState, ModelSelection, ProviderAccessState, ProviderChoice},
+        state::{AppState, ModelSelection, ProviderAccessState, ProviderChoice, ResumeEntry},
     };
 
     fn render(state: &mut AppState, width: u16, height: u16) -> String {
@@ -580,6 +586,29 @@ mod tests {
         assert!(rendered.contains("> /register  Prepare this project"));
         assert!(rendered.contains("/resume  Resume a conversation"));
         assert!(rendered.contains("/model  Switch model"));
+    }
+
+    #[test]
+    fn resume_picker_keeps_the_selected_session_visible() {
+        let mut state = AppState::new();
+        state.trusted = true;
+        state.open_resume(
+            (0..23)
+                .map(|index| ResumeEntry {
+                    id: format!("id-{index}"),
+                    title: format!("Session {index}"),
+                    updated_at_ms: index,
+                })
+                .collect(),
+        );
+        for _ in 0..22 {
+            state.select_next_resume();
+        }
+
+        let rendered = render(&mut state, 80, 12);
+
+        assert!(rendered.contains("> Session 22"));
+        assert!(!rendered.contains("> Session 21"));
     }
 
     #[test]
