@@ -32,6 +32,7 @@ const FOOTER_STYLE: Style = Style::new().fg(Color::DarkGray).bg(Color::Black);
 
 const COMPOSER_PREFIX: &str = "→ ";
 const COMPOSER_PLACEHOLDER: &str = "Add a follow-up";
+const ROVEN_MARK: &str = "████  ████  ██  ██  ████  ██  ██\n██ ██ ██ ██ ██  ██  ██    ███ ██\n████  ██ ██ ██  ██  ███   ██ ███\n██ ██ ██ ██  ██ ██  ██    ██  ██\n██ ██ ████    ████  ████  ██  ██";
 
 pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
@@ -208,11 +209,19 @@ fn composer_height(input: &str) -> u16 {
 
 fn draw_transcript(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if state.messages.is_empty() {
+        let mark_height = ROVEN_MARK.lines().count() as u16;
+        let mark_area = Rect::new(
+            area.x,
+            area.y
+                .saturating_add(area.height.saturating_sub(mark_height) / 2),
+            area.width,
+            mark_height.min(area.height),
+        );
         frame.render_widget(
-            Paragraph::new("Start a conversation")
-                .style(MUTED_STYLE)
+            Paragraph::new(ROVEN_MARK)
+                .style(PRIMARY_STYLE)
                 .alignment(Alignment::Center),
-            area,
+            mark_area,
         );
         return;
     }
@@ -516,6 +525,21 @@ mod tests {
         assert!(!rendered.contains("Roven"));
         assert!(!rendered.contains("Project agent"));
         assert!(!rendered.contains("The chat UI is ready"));
+    }
+
+    #[test]
+    fn empty_transcript_shows_roven_mark_until_first_message() {
+        let mut state = AppState::new();
+        state.trusted = true;
+
+        let empty = render(&mut state, 80, 24);
+        assert!(empty.contains("████  ████  ██  ██  ████  ██  ██"));
+
+        state.input = "Hello".to_owned();
+        assert!(state.submit());
+        let populated = render(&mut state, 80, 24);
+        assert!(!populated.contains("████  ████  ██  ██  ████  ██  ██"));
+        assert!(populated.contains("You › Hello"));
     }
 
     #[test]
