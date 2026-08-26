@@ -104,6 +104,46 @@ pub(crate) enum ModelSelection {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlashCommand {
+    Register,
+    Resume,
+    Model,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlashCommandInfo {
+    pub(crate) command: SlashCommand,
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+}
+
+const SLASH_COMMANDS: [SlashCommandInfo; 3] = [
+    SlashCommandInfo {
+        command: SlashCommand::Register,
+        name: "/register",
+        description: "Prepare this project",
+    },
+    SlashCommandInfo {
+        command: SlashCommand::Resume,
+        name: "/resume",
+        description: "Resume a conversation",
+    },
+    SlashCommandInfo {
+        command: SlashCommand::Model,
+        name: "/model",
+        description: "Switch model",
+    },
+];
+
+pub(crate) fn slash_command(input: &str) -> Option<SlashCommand> {
+    let input = input.trim();
+    SLASH_COMMANDS
+        .iter()
+        .find(|command| command.name == input)
+        .map(|command| command.command)
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct AppState {
     pub(crate) messages: Vec<Message>,
@@ -121,8 +161,13 @@ pub(crate) struct AppState {
     generation_started_at: Option<Instant>,
     pub(crate) resume_entries: Option<Vec<ResumeEntry>>,
     pub(crate) resume_index: usize,
+    pub(crate) resume_offset: usize,
+    pub(crate) resume_first_row: u16,
+    pub(crate) resume_visible_rows: u16,
     pub(crate) model_selection: Option<ModelSelection>,
     pub(crate) startup_provider_status: Option<StartupProviderStatus>,
+    slash_command_menu_open: bool,
+    pub(crate) slash_command_index: usize,
 }
 
 impl AppState {
@@ -140,18 +185,55 @@ impl AppState {
     pub(crate) fn insert_char(&mut self, character: char) {
         if self.resume_entries.is_none() && self.model_selection.is_none() {
             self.input.push(character);
+            self.update_slash_command_menu();
         }
     }
 
     pub(crate) fn backspace(&mut self) {
         if self.resume_entries.is_none() && self.model_selection.is_none() {
             self.input.pop();
+            self.update_slash_command_menu();
         }
     }
 
     pub(crate) fn insert_newline(&mut self) {
         if self.resume_entries.is_none() && self.model_selection.is_none() {
             self.input.push('\n');
+            self.update_slash_command_menu();
+        }
+    }
+
+    pub(crate) fn slash_commands(&self) -> impl Iterator<Item = SlashCommandInfo> + '_ {
+        SLASH_COMMANDS.into_iter().filter(move |command| {
+            self.slash_command_menu_open && !self.running && command.name.starts_with(&self.input)
+        })
+    }
+
+    pub(crate) fn slash_command_menu_open(&self) -> bool {
+        self.slash_commands().next().is_some()
+    }
+
+    pub(crate) fn close_slash_command_menu(&mut self) {
+        self.slash_command_menu_open = false;
+    }
+
+    pub(crate) fn select_previous_slash_command(&mut self) {
+        self.slash_command_index = self.slash_command_index.saturating_sub(1);
+    }
+
+    pub(crate) fn select_next_slash_command(&mut self) {
+        self.slash_command_index =
+            (self.slash_command_index + 1).min(self.slash_commands().count().saturating_sub(1));
+    }
+
+    pub(crate) fn insert_selected_slash_command(&mut self) {
+        let command_name = self
+            .slash_commands()
+            .nth(self.slash_command_index)
+            .map(|command| command.name);
+        if let Some(command_name) = command_name {
+            self.input = command_name.to_owned();
+            self.close_slash_command_menu();
         }
     }
 
@@ -165,6 +247,7 @@ impl AppState {
         }
 
         let content = std::mem::take(&mut self.input);
+        self.close_slash_command_menu();
         self.messages.push(Message::text(Role::User, content, None));
         self.scroll_offset = 0;
         true
@@ -238,6 +321,7 @@ impl AppState {
     pub(crate) fn open_resume(&mut self, entries: Vec<ResumeEntry>) {
         self.resume_entries = Some(entries);
         self.resume_index = 0;
+        self.resume_offset = 0;
     }
 
     pub(crate) fn close_resume(&mut self) {
@@ -333,6 +417,33 @@ impl AppState {
         }
     }
 
+    pub(crate) fn select_resume(&mut self, index: usize) {
+        if self
+            .resume_entries
+            .as_ref()
+            .is_some_and(|entries| index < entries.len())
+        {
+            self.resume_index = index;
+        }
+    }
+
+    pub(crate) fn set_resume_viewport(&mut self, first_row: u16, visible_rows: u16, offset: usize) {
+        self.resume_first_row = first_row;
+        self.resume_visible_rows = visible_rows;
+        self.resume_offset = offset;
+    }
+
+    pub(crate) fn resume_index_at_row(&self, row: u16) -> Option<usize> {
+        let relative_row = row.checked_sub(self.resume_first_row)?;
+        if relative_row >= self.resume_visible_rows {
+            return None;
+        }
+        let index = self.resume_offset + usize::from(relative_row);
+        self.resume_entries
+            .as_ref()
+            .and_then(|entries| (index < entries.len()).then_some(index))
+    }
+
     pub(crate) fn scroll_up(&mut self, lines: u16) {
         self.scroll_offset = self
             .scroll_offset
@@ -371,11 +482,72 @@ impl AppState {
             );
         }
     }
+
+    fn update_slash_command_menu(&mut self) {
+        self.slash_command_menu_open = self.input.starts_with('/')
+            && SLASH_COMMANDS
+                .iter()
+                .any(|command| command.name.starts_with(&self.input));
+        self.slash_command_index = 0;
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, MessageKind, Role};
+    use super::{AppState, MessageKind, ResumeEntry, Role};
+
+    #[test]
+    fn slash_commands_filter_navigate_and_insert_without_submitting() {
+        let mut state = AppState::new();
+        state.insert_char('/');
+
+        assert_eq!(state.slash_commands().count(), 3);
+        state.select_next_slash_command();
+        state.select_next_slash_command();
+        state.insert_selected_slash_command();
+
+        assert_eq!(state.input, "/model");
+        assert!(!state.slash_command_menu_open());
+        assert!(state.messages.is_empty());
+    }
+
+    #[test]
+    fn resume_picker_selects_entry_by_index() {
+        let mut state = AppState::new();
+        state.open_resume(vec![
+            ResumeEntry {
+                id: "first".to_owned(),
+                title: "First".to_owned(),
+                updated_at_ms: 0,
+            },
+            ResumeEntry {
+                id: "second".to_owned(),
+                title: "Second".to_owned(),
+                updated_at_ms: 0,
+            },
+        ]);
+
+        state.select_resume(1);
+
+        assert_eq!(state.selected_resume_id(), Some("second"));
+    }
+
+    #[test]
+    fn slash_command_menu_hides_for_unknown_input_and_escape() {
+        let mut state = AppState::new();
+        for character in "/unknown".chars() {
+            state.insert_char(character);
+        }
+        assert!(!state.slash_command_menu_open());
+
+        for _ in 0..7 {
+            state.backspace();
+        }
+        assert!(state.slash_command_menu_open());
+
+        state.close_slash_command_menu();
+        assert!(!state.slash_command_menu_open());
+    }
 
     #[test]
     fn submit_appends_only_the_user_turn_until_the_worker_replies() {

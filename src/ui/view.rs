@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use super::transcript::render_message;
@@ -116,33 +116,39 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
     }
 
     if let Some(entries) = &state.resume_entries {
+        let list_area = Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 3);
+        let footer_area = Rect::new(area.x + 1, area.bottom() - 2, area.width - 2, 1);
         let items = if entries.is_empty() {
-            "No previous sessions for this project".to_owned()
+            vec![ListItem::new("No previous sessions for this project")]
         } else {
             entries
                 .iter()
-                .enumerate()
-                .map(|(index, entry)| {
-                    let marker = if index == state.resume_index {
-                        ">"
-                    } else {
-                        " "
-                    };
-                    format!("{marker} {}", entry.title)
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+                .map(|entry| ListItem::new(entry.title.as_str()))
+                .collect()
         };
+        let mut list_state = ListState::default()
+            .with_offset(state.resume_offset)
+            .with_selected((!entries.is_empty()).then_some(state.resume_index));
+        frame.render_widget(Clear, area);
         frame.render_widget(
-            Paragraph::new(format!(
-                "Resume conversation\n\n{items}\n\nEnter resume   Esc back"
-            ))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(MUTED_STYLE),
-            ),
+            Block::default()
+                .title("Resume conversation")
+                .borders(Borders::ALL)
+                .border_style(MUTED_STYLE),
             area,
+        );
+        frame.render_stateful_widget(
+            List::new(items)
+                .style(SCREEN_STYLE)
+                .highlight_style(PRIMARY_STYLE)
+                .highlight_symbol("> "),
+            list_area,
+            &mut list_state,
+        );
+        state.set_resume_viewport(list_area.y, list_area.height, list_state.offset());
+        frame.render_widget(
+            Paragraph::new("Click or ↑/↓ select   Enter resume   Esc back").style(MUTED_STYLE),
+            footer_area,
         );
         return;
     }
@@ -159,9 +165,17 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
 
     let composer_height = composer_height(&state.input);
     let status_height = u16::from(state.status.is_some());
-    let [transcript_area, status_area, composer_area, footer_area] = Layout::vertical([
+    let slash_command_height = state.slash_commands().count().min(u16::MAX as usize) as u16;
+    let [
+        transcript_area,
+        status_area,
+        slash_command_area,
+        composer_area,
+        footer_area,
+    ] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(status_height),
+        Constraint::Length(slash_command_height),
         Constraint::Length(composer_height),
         Constraint::Length(1),
     ])
@@ -169,6 +183,7 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
 
     draw_transcript(frame, transcript_area, state);
     draw_status_bar(frame, status_area, state);
+    draw_slash_commands(frame, slash_command_area, state);
     draw_composer(frame, composer_area, state);
     draw_footer(frame, footer_area, state);
 }
@@ -232,6 +247,27 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
         Paragraph::new(Span::styled(status, STATUS_STYLE)).style(SCREEN_STYLE),
         area,
     );
+}
+
+fn draw_slash_commands(frame: &mut Frame, area: Rect, state: &AppState) {
+    let items = state
+        .slash_commands()
+        .enumerate()
+        .map(|(index, command)| {
+            let marker = if index == state.slash_command_index {
+                ">"
+            } else {
+                " "
+            };
+            Line::from(vec![
+                Span::styled(format!("{marker} {}", command.name), PRIMARY_STYLE),
+                Span::styled(format!("  {}", command.description), MUTED_STYLE),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if !items.is_empty() {
+        frame.render_widget(Paragraph::new(items).style(SCREEN_STYLE), area);
+    }
 }
 
 fn draw_composer(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -381,7 +417,7 @@ mod tests {
     use super::{MINIMUM_HEIGHT, MINIMUM_WIDTH, draw};
     use crate::ui::{
         startup::StartupProviderStatus,
-        state::{AppState, ModelSelection, ProviderAccessState, ProviderChoice},
+        state::{AppState, ModelSelection, ProviderAccessState, ProviderChoice, ResumeEntry},
     };
 
     fn render(state: &mut AppState, width: u16, height: u16) -> String {
@@ -537,6 +573,42 @@ mod tests {
 
         assert!(!rendered.contains("first-composer-line"));
         assert!(rendered.contains("fifth-composer-line"));
+    }
+
+    #[test]
+    fn slash_command_menu_lists_matching_commands_above_the_composer() {
+        let mut state = AppState::new();
+        state.trusted = true;
+        state.insert_char('/');
+
+        let rendered = render(&mut state, 80, 24);
+
+        assert!(rendered.contains("> /register  Prepare this project"));
+        assert!(rendered.contains("/resume  Resume a conversation"));
+        assert!(rendered.contains("/model  Switch model"));
+    }
+
+    #[test]
+    fn resume_picker_keeps_the_selected_session_visible() {
+        let mut state = AppState::new();
+        state.trusted = true;
+        state.open_resume(
+            (0..23)
+                .map(|index| ResumeEntry {
+                    id: format!("id-{index}"),
+                    title: format!("Session {index}"),
+                    updated_at_ms: index,
+                })
+                .collect(),
+        );
+        for _ in 0..22 {
+            state.select_next_resume();
+        }
+
+        let rendered = render(&mut state, 80, 12);
+
+        assert!(rendered.contains("> Session 22"));
+        assert!(!rendered.contains("> Session 21"));
     }
 
     #[test]

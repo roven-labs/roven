@@ -13,7 +13,7 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEventKind,
+        KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
@@ -35,7 +35,10 @@ use crate::{
 
 use super::{
     startup,
-    state::{AppState, Message, ProviderAccessState, ProviderChoice, ResumeEntry, Role},
+    state::{
+        AppState, Message, ProviderAccessState, ProviderChoice, ResumeEntry, Role, SlashCommand,
+        slash_command,
+    },
     view,
 };
 
@@ -60,7 +63,7 @@ const REGISTER_PROJECT_PROMPT: &str = include_str!(concat!(
 ));
 
 fn slash_command_prompt(input: &str) -> Option<&'static str> {
-    (input.trim() == "/register").then_some(REGISTER_PROJECT_PROMPT)
+    (slash_command(input) == Some(SlashCommand::Register)).then_some(REGISTER_PROJECT_PROMPT)
 }
 
 pub(crate) fn run(runtime_log: Option<RuntimeLog>) -> anyhow::Result<()> {
@@ -181,6 +184,15 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                     code: KeyCode::Down,
                     ..
                 }) => state.select_next_resume(),
+                Event::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    row,
+                    ..
+                }) => {
+                    if let Some(index) = state.resume_index_at_row(row) {
+                        state.select_resume(index);
+                    }
+                }
                 Event::Key(KeyEvent {
                     code: KeyCode::Enter,
                     ..
@@ -263,6 +275,26 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
         }
         match event {
             Event::Key(KeyEvent {
+                code: KeyCode::Esc,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            }) if state.slash_command_menu_open() => state.close_slash_command_menu(),
+            Event::Key(KeyEvent {
+                code: KeyCode::Up,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            }) if state.slash_command_menu_open() => state.select_previous_slash_command(),
+            Event::Key(KeyEvent {
+                code: KeyCode::Down,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            }) if state.slash_command_menu_open() => state.select_next_slash_command(),
+            Event::Key(KeyEvent {
+                code: KeyCode::Tab,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            }) if state.slash_command_menu_open() => state.insert_selected_slash_command(),
+            Event::Key(KeyEvent {
                 code: KeyCode::Enter,
                 modifiers,
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
@@ -272,9 +304,15 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                 code: KeyCode::Enter,
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
                 ..
+            }) if state.slash_command_menu_open() => state.insert_selected_slash_command(),
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
             }) => {
                 let raw = state.input.clone();
-                if raw.trim() == "/resume" {
+                let command = slash_command(&raw);
+                if command == Some(SlashCommand::Resume) {
                     state.input.clear();
                     let entries = store
                         .as_ref()
@@ -289,7 +327,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                         .collect();
                     state.open_resume(entries);
                     log_event(runtime_log, "resume_picker_opened", "outcome=ok");
-                } else if raw.trim() == "/model" {
+                } else if command == Some(SlashCommand::Model) {
                     state.input.clear();
                     if let Err(error) = open_model_switch(&mut state) {
                         state.activity(error);
@@ -297,6 +335,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                 } else if state.submit() {
                     refresh_provider_model(&mut state);
                     let user = state.last_user_message().unwrap_or_default().to_owned();
+                    let stored_user = slash_command_prompt(&user).unwrap_or(&user).to_owned();
                     let project_store = store.as_ref().expect("trusted store");
                     if session.is_none() {
                         session =
@@ -313,7 +352,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                     project_store
                         .append_event(
                             &active_session.id,
-                            &ConversationEvent::message(EventKind::User, user.clone(), None),
+                            &ConversationEvent::message(EventKind::User, stored_user, None),
                         )
                         .inspect_err(|error| {
                             log_event(
@@ -881,7 +920,15 @@ fn event_to_message(event: ConversationEvent) -> Message {
             event.tool_input.unwrap_or(Value::Null),
             event.tool_output.unwrap_or(Value::Null),
         ),
-        _ => Message::text(role, event.content, event.duration_ms),
+        _ => Message::text(
+            role,
+            if event.content == REGISTER_PROJECT_PROMPT {
+                "/register".to_owned()
+            } else {
+                event.content
+            },
+            event.duration_ms,
+        ),
     }
 }
 
@@ -942,7 +989,7 @@ mod tests {
         storage::{ConversationEvent, EventKind, ProjectStore},
         ui::{
             startup::StartupProviderStatus,
-            state::{AppState, ModelSelection, Role},
+            state::{AppState, ModelSelection, ResumeEntry, Role},
         },
     };
 
@@ -1023,20 +1070,78 @@ mod tests {
     }
 
     #[test]
-    fn register_slash_command_expands_to_the_registration_prompt() {
+    fn register_slash_command_expands_only_in_agent_context() {
         let prompt = super::slash_command_prompt("  /register  ").expect("command should expand");
 
         assert!(prompt.contains("prepare_project"));
         assert!(prompt.contains("summary"));
-        assert!(prompt.contains("read-only project tools"));
-        assert!(prompt.contains("Report success only when the summary has actually been saved"));
-        assert!(prompt.contains("Do not modify project files"));
-        assert!(super::slash_command_prompt("/unknown").is_none());
+        assert!(super::slash_command("/unknown").is_none());
+        assert_eq!(
+            super::slash_command("/resume"),
+            Some(super::SlashCommand::Resume)
+        );
+        assert_eq!(
+            super::slash_command("/model"),
+            Some(super::SlashCommand::Model)
+        );
     }
 
     #[test]
-    fn register_slash_command_stays_visible_while_only_the_agent_message_expands() {
+    fn resume_picker_maps_session_rows_to_indices() {
+        let mut state = AppState::new();
+        state.open_resume(vec![
+            ResumeEntry {
+                id: "first".to_owned(),
+                title: "First".to_owned(),
+                updated_at_ms: 0,
+            },
+            ResumeEntry {
+                id: "second".to_owned(),
+                title: "Second".to_owned(),
+                updated_at_ms: 0,
+            },
+        ]);
+        state.set_resume_viewport(6, 2, 0);
+
+        assert_eq!(state.resume_index_at_row(6), Some(0));
+        assert_eq!(state.resume_index_at_row(7), Some(1));
+        assert_eq!(state.resume_index_at_row(5), None);
+        assert_eq!(state.resume_index_at_row(8), None);
+    }
+
+    #[test]
+    fn register_slash_command_stays_visible_while_agent_context_expands() {
         let root = temp_root("register-command-display");
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let store = ProjectStore::for_project(&root, &project).unwrap();
+        let session = store.create_session("/register").unwrap();
+        let prompt = super::slash_command_prompt("/register").unwrap();
+        store
+            .append_event(
+                &session.id,
+                &ConversationEvent::message(EventKind::User, prompt.to_owned(), None),
+            )
+            .unwrap();
+
+        let messages = super::request_messages(&store, &session, "").unwrap();
+
+        assert_eq!(session.title, "/register");
+        assert_eq!(store.events(&session.id).unwrap()[0].content, prompt);
+        assert!(matches!(
+            messages.last(),
+            Some(AgentMessage::User { content }) if content == prompt
+        ));
+        assert_eq!(
+            super::event_to_message(store.events(&session.id).unwrap()[0].clone()).content,
+            "/register"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_register_events_expand_in_agent_context() {
+        let root = temp_root("legacy-register-command");
         let project = root.join("project");
         fs::create_dir_all(&project).unwrap();
         let store = ProjectStore::for_project(&root, &project).unwrap();
@@ -1050,8 +1155,6 @@ mod tests {
 
         let messages = super::request_messages(&store, &session, "").unwrap();
 
-        assert_eq!(session.title, "/register");
-        assert_eq!(store.events(&session.id).unwrap()[0].content, "/register");
         assert!(matches!(
             messages.last(),
             Some(AgentMessage::User { content }) if content == super::REGISTER_PROJECT_PROMPT
