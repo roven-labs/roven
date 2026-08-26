@@ -104,6 +104,46 @@ pub(crate) enum ModelSelection {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlashCommand {
+    Register,
+    Resume,
+    Model,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlashCommandInfo {
+    pub(crate) command: SlashCommand,
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+}
+
+const SLASH_COMMANDS: [SlashCommandInfo; 3] = [
+    SlashCommandInfo {
+        command: SlashCommand::Register,
+        name: "/register",
+        description: "Prepare this project",
+    },
+    SlashCommandInfo {
+        command: SlashCommand::Resume,
+        name: "/resume",
+        description: "Resume a conversation",
+    },
+    SlashCommandInfo {
+        command: SlashCommand::Model,
+        name: "/model",
+        description: "Switch model",
+    },
+];
+
+pub(crate) fn slash_command(input: &str) -> Option<SlashCommand> {
+    let input = input.trim();
+    SLASH_COMMANDS
+        .iter()
+        .find(|command| command.name == input)
+        .map(|command| command.command)
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct AppState {
     pub(crate) messages: Vec<Message>,
@@ -123,6 +163,8 @@ pub(crate) struct AppState {
     pub(crate) resume_index: usize,
     pub(crate) model_selection: Option<ModelSelection>,
     pub(crate) startup_provider_status: Option<StartupProviderStatus>,
+    slash_command_menu_open: bool,
+    pub(crate) slash_command_index: usize,
 }
 
 impl AppState {
@@ -140,18 +182,55 @@ impl AppState {
     pub(crate) fn insert_char(&mut self, character: char) {
         if self.resume_entries.is_none() && self.model_selection.is_none() {
             self.input.push(character);
+            self.update_slash_command_menu();
         }
     }
 
     pub(crate) fn backspace(&mut self) {
         if self.resume_entries.is_none() && self.model_selection.is_none() {
             self.input.pop();
+            self.update_slash_command_menu();
         }
     }
 
     pub(crate) fn insert_newline(&mut self) {
         if self.resume_entries.is_none() && self.model_selection.is_none() {
             self.input.push('\n');
+            self.update_slash_command_menu();
+        }
+    }
+
+    pub(crate) fn slash_commands(&self) -> impl Iterator<Item = SlashCommandInfo> + '_ {
+        SLASH_COMMANDS.into_iter().filter(move |command| {
+            self.slash_command_menu_open && !self.running && command.name.starts_with(&self.input)
+        })
+    }
+
+    pub(crate) fn slash_command_menu_open(&self) -> bool {
+        self.slash_commands().next().is_some()
+    }
+
+    pub(crate) fn close_slash_command_menu(&mut self) {
+        self.slash_command_menu_open = false;
+    }
+
+    pub(crate) fn select_previous_slash_command(&mut self) {
+        self.slash_command_index = self.slash_command_index.saturating_sub(1);
+    }
+
+    pub(crate) fn select_next_slash_command(&mut self) {
+        self.slash_command_index =
+            (self.slash_command_index + 1).min(self.slash_commands().count().saturating_sub(1));
+    }
+
+    pub(crate) fn insert_selected_slash_command(&mut self) {
+        let command_name = self
+            .slash_commands()
+            .nth(self.slash_command_index)
+            .map(|command| command.name);
+        if let Some(command_name) = command_name {
+            self.input = command_name.to_owned();
+            self.close_slash_command_menu();
         }
     }
 
@@ -165,6 +244,7 @@ impl AppState {
         }
 
         let content = std::mem::take(&mut self.input);
+        self.close_slash_command_menu();
         self.messages.push(Message::text(Role::User, content, None));
         self.scroll_offset = 0;
         true
@@ -371,11 +451,51 @@ impl AppState {
             );
         }
     }
+
+    fn update_slash_command_menu(&mut self) {
+        self.slash_command_menu_open = self.input.starts_with('/')
+            && SLASH_COMMANDS
+                .iter()
+                .any(|command| command.name.starts_with(&self.input));
+        self.slash_command_index = 0;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AppState, MessageKind, Role};
+
+    #[test]
+    fn slash_commands_filter_navigate_and_insert_without_submitting() {
+        let mut state = AppState::new();
+        state.insert_char('/');
+
+        assert_eq!(state.slash_commands().count(), 3);
+        state.select_next_slash_command();
+        state.select_next_slash_command();
+        state.insert_selected_slash_command();
+
+        assert_eq!(state.input, "/model");
+        assert!(!state.slash_command_menu_open());
+        assert!(state.messages.is_empty());
+    }
+
+    #[test]
+    fn slash_command_menu_hides_for_unknown_input_and_escape() {
+        let mut state = AppState::new();
+        for character in "/unknown".chars() {
+            state.insert_char(character);
+        }
+        assert!(!state.slash_command_menu_open());
+
+        for _ in 0..7 {
+            state.backspace();
+        }
+        assert!(state.slash_command_menu_open());
+
+        state.close_slash_command_menu();
+        assert!(!state.slash_command_menu_open());
+    }
 
     #[test]
     fn submit_appends_only_the_user_turn_until_the_worker_replies() {

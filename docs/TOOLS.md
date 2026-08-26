@@ -6,9 +6,11 @@ workflow definition.
 
 ## Slash commands
 
-- `/register` submits Roven's built-in project-registration prompt, prepares
-  the current trusted workspace, reads the codebase, and stores a concise
-  report through `prepare_project`.
+- `/register` expands Roven's built-in project-registration prompt, which
+  prepares the current trusted workspace, reads the codebase, and stores a
+  concise report through `prepare_project`.
+- `/resume` opens the saved conversations for the current project.
+- `/model` opens the provider and model picker.
 
 ## At a glance
 
