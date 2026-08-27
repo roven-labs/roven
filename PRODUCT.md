@@ -22,6 +22,11 @@ native `/api/chat` endpoint are handled by separate protocol adapters.
 - Bare `roven` opens the trust gate and terminal chat.
 - `/register` validates the current trusted project, inspects it through the
   read-only tools, and saves a compact evidence summary locally.
+- `/generate-resume <job description>` generates a Markdown project section
+  from the job description and stored project summaries only. Generation does
+  not read the workspace or repository, expose provider tools, or invent
+  achievements, metrics, technologies, or responsibilities. Output is stored
+  at `%LOCALAPPDATA%\Roven\data\resumes\<uuid>.md`.
 - `/resume` lists sessions for the current canonical workspace.
 - `Esc` requests cancellation of an active provider stream.
 
@@ -54,6 +59,7 @@ sessions/<workspace-sha256>/<uuid>/    conversation sessions
   meta.json                            session identity and timestamps
   events.jsonl                         conversation and tool-call events
 ollama-stream-failures.log             raw Ollama stream data after failures
+resumes/<uuid>.md                       generated resume project sections
 log.md                                 operational diagnostics only
 ```
 
@@ -73,3 +79,5 @@ can contain raw model output and tool-call arguments.
 - Roven provides a read-only raw project file-reading tool for regular UTF-8
   files up to 50 KiB inside the trusted workspace. It does not provide
   automatic provider retries or automatic context summarization.
+- Resume project-section generation uses stored project summaries as its sole
+  project evidence and does not read the workspace/repository or provide tools.

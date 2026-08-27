@@ -29,6 +29,11 @@ commands.
 - After trust, the optional root `ROVEN.md` is loaded as project instructions.
 - `/register` submits the built-in project-registration prompt, prepares the
   current trusted workspace, reads the codebase, and stores a concise report.
+- `/generate-resume <job description>` generates a Markdown project section
+  using only the job description and stored project summaries. It does not read
+  the workspace or repository, expose provider tools, or invent achievements,
+  metrics, technologies, or responsibilities. Output is stored at
+  `%LOCALAPPDATA%\Roven\data\resumes\<uuid>.md`.
 - `/resume` opens sessions for the current workspace. `Esc` cancels an active
   provider stream while retaining received content.
 
@@ -64,6 +69,7 @@ sessions\<workspace-sha256>\<session-uuid>\meta.json
 sessions\<workspace-sha256>\<session-uuid>\events.jsonl
 log.md
 ollama-stream-failures.log  (created only when an Ollama stream fails)
+resumes\<uuid>.md
 ```
 
 API keys are stored only in the operating-system credential store. Session
@@ -82,6 +88,9 @@ up to 50 KiB through `read_file`, using workspace-relative paths inside the
 trusted workspace. It does not provide arbitrary command execution, automatic
 provider retries, or automatic project-context summarization. The agent only
 receives data returned by the available tools and the optional root `ROVEN.md`.
+Resume project-section generation uses stored project summaries as its sole
+project evidence and performs no workspace/repository reads or provider-tool
+calls.
 
 ## Install
 
