@@ -80,6 +80,48 @@ fn resume_generation_prompt(job_description: &str, evidence: &[ProjectEvidence])
     )
 }
 
+#[derive(Debug, Clone)]
+struct ResumeGeneration {
+    provider_prompt: String,
+}
+
+impl ResumeGeneration {
+    fn apply_to_provider_messages(&self, messages: &mut [AgentMessage]) {
+        if let Some(AgentMessage::User { content }) = messages.last_mut() {
+            *content = self.provider_prompt.clone();
+        }
+    }
+
+    const fn allow_tools(&self) -> bool {
+        false
+    }
+}
+
+fn prepare_resume_generation(
+    input: &str,
+    load_evidence: impl FnOnce() -> Result<Vec<ProjectEvidence>, String>,
+) -> Result<Option<ResumeGeneration>, String> {
+    if input.trim() == "/generate-resume" {
+        return Err("Enter a job description after /generate-resume.".to_owned());
+    }
+    let Some(job_description) = generate_resume_job_description(input) else {
+        return Ok(None);
+    };
+    let mut evidence = load_evidence()?;
+    evidence
+        .retain(|project| !project.name.trim().is_empty() && !project.summary.trim().is_empty());
+    evidence.sort_by(|left, right| left.name.cmp(&right.name));
+    if evidence.is_empty() {
+        return Err(
+            "No project summaries available. Prepare projects before generating a resume."
+                .to_owned(),
+        );
+    }
+    Ok(Some(ResumeGeneration {
+        provider_prompt: resume_generation_prompt(job_description, &evidence),
+    }))
+}
+
 pub(crate) fn run(runtime_log: Option<RuntimeLog>) -> anyhow::Result<()> {
     log_event(runtime_log.as_ref(), "terminal_starting", "outcome=started");
     let mut guard = TerminalGuard::enter()?;
@@ -329,25 +371,20 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
             }) => {
                 let raw = state.input.clone();
                 let command = slash_command(&raw);
-                let resume_job_description = generate_resume_job_description(&raw);
-                let resume_prompt = resume_job_description.and_then(|job_description| {
-                    let evidence = match ProjectRegistry::for_current_user()
+                let resume_generation = match prepare_resume_generation(&raw, || {
+                    ProjectRegistry::for_current_user()
                         .and_then(|registry| registry.resume_evidence())
-                    {
-                        Ok(evidence) if !evidence.is_empty() => evidence,
-                        Ok(_) => {
-                            state.activity(
-                                "No project summaries available. Prepare projects before generating a resume.",
-                            );
-                            return None;
+                        .map_err(|error| format!("Could not read project evidence: {error}"))
+                }) {
+                    Ok(resume_generation) => resume_generation,
+                    Err(error) => {
+                        if raw.trim() == "/generate-resume" {
+                            state.input.clear();
                         }
-                        Err(error) => {
-                            state.activity(format!("Could not read project evidence: {error}"));
-                            return None;
-                        }
-                    };
-                    Some(resume_generation_prompt(job_description, &evidence))
-                });
+                        state.activity(error);
+                        continue;
+                    }
+                };
                 if command == Some(SlashCommand::Resume) {
                     state.input.clear();
                     let entries = store
@@ -368,12 +405,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                     if let Err(error) = open_model_switch(&mut state) {
                         state.activity(error);
                     }
-                } else if raw.trim() == "/generate-resume" {
-                    state.input.clear();
-                    state.activity("Enter a job description after /generate-resume.");
-                } else if (resume_job_description.is_none() || resume_prompt.is_some())
-                    && state.submit()
-                {
+                } else if state.submit() {
                     refresh_provider_model(&mut state);
                     let user = state.last_user_message().unwrap_or_default().to_owned();
                     let stored_user = slash_command_prompt(&user).unwrap_or(&user).to_owned();
@@ -404,13 +436,10 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                         })?;
                     let mut messages =
                         request_messages(project_store, active_session, &project_instructions)?;
-                    let is_resume_generation = resume_prompt.is_some();
-                    if let Some(prompt) = resume_prompt {
-                        if let Some(AgentMessage::User { content }) = messages.last_mut() {
-                            *content = prompt;
-                        }
+                    if let Some(resume_generation) = &resume_generation {
+                        resume_generation.apply_to_provider_messages(&mut messages);
                     }
-                    if is_resume_generation {
+                    if resume_generation.is_some() {
                         state.start_resume_generation();
                     } else {
                         state.start_agent();
@@ -429,7 +458,9 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                         messages,
                         tool_context,
                         runtime_log.cloned(),
-                        !is_resume_generation,
+                        resume_generation
+                            .as_ref()
+                            .map_or(true, ResumeGeneration::allow_tools),
                     );
                 }
             }
@@ -1045,15 +1076,16 @@ mod tests {
     use std::{
         cell::RefCell,
         fs,
-        sync::{Mutex, OnceLock},
+        sync::{Mutex, OnceLock, atomic::AtomicBool},
     };
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use crate::{
-        agent::AgentMessage,
+        agent::{self, AgentEvent, AgentMessage, AgentRequest, AgentRun, ProviderEvent},
         credentials::{CredentialError, SecretStore},
         profiles::{ProviderProfile, ProviderProfiles},
+        provider::{Provider, ProviderError},
         storage::{ConversationEvent, EventKind, ProjectStore},
         ui::{
             startup::StartupProviderStatus,
@@ -1061,7 +1093,10 @@ mod tests {
         },
     };
 
-    use super::{WorkerEvent, apply_worker_event_with_resume_store, resume_generation_prompt};
+    use super::{
+        WorkerEvent, apply_worker_event_with_resume_store, prepare_resume_generation,
+        resume_generation_prompt,
+    };
     use crate::storage::{ProjectEvidence, ResumeStore};
     use crate::tools::{RovenToolCall, RovenToolResult};
 
@@ -1082,6 +1117,28 @@ mod tests {
 
         fn delete(&self) -> Result<bool, CredentialError> {
             Ok(self.value.borrow_mut().take().is_some())
+        }
+    }
+
+    struct UnexpectedToolCallProvider;
+
+    impl Provider for UnexpectedToolCallProvider {
+        fn stream(
+            &self,
+            _api_key: &str,
+            request: &AgentRequest,
+            _cancelled: &AtomicBool,
+            _runtime_log: Option<&crate::runtime_log::RuntimeLog>,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderError> {
+            assert!(request.tools.is_empty());
+            emit(ProviderEvent::ToolCalls(vec![RovenToolCall {
+                id: "unexpected".to_owned(),
+                name: "list_tools".to_owned(),
+                arguments: serde_json::json!({}),
+            }]));
+            emit(ProviderEvent::Finished);
+            Ok(())
         }
     }
 
@@ -1171,6 +1228,107 @@ mod tests {
     }
 
     #[test]
+    fn resume_generation_preparation_blocks_blank_and_missing_evidence_before_worker() {
+        let blank = prepare_resume_generation("/generate-resume", || {
+            panic!("blank requests must not load evidence")
+        });
+        assert!(blank.unwrap_err().contains("Enter a job description"));
+
+        let missing = prepare_resume_generation("/generate-resume\nRust role", || Ok(Vec::new()));
+        assert!(
+            missing
+                .unwrap_err()
+                .contains("No project summaries available")
+        );
+    }
+
+    #[test]
+    fn resume_generation_terminal_turn_preserves_raw_history_and_rejects_tools() {
+        let generation = prepare_resume_generation("/generate-resume\nRust role", || {
+            Ok(vec![
+                ProjectEvidence {
+                    name: "Zeta".to_owned(),
+                    summary: "Zeta summary".to_owned(),
+                },
+                ProjectEvidence {
+                    name: "Ignored".to_owned(),
+                    summary: "   ".to_owned(),
+                },
+                ProjectEvidence {
+                    name: "Alpha".to_owned(),
+                    summary: "Alpha summary".to_owned(),
+                },
+            ])
+        })
+        .unwrap()
+        .expect("evidence should start a resume turn");
+        assert!(
+            generation.provider_prompt.find("Project: Alpha")
+                < generation.provider_prompt.find("Project: Zeta")
+        );
+        assert!(!generation.provider_prompt.contains("Ignored"));
+
+        let data = temp_root("resume-generation-history-data");
+        let project = temp_root("resume-generation-history-project");
+        let store = ProjectStore::for_project(&data, &project).unwrap();
+        let raw = "/generate-resume\nRust role";
+        let session = store.create_session(raw).unwrap();
+        store
+            .append_event(
+                &session.id,
+                &ConversationEvent::message(EventKind::User, raw.to_owned(), None),
+            )
+            .unwrap();
+        let mut messages = super::request_messages(&store, &session, "").unwrap();
+        generation.apply_to_provider_messages(&mut messages);
+
+        assert_eq!(store.events(&session.id).unwrap()[0].content, raw);
+        assert!(matches!(
+            messages.last(),
+            Some(AgentMessage::User { content }) if content == &generation.provider_prompt
+        ));
+        assert!(!generation.allow_tools());
+        assert!(
+            AgentRequest::new(messages.clone(), generation.allow_tools())
+                .tools
+                .is_empty()
+        );
+
+        let workspace = temp_root("resume-generation-no-tools");
+        let context = crate::tools::ToolContext::new(workspace.clone()).unwrap();
+        let events = RefCell::new(Vec::new());
+        let result = agent::run(
+            AgentRun {
+                provider: &UnexpectedToolCallProvider,
+                api_key: "key",
+                tool_context: &context,
+                context_window: None,
+                cancelled: &AtomicBool::new(false),
+                runtime_log: None,
+                allow_tools: generation.allow_tools(),
+            },
+            messages,
+            &mut |event| events.borrow_mut().push(event),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected tool call in no-tools turn")
+        );
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolResult { .. }))
+        );
+
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(project).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
     fn resume_generation_saves_only_completed_visible_assistant_output() {
         let root = temp_root("resume-generation");
         let resumes = ResumeStore::for_data_root(root.clone());
@@ -1221,6 +1379,34 @@ mod tests {
         }
         assert_eq!(fs::read_dir(root.join("resumes")).unwrap().count(), 1);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_generation_reports_save_errors_as_activity() {
+        let parent = temp_root("resume-generation-save-error");
+        let blocked_data_root = parent.join("blocked-data-root");
+        fs::write(&blocked_data_root, "not a directory").unwrap();
+        let resumes = ResumeStore::for_data_root(blocked_data_root);
+        let mut state = AppState::new();
+        state.start_resume_generation();
+        state.append_agent_text("# Projects\n\n- Roven".to_owned());
+
+        apply_worker_event_with_resume_store(
+            &mut state,
+            None,
+            None,
+            Some(&resumes),
+            None,
+            WorkerEvent::Finished,
+        );
+
+        assert!(state.messages.iter().any(|message| {
+            message.role == Role::Activity
+                && message
+                    .content
+                    .starts_with("Could not save generated resume:")
+        }));
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
