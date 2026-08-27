@@ -423,25 +423,23 @@ mod tests {
         layout::Position,
     };
 
-    use super::{MINIMUM_HEIGHT, MINIMUM_WIDTH, ROVEN_MARK, draw};
+    use super::{MINIMUM_HEIGHT, MINIMUM_WIDTH, draw};
     use crate::ui::{
         startup::StartupProviderStatus,
         state::{AppState, ModelSelection, ProviderAccessState, ProviderChoice, ResumeEntry},
     };
 
+    const FIRST_MARK_LINE: &str = "████  ████  ██  ██  ████  ██  ██";
+    const EXPECTED_MARK: [&str; 5] = [
+        "████  ████  ██  ██  ████  ██  ██",
+        "██ ██ ██ ██ ██  ██  ██    ███ ██",
+        "████  ██ ██ ██  ██  ███   ██ ███",
+        "██ ██ ██ ██  ██ ██  ██    ██  ██",
+        "██ ██ ████    ████  ████  ██  ██",
+    ];
+
     fn render(state: &mut AppState, width: u16, height: u16) -> String {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
-        terminal
-            .draw(|frame| draw(frame, state))
-            .expect("frame should render");
-        terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect()
+        render_rows(state, width, height).concat()
     }
 
     fn render_rows(state: &mut AppState, width: u16, height: u16) -> Vec<String> {
@@ -548,7 +546,7 @@ mod tests {
         state.trusted = true;
 
         let empty = render(&mut state, 80, 24);
-        assert!(empty.contains("████  ████  ██  ██  ████  ██  ██"));
+        assert!(empty.contains(FIRST_MARK_LINE));
 
         state.input = "Hello".to_owned();
         assert!(state.submit());
@@ -563,7 +561,7 @@ mod tests {
         state.trusted = true;
         let rows = render_rows(&mut state, 80, 24);
 
-        for (row, mark_line) in rows[7..12].iter().zip(ROVEN_MARK.lines()) {
+        for (row, mark_line) in rows[7..12].iter().zip(EXPECTED_MARK) {
             assert_eq!(row.trim(), mark_line);
             let left_padding = row
                 .chars()
@@ -581,13 +579,13 @@ mod tests {
         state.trusted = true;
         let rows = render_rows(&mut state, 40, 8);
 
-        for (row, mark_line) in rows[..4].iter().zip(ROVEN_MARK.lines()) {
+        for (row, mark_line) in rows[..4].iter().zip(EXPECTED_MARK) {
             assert_eq!(row.trim(), mark_line);
         }
         assert!(
             rows[4..]
                 .iter()
-                .all(|row| !row.contains(ROVEN_MARK.lines().nth(4).unwrap()))
+                .all(|row| !row.contains(EXPECTED_MARK[4]))
         );
     }
 
@@ -598,12 +596,12 @@ mod tests {
 
         state.input = "Draft".to_owned();
         let first_draft = render(&mut state, 80, 24);
-        assert!(first_draft.contains("████  ████  ██  ██  ████  ██  ██"));
+        assert!(first_draft.contains(FIRST_MARK_LINE));
         assert!(first_draft.contains("Draft"));
 
         state.input = "Draft\nsecond line".to_owned();
         let second_draft = render(&mut state, 80, 24);
-        assert!(second_draft.contains("████  ████  ██  ██  ████  ██  ██"));
+        assert!(second_draft.contains(FIRST_MARK_LINE));
         assert!(second_draft.contains("second line"));
     }
 
@@ -615,7 +613,7 @@ mod tests {
         state.insert_char('/');
         let rows = render_rows(&mut state, 80, 24);
 
-        for (row, mark_line) in rows[5..10].iter().zip(ROVEN_MARK.lines()) {
+        for (row, mark_line) in rows[5..10].iter().zip(EXPECTED_MARK) {
             assert_eq!(row.trim(), mark_line);
         }
         assert!(rows[16].contains("Status line"));
