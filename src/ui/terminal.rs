@@ -453,6 +453,7 @@ fn spawn_worker(
                     context_window,
                     cancelled: &cancelled,
                     runtime_log: runtime_log.as_ref(),
+                    allow_tools: true,
                 },
                 messages,
                 &mut |event| {

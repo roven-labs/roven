@@ -3,7 +3,7 @@
 use std::sync::atomic::AtomicBool;
 
 use crate::tools::{
-    RovenToolCall, RovenToolDefinition, RovenToolResult, ToolContext, definitions, dispatch,
+    definitions, dispatch, RovenToolCall, RovenToolDefinition, RovenToolResult, ToolContext,
 };
 use crate::{
     context,
@@ -36,10 +36,10 @@ pub(crate) struct AgentRequest {
 }
 
 impl AgentRequest {
-    pub(crate) fn new(messages: Vec<AgentMessage>) -> Self {
+    pub(crate) fn new(messages: Vec<AgentMessage>, allow_tools: bool) -> Self {
         Self {
             messages,
-            tools: definitions(),
+            tools: allow_tools.then(definitions).unwrap_or_default(),
         }
     }
 }
@@ -75,6 +75,7 @@ pub(crate) struct AgentRun<'a> {
     pub(crate) context_window: Option<usize>,
     pub(crate) cancelled: &'a AtomicBool,
     pub(crate) runtime_log: Option<&'a RuntimeLog>,
+    pub(crate) allow_tools: bool,
 }
 
 /// Continue the same user turn until the provider produces a final response.
@@ -91,9 +92,10 @@ pub(crate) fn run(
         context_window,
         cancelled,
         runtime_log,
+        allow_tools,
     } = agent_run;
     loop {
-        let request = AgentRequest::new(messages.clone());
+        let request = AgentRequest::new(messages.clone(), allow_tools);
         record(
             runtime_log,
             "model_request_started",
@@ -106,6 +108,7 @@ pub(crate) fn run(
         let mut response_content = String::new();
         let mut response_reasoning = String::new();
         let mut tool_calls = None;
+        let mut unexpected_tool_calls = false;
         let mut finished = false;
         let mut was_cancelled = false;
 
@@ -139,6 +142,10 @@ pub(crate) fn run(
                         "tool_calls_received",
                         &format!("count={}", calls.len()),
                     );
+                    if !allow_tools {
+                        unexpected_tool_calls = true;
+                        return;
+                    }
                     tool_calls = Some(calls);
                 }
                 ProviderEvent::ContextUsage(prompt_tokens) => {
@@ -169,6 +176,14 @@ pub(crate) fn run(
                 &format!("error={error}"),
             );
             return Err(error);
+        }
+
+        if unexpected_tool_calls {
+            return Err(ProviderError::diagnostic(
+                "agent",
+                "tool_calls",
+                "unexpected tool call in no-tools turn",
+            ));
         }
 
         if was_cancelled {
@@ -233,12 +248,12 @@ mod tests {
     use std::{cell::RefCell, fs, sync::atomic::AtomicBool};
 
     use crate::{
-        provider::{OpenAiCompatibleProvider, Provider, ProviderError, test_support},
+        provider::{test_support, OpenAiCompatibleProvider, Provider, ProviderError},
         runtime_log::RuntimeLog,
         tools::ToolContext,
     };
 
-    use super::{AgentEvent, AgentMessage, AgentRun, run};
+    use super::{run, AgentEvent, AgentMessage, AgentRun};
 
     fn workspace() -> std::path::PathBuf {
         std::env::current_dir().unwrap().canonicalize().unwrap()
@@ -261,6 +276,68 @@ mod tests {
         }
     }
 
+    struct ToolCallProvider;
+
+    impl Provider for ToolCallProvider {
+        fn stream(
+            &self,
+            _api_key: &str,
+            _request: &super::AgentRequest,
+            _cancelled: &AtomicBool,
+            _runtime_log: Option<&RuntimeLog>,
+            emit: &mut dyn FnMut(super::ProviderEvent),
+        ) -> Result<(), ProviderError> {
+            emit(super::ProviderEvent::ToolCalls(vec![
+                crate::tools::RovenToolCall {
+                    id: "unexpected".to_owned(),
+                    name: "list_tools".to_owned(),
+                    arguments: serde_json::json!({}),
+                },
+            ]));
+            emit(super::ProviderEvent::Finished);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn no_tools_turn_rejects_provider_tool_calls_without_dispatch() {
+        let provider = ToolCallProvider;
+        let tool_context = ToolContext::new(workspace()).unwrap();
+        let events = RefCell::new(Vec::new());
+        let result = run(
+            AgentRun {
+                provider: &provider,
+                api_key: "key",
+                tool_context: &tool_context,
+                context_window: None,
+                cancelled: &AtomicBool::new(false),
+                runtime_log: None,
+                allow_tools: false,
+            },
+            vec![AgentMessage::User {
+                content: "hello".to_owned(),
+            }],
+            &mut |event| events.borrow_mut().push(event),
+        );
+
+        assert!(result.is_err());
+        assert!(!events
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolResult { .. })));
+    }
+
+    #[test]
+    fn no_tools_request_has_no_tool_definitions() {
+        let request = super::AgentRequest::new(
+            vec![AgentMessage::User {
+                content: "hello".to_owned(),
+            }],
+            false,
+        );
+        assert!(request.tools.is_empty());
+    }
+
     #[test]
     fn final_response_streams_every_chunk_and_finishes() {
         let (endpoint, server) = test_support::serve(vec![test_support::sse(
@@ -277,6 +354,7 @@ mod tests {
                 context_window: None,
                 cancelled: &AtomicBool::new(false),
                 runtime_log: None,
+                allow_tools: true,
             },
             vec![AgentMessage::User {
                 content: "hello".to_owned(),
@@ -321,6 +399,7 @@ mod tests {
                 context_window: None,
                 cancelled: &AtomicBool::new(false),
                 runtime_log: None,
+                allow_tools: true,
             },
             vec![AgentMessage::User {
                 content: "register this".to_owned(),
@@ -362,6 +441,7 @@ mod tests {
                 context_window: None,
                 cancelled: &AtomicBool::new(false),
                 runtime_log: None,
+                allow_tools: true,
             },
             vec![AgentMessage::User {
                 content: "read Cargo.toml".to_owned(),
@@ -406,6 +486,7 @@ mod tests {
                 context_window: None,
                 cancelled: &AtomicBool::new(false),
                 runtime_log: Some(&log),
+                allow_tools: true,
             },
             vec![AgentMessage::User {
                 content: "hello".to_owned(),
@@ -417,11 +498,9 @@ mod tests {
             result,
             Err(ProviderError::HttpStatus { status: 500 })
         ));
-        assert!(
-            fs::read_to_string(log_path)
-                .unwrap()
-                .contains("event=model_request_failed")
-        );
+        assert!(fs::read_to_string(log_path)
+            .unwrap()
+            .contains("event=model_request_failed"));
         assert_eq!(server.join().unwrap().len(), 1);
 
         let (endpoint, server) = test_support::serve(vec![test_support::sse(
@@ -437,6 +516,7 @@ mod tests {
                 context_window: None,
                 cancelled: &AtomicBool::new(true),
                 runtime_log: None,
+                allow_tools: true,
             },
             vec![AgentMessage::User {
                 content: "cancel".to_owned(),
@@ -463,6 +543,7 @@ mod tests {
                 context_window: Some(100),
                 cancelled: &cancelled,
                 runtime_log: None,
+                allow_tools: true,
             },
             vec![AgentMessage::User {
                 content: "hello".to_owned(),

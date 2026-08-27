@@ -761,7 +761,7 @@ mod tests {
     fn request_uses_profile_model_and_standard_openai_fields() {
         let request = AgentRequest::new(vec![AgentMessage::User {
             content: "Hello".to_owned(),
-        }]);
+        }], true);
         let request = ChatCompletionsRequest::from_agent("llama-3.3-70b-versatile", &request);
         let value = serde_json::to_value(&request).unwrap();
 
@@ -1030,7 +1030,7 @@ mod tests {
     fn stream_reports_real_http_rate_limits_and_unexpected_eof() {
         let request = AgentRequest::new(vec![AgentMessage::User {
             content: "Hello".to_owned(),
-        }]);
+        }], true);
         let (endpoint, server) = super::test_support::serve(vec![super::test_support::response(
             "429 Too Many Requests",
             &[("retry-after", "7")],
