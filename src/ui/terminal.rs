@@ -97,6 +97,11 @@ impl ResumeGeneration {
     }
 }
 
+struct WorkerTurn {
+    messages: Vec<AgentMessage>,
+    allow_tools: bool,
+}
+
 fn prepare_resume_generation(
     input: &str,
     load_evidence: impl FnOnce() -> Result<Vec<ProjectEvidence>, String>,
@@ -119,6 +124,68 @@ fn prepare_resume_generation(
     }
     Ok(Some(ResumeGeneration {
         provider_prompt: resume_generation_prompt(job_description, &evidence),
+    }))
+}
+
+fn submit_terminal_turn(
+    state: &mut AppState,
+    store: &ProjectStore,
+    session: &mut Option<SessionMeta>,
+    project_instructions: &str,
+    runtime_log: Option<&RuntimeLog>,
+    load_evidence: impl FnOnce() -> Result<Vec<ProjectEvidence>, String>,
+) -> anyhow::Result<Option<WorkerTurn>> {
+    let raw = state.input.clone();
+    let resume_generation = match prepare_resume_generation(&raw, load_evidence) {
+        Ok(resume_generation) => resume_generation,
+        Err(error) => {
+            if raw.trim() == "/generate-resume" {
+                state.input.clear();
+            }
+            state.activity(error);
+            return Ok(None);
+        }
+    };
+    if !state.submit() {
+        return Ok(None);
+    }
+    let user = state.last_user_message().unwrap_or_default().to_owned();
+    let stored_user = slash_command_prompt(&user).unwrap_or(&user).to_owned();
+    if session.is_none() {
+        *session = Some(store.create_session(&user).inspect_err(|error| {
+            log_event(
+                runtime_log,
+                "session_create_failed",
+                &format!("error={error}"),
+            );
+        })?);
+        log_event(runtime_log, "session_created", "outcome=ok");
+    }
+    let active_session = session.as_ref().expect("created session");
+    store
+        .append_event(
+            &active_session.id,
+            &ConversationEvent::message(EventKind::User, stored_user, None),
+        )
+        .inspect_err(|error| {
+            log_event(
+                runtime_log,
+                "session_event_write_failed",
+                &format!("error={error}"),
+            );
+        })?;
+    let mut messages = request_messages(store, active_session, project_instructions)?;
+    if let Some(resume_generation) = &resume_generation {
+        resume_generation.apply_to_provider_messages(&mut messages);
+        state.start_resume_generation();
+    } else {
+        state.start_agent();
+    }
+    Ok(Some(WorkerTurn {
+        messages,
+        allow_tools: resume_generation
+            .as_ref()
+            .map_or(true, ResumeGeneration::allow_tools),
     }))
 }
 
@@ -369,22 +436,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
                 ..
             }) => {
-                let raw = state.input.clone();
-                let command = slash_command(&raw);
-                let resume_generation = match prepare_resume_generation(&raw, || {
-                    ProjectRegistry::for_current_user()
-                        .and_then(|registry| registry.resume_evidence())
-                        .map_err(|error| format!("Could not read project evidence: {error}"))
-                }) {
-                    Ok(resume_generation) => resume_generation,
-                    Err(error) => {
-                        if raw.trim() == "/generate-resume" {
-                            state.input.clear();
-                        }
-                        state.activity(error);
-                        continue;
-                    }
-                };
+                let command = slash_command(&state.input);
                 if command == Some(SlashCommand::Resume) {
                     state.input.clear();
                     let entries = store
@@ -405,62 +457,34 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                     if let Err(error) = open_model_switch(&mut state) {
                         state.activity(error);
                     }
-                } else if state.submit() {
+                } else if let Some(turn) = submit_terminal_turn(
+                    &mut state,
+                    store.as_ref().expect("trusted store"),
+                    &mut session,
+                    &project_instructions,
+                    runtime_log,
+                    || {
+                        ProjectRegistry::for_current_user()
+                            .and_then(|registry| registry.resume_evidence())
+                            .map_err(|error| format!("Could not read project evidence: {error}"))
+                    },
+                )? {
                     refresh_provider_model(&mut state);
-                    let user = state.last_user_message().unwrap_or_default().to_owned();
-                    let stored_user = slash_command_prompt(&user).unwrap_or(&user).to_owned();
-                    let project_store = store.as_ref().expect("trusted store");
-                    if session.is_none() {
-                        session =
-                            Some(project_store.create_session(&user).inspect_err(|error| {
-                                log_event(
-                                    runtime_log,
-                                    "session_create_failed",
-                                    &format!("error={error}"),
-                                );
-                            })?);
-                        log_event(runtime_log, "session_created", "outcome=ok");
-                    }
-                    let active_session = session.as_ref().expect("created session");
-                    project_store
-                        .append_event(
-                            &active_session.id,
-                            &ConversationEvent::message(EventKind::User, stored_user, None),
-                        )
-                        .inspect_err(|error| {
-                            log_event(
-                                runtime_log,
-                                "session_event_write_failed",
-                                &format!("error={error}"),
-                            );
-                        })?;
-                    let mut messages =
-                        request_messages(project_store, active_session, &project_instructions)?;
-                    if let Some(resume_generation) = &resume_generation {
-                        resume_generation.apply_to_provider_messages(&mut messages);
-                    }
-                    if resume_generation.is_some() {
-                        state.start_resume_generation();
-                    } else {
-                        state.start_agent();
-                    }
                     let flag = Arc::new(AtomicBool::new(false));
                     cancellation = Some(flag.clone());
                     let tool_context = tool_context.as_ref().expect("trusted tool context").clone();
                     log_event(
                         runtime_log,
                         "agent_turn_started",
-                        &format!("messages={}", messages.len()),
+                        &format!("messages={}", turn.messages.len()),
                     );
                     spawn_worker(
                         sender.clone(),
                         flag,
-                        messages,
+                        turn.messages,
                         tool_context,
                         runtime_log.cloned(),
-                        resume_generation
-                            .as_ref()
-                            .map_or(true, ResumeGeneration::allow_tools),
+                        turn.allow_tools,
                     );
                 }
             }
@@ -1095,7 +1119,7 @@ mod tests {
 
     use super::{
         WorkerEvent, apply_worker_event_with_resume_store, prepare_resume_generation,
-        resume_generation_prompt,
+        resume_generation_prompt, submit_terminal_turn,
     };
     use crate::storage::{ProjectEvidence, ResumeStore};
     use crate::tools::{RovenToolCall, RovenToolResult};
@@ -1240,6 +1264,86 @@ mod tests {
                 .unwrap_err()
                 .contains("No project summaries available")
         );
+    }
+
+    #[test]
+    fn resume_generation_submit_gate_blocks_persistence_and_worker_setup_without_evidence() {
+        let data = temp_root("resume-generation-submit-gate-data");
+        let project = temp_root("resume-generation-submit-gate-project");
+        let store = ProjectStore::for_project(&data, &project).unwrap();
+        let mut state = AppState::new();
+        let mut session = None;
+        state.input = "/generate-resume\nRust role".to_owned();
+
+        let turn =
+            submit_terminal_turn(
+                &mut state,
+                &store,
+                &mut session,
+                "",
+                None,
+                || Ok(Vec::new()),
+            )
+            .unwrap();
+
+        assert!(turn.is_none());
+        assert!(session.is_none());
+        assert!(!state.running);
+        assert!(
+            state
+                .messages
+                .iter()
+                .all(|message| message.role != Role::User)
+        );
+        assert!(store.list_sessions().unwrap().is_empty());
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn resume_generation_submit_turn_persists_raw_history_and_builds_no_tools_worker() {
+        let data = temp_root("resume-generation-submit-data");
+        let project = temp_root("resume-generation-submit-project");
+        let store = ProjectStore::for_project(&data, &project).unwrap();
+        let mut state = AppState::new();
+        let mut session = None;
+        let raw = "/generate-resume\nRust role";
+        state.input = raw.to_owned();
+
+        let turn = submit_terminal_turn(&mut state, &store, &mut session, "", None, || {
+            Ok(vec![ProjectEvidence {
+                name: "Roven".to_owned(),
+                summary: "Project memory assistant".to_owned(),
+            }])
+        })
+        .unwrap()
+        .expect("valid resume request should produce a worker turn");
+
+        let active_session = session.expect("resume turn should create a session");
+        assert!(state.running);
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| { message.role == Role::User && message.content == raw })
+        );
+        assert_eq!(store.events(&active_session.id).unwrap()[0].content, raw);
+        assert!(matches!(
+            turn.messages.last(),
+            Some(AgentMessage::User { content })
+                if content.contains("Rust role")
+                    && content.contains("Project: Roven")
+                    && content.contains("Project memory assistant")
+        ));
+        assert!(!turn.allow_tools);
+        assert!(
+            AgentRequest::new(turn.messages, turn.allow_tools)
+                .tools
+                .is_empty()
+        );
+
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(project).unwrap();
     }
 
     #[test]
