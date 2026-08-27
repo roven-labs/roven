@@ -423,7 +423,7 @@ mod tests {
         layout::Position,
     };
 
-    use super::{MINIMUM_HEIGHT, MINIMUM_WIDTH, draw};
+    use super::{MINIMUM_HEIGHT, MINIMUM_WIDTH, ROVEN_MARK, draw};
     use crate::ui::{
         startup::StartupProviderStatus,
         state::{AppState, ModelSelection, ProviderAccessState, ProviderChoice, ResumeEntry},
@@ -441,6 +441,21 @@ mod tests {
             .content()
             .iter()
             .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn render_rows(state: &mut AppState, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
+        terminal
+            .draw(|frame| draw(frame, state))
+            .expect("frame should render");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().flat_map(|cell| cell.symbol().chars()).collect())
             .collect()
     }
 
@@ -540,6 +555,71 @@ mod tests {
         let populated = render(&mut state, 80, 24);
         assert!(!populated.contains("████  ████  ██  ██  ████  ██  ██"));
         assert!(populated.contains("You › Hello"));
+    }
+
+    #[test]
+    fn empty_transcript_centers_the_exact_five_line_mark() {
+        let mut state = AppState::new();
+        state.trusted = true;
+        let rows = render_rows(&mut state, 80, 24);
+
+        for (row, mark_line) in rows[7..12].iter().zip(ROVEN_MARK.lines()) {
+            assert_eq!(row.trim(), mark_line);
+            let left_padding = row
+                .chars()
+                .take_while(|character| *character == ' ')
+                .count();
+            assert_eq!(left_padding, 1 + (78 - mark_line.chars().count()) / 2);
+        }
+        assert!(!rows[6].contains('█'));
+        assert!(!rows[12].contains('█'));
+    }
+
+    #[test]
+    fn empty_transcript_clips_the_mark_when_transcript_is_shorter_than_five_rows() {
+        let mut state = AppState::new();
+        state.trusted = true;
+        let rows = render_rows(&mut state, 40, 8);
+
+        for (row, mark_line) in rows[..4].iter().zip(ROVEN_MARK.lines()) {
+            assert_eq!(row.trim(), mark_line);
+        }
+        assert!(
+            rows[4..]
+                .iter()
+                .all(|row| !row.contains(ROVEN_MARK.lines().nth(4).unwrap()))
+        );
+    }
+
+    #[test]
+    fn empty_transcript_keeps_mark_visible_while_draft_changes() {
+        let mut state = AppState::new();
+        state.trusted = true;
+
+        state.input = "Draft".to_owned();
+        let first_draft = render(&mut state, 80, 24);
+        assert!(first_draft.contains("████  ████  ██  ██  ████  ██  ██"));
+        assert!(first_draft.contains("Draft"));
+
+        state.input = "Draft\nsecond line".to_owned();
+        let second_draft = render(&mut state, 80, 24);
+        assert!(second_draft.contains("████  ████  ██  ██  ████  ██  ██"));
+        assert!(second_draft.contains("second line"));
+    }
+
+    #[test]
+    fn empty_transcript_centers_mark_in_reduced_status_and_slash_menu_area() {
+        let mut state = AppState::new();
+        state.trusted = true;
+        state.status = Some("Status line".to_owned());
+        state.insert_char('/');
+        let rows = render_rows(&mut state, 80, 24);
+
+        for (row, mark_line) in rows[5..10].iter().zip(ROVEN_MARK.lines()) {
+            assert_eq!(row.trim(), mark_line);
+        }
+        assert!(rows[16].contains("Status line"));
+        assert!(rows[17..20].iter().any(|row| row.contains("/register")));
     }
 
     #[test]
