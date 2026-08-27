@@ -32,6 +32,7 @@ const FOOTER_STYLE: Style = Style::new().fg(Color::DarkGray).bg(Color::Black);
 
 const COMPOSER_PREFIX: &str = "→ ";
 const COMPOSER_PLACEHOLDER: &str = "Add a follow-up";
+const ROVEN_MARK: &str = "████  ████  ██  ██  ████  ██  ██\n██ ██ ██ ██ ██  ██  ██    ███ ██\n████  ██ ██ ██  ██  ███   ██ ███\n██ ██ ██ ██  ██ ██  ██    ██  ██\n██ ██ ████    ████  ████  ██  ██";
 
 pub(crate) fn draw(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
@@ -208,11 +209,19 @@ fn composer_height(input: &str) -> u16 {
 
 fn draw_transcript(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if state.messages.is_empty() {
+        let mark_height = ROVEN_MARK.lines().count() as u16;
+        let mark_area = Rect::new(
+            area.x,
+            area.y
+                .saturating_add(area.height.saturating_sub(mark_height) / 2),
+            area.width,
+            mark_height.min(area.height),
+        );
         frame.render_widget(
-            Paragraph::new("Start a conversation")
-                .style(MUTED_STYLE)
+            Paragraph::new(ROVEN_MARK)
+                .style(PRIMARY_STYLE)
                 .alignment(Alignment::Center),
-            area,
+            mark_area,
         );
         return;
     }
@@ -420,7 +429,20 @@ mod tests {
         state::{AppState, ModelSelection, ProviderAccessState, ProviderChoice, ResumeEntry},
     };
 
+    const FIRST_MARK_LINE: &str = "████  ████  ██  ██  ████  ██  ██";
+    const EXPECTED_MARK: [&str; 5] = [
+        "████  ████  ██  ██  ████  ██  ██",
+        "██ ██ ██ ██ ██  ██  ██    ███ ██",
+        "████  ██ ██ ██  ██  ███   ██ ███",
+        "██ ██ ██ ██  ██ ██  ██    ██  ██",
+        "██ ██ ████    ████  ████  ██  ██",
+    ];
+
     fn render(state: &mut AppState, width: u16, height: u16) -> String {
+        render_rows(state, width, height).concat()
+    }
+
+    fn render_rows(state: &mut AppState, width: u16, height: u16) -> Vec<String> {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
         terminal
@@ -430,8 +452,8 @@ mod tests {
             .backend()
             .buffer()
             .content()
-            .iter()
-            .map(|cell| cell.symbol())
+            .chunks(width as usize)
+            .map(|row| row.iter().flat_map(|cell| cell.symbol().chars()).collect())
             .collect()
     }
 
@@ -516,6 +538,86 @@ mod tests {
         assert!(!rendered.contains("Roven"));
         assert!(!rendered.contains("Project agent"));
         assert!(!rendered.contains("The chat UI is ready"));
+    }
+
+    #[test]
+    fn empty_transcript_shows_roven_mark_until_first_message() {
+        let mut state = AppState::new();
+        state.trusted = true;
+
+        let empty = render(&mut state, 80, 24);
+        assert!(empty.contains(FIRST_MARK_LINE));
+
+        state.input = "Hello".to_owned();
+        assert!(state.submit());
+        let populated = render(&mut state, 80, 24);
+        assert!(!populated.contains("████  ████  ██  ██  ████  ██  ██"));
+        assert!(populated.contains("You › Hello"));
+    }
+
+    #[test]
+    fn empty_transcript_centers_the_exact_five_line_mark() {
+        let mut state = AppState::new();
+        state.trusted = true;
+        let rows = render_rows(&mut state, 80, 24);
+
+        for (row, mark_line) in rows[7..12].iter().zip(EXPECTED_MARK) {
+            assert_eq!(row.trim(), mark_line);
+            let left_padding = row
+                .chars()
+                .take_while(|character| *character == ' ')
+                .count();
+            assert_eq!(left_padding, 1 + (78 - mark_line.chars().count()) / 2);
+        }
+        assert!(!rows[6].contains('█'));
+        assert!(!rows[12].contains('█'));
+    }
+
+    #[test]
+    fn empty_transcript_clips_the_mark_when_transcript_is_shorter_than_five_rows() {
+        let mut state = AppState::new();
+        state.trusted = true;
+        let rows = render_rows(&mut state, 40, 8);
+
+        for (row, mark_line) in rows[..4].iter().zip(EXPECTED_MARK) {
+            assert_eq!(row.trim(), mark_line);
+        }
+        assert!(
+            rows[4..]
+                .iter()
+                .all(|row| !row.contains(EXPECTED_MARK[4]))
+        );
+    }
+
+    #[test]
+    fn empty_transcript_keeps_mark_visible_while_draft_changes() {
+        let mut state = AppState::new();
+        state.trusted = true;
+
+        state.input = "Draft".to_owned();
+        let first_draft = render(&mut state, 80, 24);
+        assert!(first_draft.contains(FIRST_MARK_LINE));
+        assert!(first_draft.contains("Draft"));
+
+        state.input = "Draft\nsecond line".to_owned();
+        let second_draft = render(&mut state, 80, 24);
+        assert!(second_draft.contains(FIRST_MARK_LINE));
+        assert!(second_draft.contains("second line"));
+    }
+
+    #[test]
+    fn empty_transcript_centers_mark_in_reduced_status_and_slash_menu_area() {
+        let mut state = AppState::new();
+        state.trusted = true;
+        state.status = Some("Status line".to_owned());
+        state.insert_char('/');
+        let rows = render_rows(&mut state, 80, 24);
+
+        for (row, mark_line) in rows[5..10].iter().zip(EXPECTED_MARK) {
+            assert_eq!(row.trim(), mark_line);
+        }
+        assert!(rows[16].contains("Status line"));
+        assert!(rows[17..20].iter().any(|row| row.contains("/register")));
     }
 
     #[test]
