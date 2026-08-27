@@ -36,6 +36,22 @@ pub(crate) struct ProjectRegistration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectEvidence {
+    pub(crate) name: String,
+    pub(crate) summary: String,
+}
+
+impl ProjectEvidence {
+    fn from_registration(registration: ProjectRegistration) -> Option<Self> {
+        let summary = registration.sections.get("summary")?.clone();
+        (!summary.trim().is_empty()).then_some(Self {
+            name: registration.name,
+            summary,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RegistrationLookup {
     Absent,
     Registered(Box<ProjectRegistration>),
@@ -46,6 +62,35 @@ pub(crate) enum RegistrationLookup {
 #[derive(Debug, Clone)]
 pub(crate) struct ProjectRegistry {
     data_root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResumeStore {
+    data_root: PathBuf,
+}
+
+impl ResumeStore {
+    pub(crate) fn for_data_root(data_root: impl Into<PathBuf>) -> Self {
+        Self {
+            data_root: data_root.into(),
+        }
+    }
+
+    pub(crate) fn save(&self, markdown: &str) -> Result<PathBuf, StorageError> {
+        if markdown.trim().is_empty() {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "resume Markdown must not be empty",
+            )));
+        }
+        let resumes_dir = self.data_root.join("resumes");
+        fs::create_dir_all(&resumes_dir)?;
+        let path = resumes_dir.join(format!("{}.md", Uuid::now_v7()));
+        let mut file = AtomicWriteFile::options().open(&path)?;
+        file.write_all(markdown.as_bytes())?;
+        file.commit()?;
+        Ok(path)
+    }
 }
 
 impl ProjectRegistry {
@@ -82,6 +127,14 @@ impl ProjectRegistry {
             .collect::<Result<Vec<_>, _>>()?;
         registrations.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(registrations)
+    }
+
+    pub(crate) fn resume_evidence(&self) -> Result<Vec<ProjectEvidence>, StorageError> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter_map(ProjectEvidence::from_registration)
+            .collect())
     }
 
     pub(crate) fn register(
@@ -430,8 +483,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        ConversationEvent, EventKind, ProjectRegistration, ProjectRegistry, ProjectStore,
-        RegistrationLookup, project_id,
+        ConversationEvent, EventKind, ProjectEvidence, ProjectRegistration, ProjectRegistry,
+        ProjectStore, RegistrationLookup, ResumeStore, project_id,
     };
 
     fn temp_root(name: &str) -> std::path::PathBuf {
@@ -799,6 +852,89 @@ mod tests {
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(current_project).unwrap();
         fs::remove_dir_all(other_project).unwrap();
+    }
+
+    #[test]
+    fn resume_evidence_uses_non_empty_stored_summaries_in_list_order() {
+        let data = temp_root("resume-evidence-data");
+        let alpha = temp_root("alpha");
+        let blank = temp_root("blank");
+        let whitespace = temp_root("whitespace");
+        let registry = ProjectRegistry::for_data_root(&data);
+
+        registry
+            .register(
+                &blank,
+                "https://github.com/roven/blank.git".to_owned(),
+                "abc".to_owned(),
+            )
+            .unwrap();
+        registry
+            .register(
+                &alpha,
+                "https://github.com/roven/alpha.git".to_owned(),
+                "def".to_owned(),
+            )
+            .unwrap();
+        registry
+            .register(
+                &whitespace,
+                "https://github.com/roven/whitespace.git".to_owned(),
+                "ghi".to_owned(),
+            )
+            .unwrap();
+        registry.replace_section(&blank, "summary", " ").unwrap();
+        registry
+            .replace_section(&alpha, "summary", "verified evidence")
+            .unwrap();
+        registry
+            .replace_section(&whitespace, "summary", "\n\t")
+            .unwrap();
+
+        assert_eq!(
+            registry.resume_evidence().unwrap(),
+            vec![ProjectEvidence {
+                name: alpha.file_name().unwrap().to_string_lossy().into_owned(),
+                summary: "verified evidence".into(),
+            }]
+        );
+
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(alpha).unwrap();
+        fs::remove_dir_all(blank).unwrap();
+        fs::remove_dir_all(whitespace).unwrap();
+    }
+
+    #[test]
+    fn resume_store_saves_exact_markdown_atomically_below_resumes() {
+        let data = temp_root("resume-store-data");
+        let path = ResumeStore::for_data_root(data.clone())
+            .save("# Projects\n\n- factual result")
+            .unwrap();
+
+        assert!(path.starts_with(data.join("resumes")));
+        assert_eq!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("md")
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# Projects\n\n- factual result"
+        );
+
+        fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn resume_store_rejects_empty_markdown_without_creating_resumes() {
+        let data = temp_root("empty-resume-store-data");
+        assert!(
+            ResumeStore::for_data_root(data.clone())
+                .save(" \n\t")
+                .is_err()
+        );
+        assert!(!data.join("resumes").exists());
+        fs::remove_dir_all(data).unwrap();
     }
 
     #[test]
