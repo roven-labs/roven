@@ -3,7 +3,7 @@
 use std::sync::atomic::AtomicBool;
 
 use crate::tools::{
-    definitions, dispatch, RovenToolCall, RovenToolDefinition, RovenToolResult, ToolContext,
+    RovenToolCall, RovenToolDefinition, RovenToolResult, ToolContext, definitions, dispatch,
 };
 use crate::{
     context,
@@ -248,12 +248,12 @@ mod tests {
     use std::{cell::RefCell, fs, sync::atomic::AtomicBool};
 
     use crate::{
-        provider::{test_support, OpenAiCompatibleProvider, Provider, ProviderError},
+        provider::{OpenAiCompatibleProvider, Provider, ProviderError, test_support},
         runtime_log::RuntimeLog,
         tools::ToolContext,
     };
 
-    use super::{run, AgentEvent, AgentMessage, AgentRun};
+    use super::{AgentEvent, AgentMessage, AgentRun, run};
 
     fn workspace() -> std::path::PathBuf {
         std::env::current_dir().unwrap().canonicalize().unwrap()
@@ -321,10 +321,12 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert!(!events
-            .borrow()
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ToolResult { .. })));
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolResult { .. }))
+        );
     }
 
     #[test]
@@ -498,9 +500,11 @@ mod tests {
             result,
             Err(ProviderError::HttpStatus { status: 500 })
         ));
-        assert!(fs::read_to_string(log_path)
-            .unwrap()
-            .contains("event=model_request_failed"));
+        assert!(
+            fs::read_to_string(log_path)
+                .unwrap()
+                .contains("event=model_request_failed")
+        );
         assert_eq!(server.join().unwrap().len(), 1);
 
         let (endpoint, server) = test_support::serve(vec![test_support::sse(

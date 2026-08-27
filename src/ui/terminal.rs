@@ -185,7 +185,7 @@ fn submit_terminal_turn(
         messages,
         allow_tools: resume_generation
             .as_ref()
-            .map_or(true, ResumeGeneration::allow_tools),
+            .is_none_or(ResumeGeneration::allow_tools),
     }))
 }
 
