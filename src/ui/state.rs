@@ -109,6 +109,7 @@ pub(crate) enum SlashCommand {
     Register,
     Resume,
     Model,
+    GenerateResume,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +119,7 @@ pub(crate) struct SlashCommandInfo {
     pub(crate) description: &'static str,
 }
 
-const SLASH_COMMANDS: [SlashCommandInfo; 3] = [
+const SLASH_COMMANDS: [SlashCommandInfo; 4] = [
     SlashCommandInfo {
         command: SlashCommand::Register,
         name: "/register",
@@ -134,6 +135,11 @@ const SLASH_COMMANDS: [SlashCommandInfo; 3] = [
         name: "/model",
         description: "Switch model",
     },
+    SlashCommandInfo {
+        command: SlashCommand::GenerateResume,
+        name: "/generate-resume",
+        description: "Generate a resume project section",
+    },
 ];
 
 pub(crate) fn slash_command(input: &str) -> Option<SlashCommand> {
@@ -142,6 +148,15 @@ pub(crate) fn slash_command(input: &str) -> Option<SlashCommand> {
         .iter()
         .find(|command| command.name == input)
         .map(|command| command.command)
+}
+
+pub(crate) fn generate_resume_job_description(input: &str) -> Option<&str> {
+    let remainder = input.strip_prefix("/generate-resume")?;
+    if !remainder.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let job_description = remainder.trim();
+    (!job_description.is_empty()).then_some(job_description)
 }
 
 #[derive(Debug, Default)]
@@ -159,6 +174,7 @@ pub(crate) struct AppState {
     pub(crate) context_percent: Option<usize>,
     generation_start_index: usize,
     generation_started_at: Option<Instant>,
+    resume_generation: bool,
     pub(crate) resume_entries: Option<Vec<ResumeEntry>>,
     pub(crate) resume_index: usize,
     pub(crate) resume_offset: usize,
@@ -265,6 +281,16 @@ impl AppState {
         self.context_percent = None;
         self.generation_start_index = self.messages.len();
         self.generation_started_at = Some(Instant::now());
+        self.resume_generation = false;
+    }
+
+    pub(crate) fn start_resume_generation(&mut self) {
+        self.start_agent();
+        self.resume_generation = true;
+    }
+
+    pub(crate) fn take_resume_generation(&mut self) -> bool {
+        std::mem::take(&mut self.resume_generation)
     }
 
     pub(crate) fn append_thought(&mut self, text: String) {
@@ -494,14 +520,35 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, MessageKind, ResumeEntry, Role};
+    use super::{
+        AppState, MessageKind, ResumeEntry, Role, SlashCommand, generate_resume_job_description,
+        slash_command,
+    };
+
+    #[test]
+    fn slash_command_parses_generate_resume_job_description_and_keeps_resume() {
+        assert_eq!(
+            generate_resume_job_description("/generate-resume\nRust role"),
+            Some("Rust role")
+        );
+        assert_eq!(generate_resume_job_description("/generate-resume"), None);
+        assert_eq!(slash_command("/resume"), Some(SlashCommand::Resume));
+
+        let mut state = AppState::new();
+        state.insert_char('/');
+        assert!(
+            state
+                .slash_commands()
+                .any(|command| command.name == "/generate-resume")
+        );
+    }
 
     #[test]
     fn slash_commands_filter_navigate_and_insert_without_submitting() {
         let mut state = AppState::new();
         state.insert_char('/');
 
-        assert_eq!(state.slash_commands().count(), 3);
+        assert_eq!(state.slash_commands().count(), 4);
         state.select_next_slash_command();
         state.select_next_slash_command();
         state.insert_selected_slash_command();

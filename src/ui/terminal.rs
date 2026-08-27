@@ -29,7 +29,10 @@ use crate::{
     profiles::{ProviderProfile, ProviderProfiles},
     provider::{OpenAiCompatibleProvider, Provider},
     runtime_log::RuntimeLog,
-    storage::{ConversationEvent, EventKind, ProjectStore, SessionMeta},
+    storage::{
+        ConversationEvent, EventKind, ProjectEvidence, ProjectRegistry, ProjectStore, ResumeStore,
+        SessionMeta,
+    },
     tools::{RovenToolCall, RovenToolResult, ToolContext},
 };
 
@@ -37,7 +40,7 @@ use super::{
     startup,
     state::{
         AppState, Message, ProviderAccessState, ProviderChoice, ResumeEntry, Role, SlashCommand,
-        slash_command,
+        generate_resume_job_description, slash_command,
     },
     view,
 };
@@ -64,6 +67,17 @@ const REGISTER_PROJECT_PROMPT: &str = include_str!(concat!(
 
 fn slash_command_prompt(input: &str) -> Option<&'static str> {
     (slash_command(input) == Some(SlashCommand::Register)).then_some(REGISTER_PROJECT_PROMPT)
+}
+
+fn resume_generation_prompt(job_description: &str, evidence: &[ProjectEvidence]) -> String {
+    let evidence = evidence
+        .iter()
+        .map(|project| format!("Project: {}\nSummary: {}", project.name, project.summary))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!(
+        "Write a Markdown resume project section using only the supplied job description and project evidence. Do not invent achievements, metrics, technologies, or responsibilities.\n\nJob description:\n{job_description}\n\nProject evidence:\n{evidence}"
+    )
 }
 
 pub(crate) fn run(runtime_log: Option<RuntimeLog>) -> anyhow::Result<()> {
@@ -105,13 +119,15 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
     let mut project_instructions = String::new();
     let mut cancellation: Option<Arc<AtomicBool>> = None;
     let mut tool_context: Option<ToolContext> = None;
+    let mut resume_store: Option<ResumeStore> = None;
 
     loop {
         while let Ok(worker_event) = receiver.try_recv() {
-            apply_worker_event(
+            apply_worker_event_with_resume_store(
                 &mut state,
                 store.as_ref(),
                 session.as_ref(),
+                resume_store.as_ref(),
                 runtime_log,
                 worker_event,
             );
@@ -150,6 +166,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                         })?;
                     project_instructions = read_project_instructions().unwrap_or_default();
                     store = Some(initialized);
+                    resume_store = Some(ResumeStore::for_data_root(crate::app_data_root()?));
                     let context = ToolContext::new(std::path::PathBuf::from(&state.project_path))
                         .inspect_err(|error| {
                         log_event(
@@ -312,6 +329,25 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
             }) => {
                 let raw = state.input.clone();
                 let command = slash_command(&raw);
+                let resume_job_description = generate_resume_job_description(&raw);
+                let resume_prompt = resume_job_description.and_then(|job_description| {
+                    let evidence = match ProjectRegistry::for_current_user()
+                        .and_then(|registry| registry.resume_evidence())
+                    {
+                        Ok(evidence) if !evidence.is_empty() => evidence,
+                        Ok(_) => {
+                            state.activity(
+                                "No project summaries available. Prepare projects before generating a resume.",
+                            );
+                            return None;
+                        }
+                        Err(error) => {
+                            state.activity(format!("Could not read project evidence: {error}"));
+                            return None;
+                        }
+                    };
+                    Some(resume_generation_prompt(job_description, &evidence))
+                });
                 if command == Some(SlashCommand::Resume) {
                     state.input.clear();
                     let entries = store
@@ -332,7 +368,12 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                     if let Err(error) = open_model_switch(&mut state) {
                         state.activity(error);
                     }
-                } else if state.submit() {
+                } else if raw.trim() == "/generate-resume" {
+                    state.input.clear();
+                    state.activity("Enter a job description after /generate-resume.");
+                } else if (resume_job_description.is_none() || resume_prompt.is_some())
+                    && state.submit()
+                {
                     refresh_provider_model(&mut state);
                     let user = state.last_user_message().unwrap_or_default().to_owned();
                     let stored_user = slash_command_prompt(&user).unwrap_or(&user).to_owned();
@@ -361,9 +402,19 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                                 &format!("error={error}"),
                             );
                         })?;
-                    let messages =
+                    let mut messages =
                         request_messages(project_store, active_session, &project_instructions)?;
-                    state.start_agent();
+                    let is_resume_generation = resume_prompt.is_some();
+                    if let Some(prompt) = resume_prompt {
+                        if let Some(AgentMessage::User { content }) = messages.last_mut() {
+                            *content = prompt;
+                        }
+                    }
+                    if is_resume_generation {
+                        state.start_resume_generation();
+                    } else {
+                        state.start_agent();
+                    }
                     let flag = Arc::new(AtomicBool::new(false));
                     cancellation = Some(flag.clone());
                     let tool_context = tool_context.as_ref().expect("trusted tool context").clone();
@@ -378,6 +429,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                         messages,
                         tool_context,
                         runtime_log.cloned(),
+                        !is_resume_generation,
                     );
                 }
             }
@@ -418,6 +470,7 @@ fn spawn_worker(
     messages: Vec<AgentMessage>,
     tool_context: ToolContext,
     runtime_log: Option<RuntimeLog>,
+    allow_tools: bool,
 ) {
     thread::spawn(move || {
         log_event(runtime_log.as_ref(), "worker_started", "outcome=started");
@@ -453,7 +506,7 @@ fn spawn_worker(
                     context_window,
                     cancelled: &cancelled,
                     runtime_log: runtime_log.as_ref(),
-                    allow_tools: true,
+                    allow_tools,
                 },
                 messages,
                 &mut |event| {
@@ -641,10 +694,11 @@ fn unsupported_model_message(choice: &ProviderChoice, model: &str) -> String {
     }
 }
 
-fn apply_worker_event(
+fn apply_worker_event_with_resume_store(
     state: &mut AppState,
     store: Option<&ProjectStore>,
     session: Option<&SessionMeta>,
+    resume_store: Option<&ResumeStore>,
     runtime_log: Option<&RuntimeLog>,
     event: WorkerEvent,
 ) {
@@ -656,33 +710,24 @@ fn apply_worker_event(
             persist_function_call_output(store, session, &call, &result);
             state.tool(call.name, call.arguments, result.result);
         }
-        WorkerEvent::Finished | WorkerEvent::Cancelled => {
-            let stopped = matches!(event, WorkerEvent::Cancelled);
+        WorkerEvent::Finished => {
+            let is_resume_generation = state.take_resume_generation();
             state.finish_agent();
-            persist_generation(
-                state,
-                store,
-                session,
-                if stopped {
-                    EventKind::Cancelled
-                } else {
-                    EventKind::Assistant
-                },
-            );
-            if stopped {
-                state.activity("Agent stopped");
+            persist_generation(state, store, session, EventKind::Assistant);
+            if is_resume_generation {
+                save_generated_resume(state, resume_store);
             }
-            log_event(
-                runtime_log,
-                "agent_turn_finished",
-                if stopped {
-                    "outcome=cancelled"
-                } else {
-                    "outcome=ok"
-                },
-            );
+            log_event(runtime_log, "agent_turn_finished", "outcome=ok");
+        }
+        WorkerEvent::Cancelled => {
+            state.take_resume_generation();
+            state.finish_agent();
+            persist_generation(state, store, session, EventKind::Cancelled);
+            state.activity("Agent stopped");
+            log_event(runtime_log, "agent_turn_finished", "outcome=cancelled");
         }
         WorkerEvent::Error(error) => {
+            state.take_resume_generation();
             state.finish_agent();
             persist_generation(state, store, session, EventKind::Assistant);
             if let (Some(project_store), Some(active_session)) = (store, session) {
@@ -694,6 +739,28 @@ fn apply_worker_event(
             state.agent_error(error);
             log_event(runtime_log, "agent_turn_finished", "outcome=error");
         }
+    }
+}
+
+fn save_generated_resume(state: &mut AppState, resume_store: Option<&ResumeStore>) {
+    let markdown = state
+        .generated_messages()
+        .iter()
+        .filter(|message| message.role == Role::Roven && !message.content.trim().is_empty())
+        .fold(String::new(), |mut markdown, message| {
+            markdown.push_str(&message.content);
+            markdown
+        });
+    if markdown.trim().is_empty() {
+        return;
+    }
+    let Some(resume_store) = resume_store else {
+        state.activity("Could not save generated resume: resume storage unavailable");
+        return;
+    };
+    match resume_store.save(&markdown) {
+        Ok(path) => state.activity(format!("Resume saved: {}", path.display())),
+        Err(error) => state.activity(format!("Could not save generated resume: {error}")),
     }
 }
 
@@ -994,7 +1061,8 @@ mod tests {
         },
     };
 
-    use super::{WorkerEvent, apply_worker_event};
+    use super::{WorkerEvent, apply_worker_event_with_resume_store, resume_generation_prompt};
+    use crate::storage::{ProjectEvidence, ResumeStore};
     use crate::tools::{RovenToolCall, RovenToolResult};
 
     #[derive(Default)]
@@ -1085,6 +1153,74 @@ mod tests {
             super::slash_command("/model"),
             Some(super::SlashCommand::Model)
         );
+    }
+
+    #[test]
+    fn resume_generation_prompt_uses_only_supplied_evidence() {
+        let evidence = vec![ProjectEvidence {
+            name: "Roven".to_owned(),
+            summary: "Project memory assistant".to_owned(),
+        }];
+        let prompt = resume_generation_prompt("Rust role", &evidence);
+
+        assert!(prompt.contains("Rust role"));
+        assert!(prompt.contains("Roven"));
+        assert!(prompt.contains("Project memory assistant"));
+        assert!(prompt.contains("Do not invent"));
+        assert!(!prompt.contains("Other project"));
+    }
+
+    #[test]
+    fn resume_generation_saves_only_completed_visible_assistant_output() {
+        let root = temp_root("resume-generation");
+        let resumes = ResumeStore::for_data_root(root.clone());
+        let mut state = AppState::new();
+        state.start_resume_generation();
+        state.append_thought("Plan response".to_owned());
+        state.append_agent_text("# Projects\n\n- Roven".to_owned());
+        apply_worker_event_with_resume_store(
+            &mut state,
+            None,
+            None,
+            Some(&resumes),
+            None,
+            WorkerEvent::Finished,
+        );
+
+        let saved = fs::read_dir(root.join("resumes"))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            fs::read_to_string(saved[0].path()).unwrap(),
+            "# Projects\n\n- Roven"
+        );
+        assert!(state.messages.iter().any(|message| {
+            message.role == Role::Activity && message.content.starts_with("Resume saved:")
+        }));
+
+        for event in [
+            WorkerEvent::Cancelled,
+            WorkerEvent::Error("provider failed".to_owned()),
+            WorkerEvent::Finished,
+        ] {
+            let mut state = AppState::new();
+            state.start_resume_generation();
+            if !matches!(event, WorkerEvent::Finished) {
+                state.append_agent_text("partial".to_owned());
+            }
+            apply_worker_event_with_resume_store(
+                &mut state,
+                None,
+                None,
+                Some(&resumes),
+                None,
+                event,
+            );
+        }
+        assert_eq!(fs::read_dir(root.join("resumes")).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1389,8 +1525,9 @@ mod tests {
             result: serde_json::json!({"status": "ok"}),
         };
 
-        apply_worker_event(
+        apply_worker_event_with_resume_store(
             &mut state,
+            None,
             None,
             None,
             None,
@@ -1425,10 +1562,11 @@ mod tests {
         assert!(state.submit());
         state.start_agent();
         state.append_agent_text("partial response".to_owned());
-        apply_worker_event(
+        apply_worker_event_with_resume_store(
             &mut state,
             Some(&store),
             Some(&session),
+            None,
             None,
             WorkerEvent::Error("provider failed".to_owned()),
         );
@@ -1444,10 +1582,11 @@ mod tests {
         assert!(state.submit());
         state.start_agent();
         state.append_agent_text("stopped response".to_owned());
-        apply_worker_event(
+        apply_worker_event_with_resume_store(
             &mut state,
             Some(&store),
             Some(&session),
+            None,
             None,
             WorkerEvent::Cancelled,
         );
