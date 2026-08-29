@@ -1,7 +1,10 @@
 [package]
 name = "roven"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+description = "Roven — Project Memory Assistant"
+repository = "https://github.com/roven-labs/roven"
+readme = "README.md"
 
 [dependencies]
 atomic-write-file = "0.3.0"

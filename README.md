@@ -4,6 +4,8 @@
 
 # Roven
 
+Version 1.0.0.
+
 Roven is a native terminal project-memory assistant. The shipped executable is
 `roven`. It keeps conversations
 scoped to the trusted project directory and can register that project for
@@ -93,6 +95,15 @@ project evidence and performs no workspace/repository reads or provider-tool
 calls.
 
 ## Install
+
+### Install a released Windows build
+
+Download `roven-windows-x86_64.zip` from the
+[latest GitHub release](https://github.com/roven-labs/roven/releases/latest),
+verify its SHA-256 checksum, and place `roven.exe` in a directory on your user
+PATH. Open a new PowerShell session, then run `roven --version`.
+
+### Build and install from source
 
 From this repository in PowerShell:
 

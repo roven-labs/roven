@@ -1,10 +1,29 @@
 # Setup
 
+Version 1.0.0.
+
 ## Install
 
-From the repository root in PowerShell:
+### Install from a released Windows build
+
+Download the Windows ZIP and its checksum file from the
+[Roven releases page](https://github.com/roven-labs/roven/releases).
+Verify the checksum, extract `roven.exe` into a user-owned directory, and add
+that directory to the user PATH.
+
+Check the installation in a new PowerShell session:
 
 ```powershell
+roven --version
+```
+
+### Clone and install from source
+
+Requires Git, Rust, Cargo, and PowerShell. In PowerShell:
+
+```powershell
+git clone https://github.com/roven-labs/roven.git
+Set-Location .\roven
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
 

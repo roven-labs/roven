@@ -582,11 +582,7 @@ mod tests {
         for (row, mark_line) in rows[..4].iter().zip(EXPECTED_MARK) {
             assert_eq!(row.trim(), mark_line);
         }
-        assert!(
-            rows[4..]
-                .iter()
-                .all(|row| !row.contains(EXPECTED_MARK[4]))
-        );
+        assert!(rows[4..].iter().all(|row| !row.contains(EXPECTED_MARK[4])));
     }
 
     #[test]
