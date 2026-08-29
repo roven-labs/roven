@@ -12,8 +12,8 @@ use std::{
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
@@ -29,7 +29,10 @@ use crate::{
     profiles::{ProviderProfile, ProviderProfiles},
     provider::{OpenAiCompatibleProvider, Provider},
     runtime_log::RuntimeLog,
-    storage::{ConversationEvent, EventKind, ProjectStore, SessionMeta},
+    storage::{
+        ConversationEvent, EventKind, ProjectEvidence, ProjectRegistry, ProjectStore, ResumeStore,
+        SessionMeta,
+    },
     tools::{RovenToolCall, RovenToolResult, ToolContext},
 };
 
@@ -37,7 +40,7 @@ use super::{
     startup,
     state::{
         AppState, Message, ProviderAccessState, ProviderChoice, ResumeEntry, Role, SlashCommand,
-        slash_command,
+        generate_resume_job_description, slash_command,
     },
     view,
 };
@@ -64,6 +67,126 @@ const REGISTER_PROJECT_PROMPT: &str = include_str!(concat!(
 
 fn slash_command_prompt(input: &str) -> Option<&'static str> {
     (slash_command(input) == Some(SlashCommand::Register)).then_some(REGISTER_PROJECT_PROMPT)
+}
+
+fn resume_generation_prompt(job_description: &str, evidence: &[ProjectEvidence]) -> String {
+    let evidence = evidence
+        .iter()
+        .map(|project| format!("Project: {}\nSummary: {}", project.name, project.summary))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!(
+        "Write a Markdown resume project section using only the supplied job description and project evidence. Do not invent achievements, metrics, technologies, or responsibilities.\n\nJob description:\n{job_description}\n\nProject evidence:\n{evidence}"
+    )
+}
+
+#[derive(Debug, Clone)]
+struct ResumeGeneration {
+    provider_prompt: String,
+}
+
+impl ResumeGeneration {
+    fn apply_to_provider_messages(&self, messages: &mut [AgentMessage]) {
+        if let Some(AgentMessage::User { content }) = messages.last_mut() {
+            *content = self.provider_prompt.clone();
+        }
+    }
+
+    const fn allow_tools(&self) -> bool {
+        false
+    }
+}
+
+struct WorkerTurn {
+    messages: Vec<AgentMessage>,
+    allow_tools: bool,
+}
+
+fn prepare_resume_generation(
+    input: &str,
+    load_evidence: impl FnOnce() -> Result<Vec<ProjectEvidence>, String>,
+) -> Result<Option<ResumeGeneration>, String> {
+    if input.trim() == "/generate-resume" {
+        return Err("Enter a job description after /generate-resume.".to_owned());
+    }
+    let Some(job_description) = generate_resume_job_description(input) else {
+        return Ok(None);
+    };
+    let mut evidence = load_evidence()?;
+    evidence
+        .retain(|project| !project.name.trim().is_empty() && !project.summary.trim().is_empty());
+    evidence.sort_by(|left, right| left.name.cmp(&right.name));
+    if evidence.is_empty() {
+        return Err(
+            "No project summaries available. Prepare projects before generating a resume."
+                .to_owned(),
+        );
+    }
+    Ok(Some(ResumeGeneration {
+        provider_prompt: resume_generation_prompt(job_description, &evidence),
+    }))
+}
+
+fn submit_terminal_turn(
+    state: &mut AppState,
+    store: &ProjectStore,
+    session: &mut Option<SessionMeta>,
+    project_instructions: &str,
+    runtime_log: Option<&RuntimeLog>,
+    load_evidence: impl FnOnce() -> Result<Vec<ProjectEvidence>, String>,
+) -> anyhow::Result<Option<WorkerTurn>> {
+    let raw = state.input.clone();
+    let resume_generation = match prepare_resume_generation(&raw, load_evidence) {
+        Ok(resume_generation) => resume_generation,
+        Err(error) => {
+            if raw.trim() == "/generate-resume" {
+                state.input.clear();
+            }
+            state.activity(error);
+            return Ok(None);
+        }
+    };
+    if !state.submit() {
+        return Ok(None);
+    }
+    let user = state.last_user_message().unwrap_or_default().to_owned();
+    let stored_user = slash_command_prompt(&user).unwrap_or(&user).to_owned();
+    if session.is_none() {
+        *session = Some(store.create_session(&user).inspect_err(|error| {
+            log_event(
+                runtime_log,
+                "session_create_failed",
+                &format!("error={error}"),
+            );
+        })?);
+        log_event(runtime_log, "session_created", "outcome=ok");
+    }
+    let active_session = session.as_ref().expect("created session");
+    store
+        .append_event(
+            &active_session.id,
+            &ConversationEvent::message(EventKind::User, stored_user, None),
+        )
+        .inspect_err(|error| {
+            log_event(
+                runtime_log,
+                "session_event_write_failed",
+                &format!("error={error}"),
+            );
+        })?;
+    let mut messages = request_messages(store, active_session, project_instructions)?;
+    if let Some(resume_generation) = &resume_generation {
+        resume_generation.apply_to_provider_messages(&mut messages);
+        state.start_resume_generation();
+    } else {
+        state.start_agent();
+    }
+    Ok(Some(WorkerTurn {
+        messages,
+        allow_tools: resume_generation
+            .as_ref()
+            .is_none_or(ResumeGeneration::allow_tools),
+    }))
 }
 
 pub(crate) fn run(runtime_log: Option<RuntimeLog>) -> anyhow::Result<()> {
@@ -105,13 +228,15 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
     let mut project_instructions = String::new();
     let mut cancellation: Option<Arc<AtomicBool>> = None;
     let mut tool_context: Option<ToolContext> = None;
+    let mut resume_store: Option<ResumeStore> = None;
 
     loop {
         while let Ok(worker_event) = receiver.try_recv() {
-            apply_worker_event(
+            apply_worker_event_with_resume_store(
                 &mut state,
                 store.as_ref(),
                 session.as_ref(),
+                resume_store.as_ref(),
                 runtime_log,
                 worker_event,
             );
@@ -150,6 +275,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                         })?;
                     project_instructions = read_project_instructions().unwrap_or_default();
                     store = Some(initialized);
+                    resume_store = Some(ResumeStore::for_data_root(crate::app_data_root()?));
                     let context = ToolContext::new(std::path::PathBuf::from(&state.project_path))
                         .inspect_err(|error| {
                         log_event(
@@ -227,6 +353,28 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
         }
         if state.running {
             match event {
+                Event::Paste(text) => state.insert_paste(&text),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('v'),
+                    modifiers,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    #[cfg(windows)]
+                    if let Ok(Some(text)) = read_clipboard_text() {
+                        state.insert_paste(&text);
+                    }
+                }
+                Event::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Right),
+                    ..
+                }) =>
+                {
+                    #[cfg(windows)]
+                    if let Ok(Some(text)) = read_clipboard_text() {
+                        state.insert_paste(&text);
+                    }
+                }
                 Event::Key(KeyEvent {
                     code: KeyCode::Esc, ..
                 }) => {
@@ -274,6 +422,28 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
             continue;
         }
         match event {
+            Event::Paste(text) => state.insert_paste(&text),
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('v'),
+                modifiers,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            }) if modifiers.contains(KeyModifiers::CONTROL) => {
+                #[cfg(windows)]
+                if let Ok(Some(text)) = read_clipboard_text() {
+                    state.insert_paste(&text);
+                }
+            }
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                ..
+            }) =>
+            {
+                #[cfg(windows)]
+                if let Ok(Some(text)) = read_clipboard_text() {
+                    state.insert_paste(&text);
+                }
+            }
             Event::Key(KeyEvent {
                 code: KeyCode::Esc,
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
@@ -310,8 +480,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
                 ..
             }) => {
-                let raw = state.input.clone();
-                let command = slash_command(&raw);
+                let command = slash_command(&state.input);
                 if command == Some(SlashCommand::Resume) {
                     state.input.clear();
                     let entries = store
@@ -332,52 +501,34 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                     if let Err(error) = open_model_switch(&mut state) {
                         state.activity(error);
                     }
-                } else if state.submit() {
+                } else if let Some(turn) = submit_terminal_turn(
+                    &mut state,
+                    store.as_ref().expect("trusted store"),
+                    &mut session,
+                    &project_instructions,
+                    runtime_log,
+                    || {
+                        ProjectRegistry::for_current_user()
+                            .and_then(|registry| registry.resume_evidence())
+                            .map_err(|error| format!("Could not read project evidence: {error}"))
+                    },
+                )? {
                     refresh_provider_model(&mut state);
-                    let user = state.last_user_message().unwrap_or_default().to_owned();
-                    let stored_user = slash_command_prompt(&user).unwrap_or(&user).to_owned();
-                    let project_store = store.as_ref().expect("trusted store");
-                    if session.is_none() {
-                        session =
-                            Some(project_store.create_session(&user).inspect_err(|error| {
-                                log_event(
-                                    runtime_log,
-                                    "session_create_failed",
-                                    &format!("error={error}"),
-                                );
-                            })?);
-                        log_event(runtime_log, "session_created", "outcome=ok");
-                    }
-                    let active_session = session.as_ref().expect("created session");
-                    project_store
-                        .append_event(
-                            &active_session.id,
-                            &ConversationEvent::message(EventKind::User, stored_user, None),
-                        )
-                        .inspect_err(|error| {
-                            log_event(
-                                runtime_log,
-                                "session_event_write_failed",
-                                &format!("error={error}"),
-                            );
-                        })?;
-                    let messages =
-                        request_messages(project_store, active_session, &project_instructions)?;
-                    state.start_agent();
                     let flag = Arc::new(AtomicBool::new(false));
                     cancellation = Some(flag.clone());
                     let tool_context = tool_context.as_ref().expect("trusted tool context").clone();
                     log_event(
                         runtime_log,
                         "agent_turn_started",
-                        &format!("messages={}", messages.len()),
+                        &format!("messages={}", turn.messages.len()),
                     );
                     spawn_worker(
                         sender.clone(),
                         flag,
-                        messages,
+                        turn.messages,
                         tool_context,
                         runtime_log.cloned(),
+                        turn.allow_tools,
                     );
                 }
             }
@@ -418,6 +569,7 @@ fn spawn_worker(
     messages: Vec<AgentMessage>,
     tool_context: ToolContext,
     runtime_log: Option<RuntimeLog>,
+    allow_tools: bool,
 ) {
     thread::spawn(move || {
         log_event(runtime_log.as_ref(), "worker_started", "outcome=started");
@@ -453,6 +605,7 @@ fn spawn_worker(
                     context_window,
                     cancelled: &cancelled,
                     runtime_log: runtime_log.as_ref(),
+                    allow_tools,
                 },
                 messages,
                 &mut |event| {
@@ -640,10 +793,11 @@ fn unsupported_model_message(choice: &ProviderChoice, model: &str) -> String {
     }
 }
 
-fn apply_worker_event(
+fn apply_worker_event_with_resume_store(
     state: &mut AppState,
     store: Option<&ProjectStore>,
     session: Option<&SessionMeta>,
+    resume_store: Option<&ResumeStore>,
     runtime_log: Option<&RuntimeLog>,
     event: WorkerEvent,
 ) {
@@ -655,33 +809,24 @@ fn apply_worker_event(
             persist_function_call_output(store, session, &call, &result);
             state.tool(call.name, call.arguments, result.result);
         }
-        WorkerEvent::Finished | WorkerEvent::Cancelled => {
-            let stopped = matches!(event, WorkerEvent::Cancelled);
+        WorkerEvent::Finished => {
+            let is_resume_generation = state.take_resume_generation();
             state.finish_agent();
-            persist_generation(
-                state,
-                store,
-                session,
-                if stopped {
-                    EventKind::Cancelled
-                } else {
-                    EventKind::Assistant
-                },
-            );
-            if stopped {
-                state.activity("Agent stopped");
+            persist_generation(state, store, session, EventKind::Assistant);
+            if is_resume_generation {
+                save_generated_resume(state, resume_store);
             }
-            log_event(
-                runtime_log,
-                "agent_turn_finished",
-                if stopped {
-                    "outcome=cancelled"
-                } else {
-                    "outcome=ok"
-                },
-            );
+            log_event(runtime_log, "agent_turn_finished", "outcome=ok");
+        }
+        WorkerEvent::Cancelled => {
+            state.take_resume_generation();
+            state.finish_agent();
+            persist_generation(state, store, session, EventKind::Cancelled);
+            state.activity("Agent stopped");
+            log_event(runtime_log, "agent_turn_finished", "outcome=cancelled");
         }
         WorkerEvent::Error(error) => {
+            state.take_resume_generation();
             state.finish_agent();
             persist_generation(state, store, session, EventKind::Assistant);
             if let (Some(project_store), Some(active_session)) = (store, session) {
@@ -693,6 +838,28 @@ fn apply_worker_event(
             state.agent_error(error);
             log_event(runtime_log, "agent_turn_finished", "outcome=error");
         }
+    }
+}
+
+fn save_generated_resume(state: &mut AppState, resume_store: Option<&ResumeStore>) {
+    let markdown = state
+        .generated_messages()
+        .iter()
+        .filter(|message| message.role == Role::Roven && !message.content.trim().is_empty())
+        .fold(String::new(), |mut markdown, message| {
+            markdown.push_str(&message.content);
+            markdown
+        });
+    if markdown.trim().is_empty() {
+        return;
+    }
+    let Some(resume_store) = resume_store else {
+        state.activity("Could not save generated resume: resume storage unavailable");
+        return;
+    };
+    match resume_store.save(&markdown) {
+        Ok(path) => state.activity(format!("Resume saved: {}", path.display())),
+        Err(error) => state.activity(format!("Could not save generated resume: {error}")),
     }
 }
 
@@ -936,6 +1103,60 @@ fn is_ctrl_c(event: &Event) -> bool {
     matches!(event, Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers, .. }) if modifiers.contains(KeyModifiers::CONTROL))
 }
 
+#[cfg(windows)]
+fn read_clipboard_text() -> io::Result<Option<String>> {
+    use std::{mem::size_of, slice};
+
+    use windows_sys::Win32::System::{
+        DataExchange::{
+            CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+        },
+        Memory::{GlobalLock, GlobalSize, GlobalUnlock},
+        Ole::CF_UNICODETEXT,
+    };
+
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let result = if IsClipboardFormatAvailable(CF_UNICODETEXT as u32) == 0 {
+            Ok(None)
+        } else {
+            let handle = GetClipboardData(CF_UNICODETEXT as u32);
+            if handle.is_null() {
+                Err(io::Error::last_os_error())
+            } else {
+                let locked = GlobalLock(handle).cast::<u16>();
+                if locked.is_null() {
+                    Err(io::Error::last_os_error())
+                } else {
+                    let units = GlobalSize(handle) / size_of::<u16>();
+                    let contents = slice::from_raw_parts(locked, units);
+                    let length = contents.iter().position(|character| *character == 0);
+                    let text =
+                        match length {
+                            Some(length) => String::from_utf16(&contents[..length])
+                                .map(Some)
+                                .map_err(|_| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "clipboard is not UTF-16",
+                                    )
+                                }),
+                            None => Ok(None),
+                        };
+                    GlobalUnlock(handle);
+                    text
+                }
+            }
+        };
+
+        CloseClipboard();
+        result
+    }
+}
+
 struct TerminalGuard {
     active: bool,
 }
@@ -947,6 +1168,7 @@ impl TerminalGuard {
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
+            EnableBracketedPaste,
             Hide,
             Clear(ClearType::All)
         ) {
@@ -960,7 +1182,13 @@ impl TerminalGuard {
             return Ok(());
         }
         let mut stdout = io::stdout();
-        let terminal_result = execute!(stdout, Show, DisableMouseCapture, LeaveAlternateScreen);
+        let terminal_result = execute!(
+            stdout,
+            Show,
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let raw_mode_result = terminal::disable_raw_mode();
         self.active = false;
         terminal_result.and(raw_mode_result)
@@ -977,15 +1205,16 @@ mod tests {
     use std::{
         cell::RefCell,
         fs,
-        sync::{Mutex, OnceLock},
+        sync::{Mutex, OnceLock, atomic::AtomicBool},
     };
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use crate::{
-        agent::AgentMessage,
+        agent::{self, AgentEvent, AgentMessage, AgentRequest, AgentRun, ProviderEvent},
         credentials::{CredentialError, SecretStore},
         profiles::{ProviderProfile, ProviderProfiles},
+        provider::{Provider, ProviderError},
         storage::{ConversationEvent, EventKind, ProjectStore},
         ui::{
             startup::StartupProviderStatus,
@@ -993,7 +1222,11 @@ mod tests {
         },
     };
 
-    use super::{WorkerEvent, apply_worker_event};
+    use super::{
+        WorkerEvent, apply_worker_event_with_resume_store, prepare_resume_generation,
+        resume_generation_prompt, submit_terminal_turn,
+    };
+    use crate::storage::{ProjectEvidence, ResumeStore};
     use crate::tools::{RovenToolCall, RovenToolResult};
 
     #[derive(Default)]
@@ -1013,6 +1246,28 @@ mod tests {
 
         fn delete(&self) -> Result<bool, CredentialError> {
             Ok(self.value.borrow_mut().take().is_some())
+        }
+    }
+
+    struct UnexpectedToolCallProvider;
+
+    impl Provider for UnexpectedToolCallProvider {
+        fn stream(
+            &self,
+            _api_key: &str,
+            request: &AgentRequest,
+            _cancelled: &AtomicBool,
+            _runtime_log: Option<&crate::runtime_log::RuntimeLog>,
+            emit: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderError> {
+            assert!(request.tools.is_empty());
+            emit(ProviderEvent::ToolCalls(vec![RovenToolCall {
+                id: "unexpected".to_owned(),
+                name: "list_tools".to_owned(),
+                arguments: serde_json::json!({}),
+            }]));
+            emit(ProviderEvent::Finished);
+            Ok(())
         }
     }
 
@@ -1084,6 +1339,283 @@ mod tests {
             super::slash_command("/model"),
             Some(super::SlashCommand::Model)
         );
+    }
+
+    #[test]
+    fn resume_generation_prompt_uses_only_supplied_evidence() {
+        let evidence = vec![ProjectEvidence {
+            name: "Roven".to_owned(),
+            summary: "Project memory assistant".to_owned(),
+        }];
+        let prompt = resume_generation_prompt("Rust role", &evidence);
+
+        assert!(prompt.contains("Rust role"));
+        assert!(prompt.contains("Roven"));
+        assert!(prompt.contains("Project memory assistant"));
+        assert!(prompt.contains("Do not invent"));
+        assert!(!prompt.contains("Other project"));
+    }
+
+    #[test]
+    fn resume_generation_preparation_blocks_blank_and_missing_evidence_before_worker() {
+        let blank = prepare_resume_generation("/generate-resume", || {
+            panic!("blank requests must not load evidence")
+        });
+        assert!(blank.unwrap_err().contains("Enter a job description"));
+
+        let missing = prepare_resume_generation("/generate-resume\nRust role", || Ok(Vec::new()));
+        assert!(
+            missing
+                .unwrap_err()
+                .contains("No project summaries available")
+        );
+    }
+
+    #[test]
+    fn resume_generation_submit_gate_blocks_persistence_and_worker_setup_without_evidence() {
+        let data = temp_root("resume-generation-submit-gate-data");
+        let project = temp_root("resume-generation-submit-gate-project");
+        let store = ProjectStore::for_project(&data, &project).unwrap();
+        let mut state = AppState::new();
+        let mut session = None;
+        state.input = "/generate-resume\nRust role".to_owned();
+
+        let turn =
+            submit_terminal_turn(
+                &mut state,
+                &store,
+                &mut session,
+                "",
+                None,
+                || Ok(Vec::new()),
+            )
+            .unwrap();
+
+        assert!(turn.is_none());
+        assert!(session.is_none());
+        assert!(!state.running);
+        assert!(
+            state
+                .messages
+                .iter()
+                .all(|message| message.role != Role::User)
+        );
+        assert!(store.list_sessions().unwrap().is_empty());
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn resume_generation_submit_turn_persists_raw_history_and_builds_no_tools_worker() {
+        let data = temp_root("resume-generation-submit-data");
+        let project = temp_root("resume-generation-submit-project");
+        let store = ProjectStore::for_project(&data, &project).unwrap();
+        let mut state = AppState::new();
+        let mut session = None;
+        let raw = "/generate-resume\nRust role";
+        state.input = raw.to_owned();
+
+        let turn = submit_terminal_turn(&mut state, &store, &mut session, "", None, || {
+            Ok(vec![ProjectEvidence {
+                name: "Roven".to_owned(),
+                summary: "Project memory assistant".to_owned(),
+            }])
+        })
+        .unwrap()
+        .expect("valid resume request should produce a worker turn");
+
+        let active_session = session.expect("resume turn should create a session");
+        assert!(state.running);
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| { message.role == Role::User && message.content == raw })
+        );
+        assert_eq!(store.events(&active_session.id).unwrap()[0].content, raw);
+        assert!(matches!(
+            turn.messages.last(),
+            Some(AgentMessage::User { content })
+                if content.contains("Rust role")
+                    && content.contains("Project: Roven")
+                    && content.contains("Project memory assistant")
+        ));
+        assert!(!turn.allow_tools);
+        assert!(
+            AgentRequest::new(turn.messages, turn.allow_tools)
+                .tools
+                .is_empty()
+        );
+
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn resume_generation_terminal_turn_preserves_raw_history_and_rejects_tools() {
+        let generation = prepare_resume_generation("/generate-resume\nRust role", || {
+            Ok(vec![
+                ProjectEvidence {
+                    name: "Zeta".to_owned(),
+                    summary: "Zeta summary".to_owned(),
+                },
+                ProjectEvidence {
+                    name: "Ignored".to_owned(),
+                    summary: "   ".to_owned(),
+                },
+                ProjectEvidence {
+                    name: "Alpha".to_owned(),
+                    summary: "Alpha summary".to_owned(),
+                },
+            ])
+        })
+        .unwrap()
+        .expect("evidence should start a resume turn");
+        assert!(
+            generation.provider_prompt.find("Project: Alpha")
+                < generation.provider_prompt.find("Project: Zeta")
+        );
+        assert!(!generation.provider_prompt.contains("Ignored"));
+
+        let data = temp_root("resume-generation-history-data");
+        let project = temp_root("resume-generation-history-project");
+        let store = ProjectStore::for_project(&data, &project).unwrap();
+        let raw = "/generate-resume\nRust role";
+        let session = store.create_session(raw).unwrap();
+        store
+            .append_event(
+                &session.id,
+                &ConversationEvent::message(EventKind::User, raw.to_owned(), None),
+            )
+            .unwrap();
+        let mut messages = super::request_messages(&store, &session, "").unwrap();
+        generation.apply_to_provider_messages(&mut messages);
+
+        assert_eq!(store.events(&session.id).unwrap()[0].content, raw);
+        assert!(matches!(
+            messages.last(),
+            Some(AgentMessage::User { content }) if content == &generation.provider_prompt
+        ));
+        assert!(!generation.allow_tools());
+        assert!(
+            AgentRequest::new(messages.clone(), generation.allow_tools())
+                .tools
+                .is_empty()
+        );
+
+        let workspace = temp_root("resume-generation-no-tools");
+        let context = crate::tools::ToolContext::new(workspace.clone()).unwrap();
+        let events = RefCell::new(Vec::new());
+        let result = agent::run(
+            AgentRun {
+                provider: &UnexpectedToolCallProvider,
+                api_key: "key",
+                tool_context: &context,
+                context_window: None,
+                cancelled: &AtomicBool::new(false),
+                runtime_log: None,
+                allow_tools: generation.allow_tools(),
+            },
+            messages,
+            &mut |event| events.borrow_mut().push(event),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected tool call in no-tools turn")
+        );
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolResult { .. }))
+        );
+
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(project).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn resume_generation_saves_only_completed_visible_assistant_output() {
+        let root = temp_root("resume-generation");
+        let resumes = ResumeStore::for_data_root(root.clone());
+        let mut state = AppState::new();
+        state.start_resume_generation();
+        state.append_thought("Plan response".to_owned());
+        state.append_agent_text("# Projects\n\n- Roven".to_owned());
+        apply_worker_event_with_resume_store(
+            &mut state,
+            None,
+            None,
+            Some(&resumes),
+            None,
+            WorkerEvent::Finished,
+        );
+
+        let saved = fs::read_dir(root.join("resumes"))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            fs::read_to_string(saved[0].path()).unwrap(),
+            "# Projects\n\n- Roven"
+        );
+        assert!(state.messages.iter().any(|message| {
+            message.role == Role::Activity && message.content.starts_with("Resume saved:")
+        }));
+
+        for event in [
+            WorkerEvent::Cancelled,
+            WorkerEvent::Error("provider failed".to_owned()),
+            WorkerEvent::Finished,
+        ] {
+            let mut state = AppState::new();
+            state.start_resume_generation();
+            if !matches!(event, WorkerEvent::Finished) {
+                state.append_agent_text("partial".to_owned());
+            }
+            apply_worker_event_with_resume_store(
+                &mut state,
+                None,
+                None,
+                Some(&resumes),
+                None,
+                event,
+            );
+        }
+        assert_eq!(fs::read_dir(root.join("resumes")).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_generation_reports_save_errors_as_activity() {
+        let parent = temp_root("resume-generation-save-error");
+        let blocked_data_root = parent.join("blocked-data-root");
+        fs::write(&blocked_data_root, "not a directory").unwrap();
+        let resumes = ResumeStore::for_data_root(blocked_data_root);
+        let mut state = AppState::new();
+        state.start_resume_generation();
+        state.append_agent_text("# Projects\n\n- Roven".to_owned());
+
+        apply_worker_event_with_resume_store(
+            &mut state,
+            None,
+            None,
+            Some(&resumes),
+            None,
+            WorkerEvent::Finished,
+        );
+
+        assert!(state.messages.iter().any(|message| {
+            message.role == Role::Activity
+                && message
+                    .content
+                    .starts_with("Could not save generated resume:")
+        }));
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
@@ -1388,8 +1920,9 @@ mod tests {
             result: serde_json::json!({"status": "ok"}),
         };
 
-        apply_worker_event(
+        apply_worker_event_with_resume_store(
             &mut state,
+            None,
             None,
             None,
             None,
@@ -1424,10 +1957,11 @@ mod tests {
         assert!(state.submit());
         state.start_agent();
         state.append_agent_text("partial response".to_owned());
-        apply_worker_event(
+        apply_worker_event_with_resume_store(
             &mut state,
             Some(&store),
             Some(&session),
+            None,
             None,
             WorkerEvent::Error("provider failed".to_owned()),
         );
@@ -1443,10 +1977,11 @@ mod tests {
         assert!(state.submit());
         state.start_agent();
         state.append_agent_text("stopped response".to_owned());
-        apply_worker_event(
+        apply_worker_event_with_resume_store(
             &mut state,
             Some(&store),
             Some(&session),
+            None,
             None,
             WorkerEvent::Cancelled,
         );

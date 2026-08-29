@@ -1,7 +1,10 @@
 [package]
 name = "roven"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+description = "Roven — Project Memory Assistant"
+repository = "https://github.com/roven-labs/roven"
+readme = "README.md"
 
 [dependencies]
 atomic-write-file = "0.3.0"
@@ -21,3 +24,10 @@ thiserror = "2.0.17"
 ureq = "3.4.0"
 url = "2.5.8"
 uuid = { version = "1.24.0", features = ["v7"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+] }

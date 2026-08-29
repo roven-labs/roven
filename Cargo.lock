@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "roven"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "atomic-write-file",
@@ -2087,6 +2087,7 @@ dependencies = [
  "ureq",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

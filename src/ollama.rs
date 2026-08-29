@@ -582,9 +582,12 @@ mod tests {
             body,
         )]);
         let provider = OllamaProvider::new(endpoint, "test-model".to_owned());
-        let request = AgentRequest::new(vec![AgentMessage::User {
-            content: "list the files".to_owned(),
-        }]);
+        let request = AgentRequest::new(
+            vec![AgentMessage::User {
+                content: "list the files".to_owned(),
+            }],
+            true,
+        );
         let mut events = Vec::new();
 
         provider
