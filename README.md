@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/roven-logo-white.png" alt="Roven" width="320">
+  <img src="assets/roven-symbol-white.png" alt="Roven symbol" width="160">
 </p>
 
 # Roven
