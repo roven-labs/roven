@@ -219,6 +219,14 @@ impl AppState {
         }
     }
 
+    pub(crate) fn insert_paste(&mut self, text: &str) {
+        if self.resume_entries.is_none() && self.model_selection.is_none() {
+            self.input
+                .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+            self.update_slash_command_menu();
+        }
+    }
+
     pub(crate) fn slash_commands(&self) -> impl Iterator<Item = SlashCommandInfo> + '_ {
         SLASH_COMMANDS.into_iter().filter(move |command| {
             self.slash_command_menu_open && !self.running && command.name.starts_with(&self.input)
@@ -540,6 +548,19 @@ mod tests {
             state
                 .slash_commands()
                 .any(|command| command.name == "/generate-resume")
+        );
+    }
+
+    #[test]
+    fn paste_preserves_multiline_input_without_submitting() {
+        let mut state = AppState::new();
+        state.insert_paste("/generate-resume\r\nRust role\r\nBuild APIs");
+
+        assert_eq!(state.input, "/generate-resume\nRust role\nBuild APIs");
+        assert!(state.messages.is_empty());
+        assert_eq!(
+            generate_resume_job_description(&state.input),
+            Some("Rust role\nBuild APIs")
         );
     }
 

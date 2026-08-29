@@ -12,8 +12,8 @@ use std::{
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
@@ -353,6 +353,28 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
         }
         if state.running {
             match event {
+                Event::Paste(text) => state.insert_paste(&text),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('v'),
+                    modifiers,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    #[cfg(windows)]
+                    if let Ok(Some(text)) = read_clipboard_text() {
+                        state.insert_paste(&text);
+                    }
+                }
+                Event::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Right),
+                    ..
+                }) =>
+                {
+                    #[cfg(windows)]
+                    if let Ok(Some(text)) = read_clipboard_text() {
+                        state.insert_paste(&text);
+                    }
+                }
                 Event::Key(KeyEvent {
                     code: KeyCode::Esc, ..
                 }) => {
@@ -400,6 +422,28 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
             continue;
         }
         match event {
+            Event::Paste(text) => state.insert_paste(&text),
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('v'),
+                modifiers,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            }) if modifiers.contains(KeyModifiers::CONTROL) => {
+                #[cfg(windows)]
+                if let Ok(Some(text)) = read_clipboard_text() {
+                    state.insert_paste(&text);
+                }
+            }
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                ..
+            }) =>
+            {
+                #[cfg(windows)]
+                if let Ok(Some(text)) = read_clipboard_text() {
+                    state.insert_paste(&text);
+                }
+            }
             Event::Key(KeyEvent {
                 code: KeyCode::Esc,
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
@@ -1059,6 +1103,60 @@ fn is_ctrl_c(event: &Event) -> bool {
     matches!(event, Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers, .. }) if modifiers.contains(KeyModifiers::CONTROL))
 }
 
+#[cfg(windows)]
+fn read_clipboard_text() -> io::Result<Option<String>> {
+    use std::{mem::size_of, slice};
+
+    use windows_sys::Win32::System::{
+        DataExchange::{
+            CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+        },
+        Memory::{GlobalLock, GlobalSize, GlobalUnlock},
+        Ole::CF_UNICODETEXT,
+    };
+
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let result = if IsClipboardFormatAvailable(CF_UNICODETEXT as u32) == 0 {
+            Ok(None)
+        } else {
+            let handle = GetClipboardData(CF_UNICODETEXT as u32);
+            if handle.is_null() {
+                Err(io::Error::last_os_error())
+            } else {
+                let locked = GlobalLock(handle).cast::<u16>();
+                if locked.is_null() {
+                    Err(io::Error::last_os_error())
+                } else {
+                    let units = GlobalSize(handle) / size_of::<u16>();
+                    let contents = slice::from_raw_parts(locked, units);
+                    let length = contents.iter().position(|character| *character == 0);
+                    let text =
+                        match length {
+                            Some(length) => String::from_utf16(&contents[..length])
+                                .map(Some)
+                                .map_err(|_| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "clipboard is not UTF-16",
+                                    )
+                                }),
+                            None => Ok(None),
+                        };
+                    GlobalUnlock(handle);
+                    text
+                }
+            }
+        };
+
+        CloseClipboard();
+        result
+    }
+}
+
 struct TerminalGuard {
     active: bool,
 }
@@ -1070,6 +1168,7 @@ impl TerminalGuard {
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
+            EnableBracketedPaste,
             Hide,
             Clear(ClearType::All)
         ) {
@@ -1083,7 +1182,13 @@ impl TerminalGuard {
             return Ok(());
         }
         let mut stdout = io::stdout();
-        let terminal_result = execute!(stdout, Show, DisableMouseCapture, LeaveAlternateScreen);
+        let terminal_result = execute!(
+            stdout,
+            Show,
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let raw_mode_result = terminal::disable_raw_mode();
         self.active = false;
         terminal_result.and(raw_mode_result)

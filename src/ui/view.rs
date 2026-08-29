@@ -616,8 +616,8 @@ mod tests {
         for (row, mark_line) in rows[5..10].iter().zip(EXPECTED_MARK) {
             assert_eq!(row.trim(), mark_line);
         }
-        assert!(rows[16].contains("Status line"));
-        assert!(rows[17..20].iter().any(|row| row.contains("/register")));
+        assert!(rows[15].contains("Status line"));
+        assert!(rows[16..20].iter().any(|row| row.contains("/register")));
     }
 
     #[test]
