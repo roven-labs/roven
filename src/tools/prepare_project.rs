@@ -6,11 +6,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::storage::{ProjectRegistration, ProjectRegistry, RegistrationLookup};
+use crate::storage::{ProjectRegistry, ProjectSnapshot, RegistrationLookup, RepositoryMetadata};
 
 use super::{RovenToolDefinition, ToolContext};
 
-const PREPARE_PROJECT_DESCRIPTION: &str = "Validate and register the currently trusted project for first-time use with Roven, or replace its concise `summary` section after registration. Pass `.` as the path for the current trusted workspace on every call. Registration validates the project path, existing Roven registration, Git repository, GitHub remote, committed baseline, and clean working state, then stores the minimal project registration. Section updates accept only section_name `summary`, text, and operation `replace`; they update local Roven registration data and do not inspect or modify the project repository.";
+const PREPARE_PROJECT_DESCRIPTION: &str = "Validate and register the currently trusted project for first-time use with Roven. Pass `.` as the path for the current trusted workspace and provide the resume-ready project name. Registration validates the project path, existing Roven registration, Git repository, GitHub remote, committed baseline, and clean working state, then stores the V2 project snapshot and repository metadata.";
 
 pub(super) fn definition() -> RovenToolDefinition {
     RovenToolDefinition {
@@ -20,33 +20,23 @@ pub(super) fn definition() -> RovenToolDefinition {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path to the currently trusted project directory." },
-                "section_name": { "type": "string", "enum": ["summary"], "description": "Registration section to replace; version one accepts only summary." },
-                "text": { "type": "string", "description": "Non-empty concise report text for the selected section." },
-                "operation": { "type": "string", "enum": ["replace"], "description": "Update operation; version one accepts only replace." }
+                "project_name": { "type": "string", "description": "Resume-ready name for the project." },
+                "project_facts": { "type": "array", "items": { "type": "string" }, "description": "Repository-derived resume facts." },
+                "user_context_facts": { "type": "array", "items": { "type": "string" }, "description": "User-provided project context facts." },
+                "user_contribution_facts": { "type": "array", "items": { "type": "string" }, "description": "User-provided contribution facts." }
             },
-            "required": ["path"],
+            "required": ["path", "project_name"],
             "additionalProperties": false
         }),
     }
 }
 
 pub(super) fn dispatch(context: &ToolContext, arguments: Value) -> serde_json::Result<Value> {
-    let has_null_section_field = ["section_name", "text", "operation"]
-        .iter()
-        .any(|key| arguments.get(*key).is_some_and(Value::is_null));
-    if has_null_section_field {
-        serde_json::to_value(PrepareProjectResult::blocked(
-            BlockedReason::InvalidSectionUpdate,
-        ))
-    } else {
-        match serde_json::from_value::<PrepareProjectInput>(arguments) {
-            Ok(input) => {
-                serde_json::to_value(PrepareProject::for_current_user().execute(context, input))
-            }
-            Err(_) => {
-                serde_json::to_value(PrepareProjectResult::blocked(BlockedReason::InvalidPath))
-            }
+    match serde_json::from_value::<PrepareProjectInput>(arguments) {
+        Ok(input) => {
+            serde_json::to_value(PrepareProject::for_current_user().execute(context, input))
         }
+        Err(_) => serde_json::to_value(PrepareProjectResult::blocked(BlockedReason::InvalidPath)),
     }
 }
 
@@ -54,9 +44,13 @@ pub(super) fn dispatch(context: &ToolContext, arguments: Value) -> serde_json::R
 #[serde(deny_unknown_fields)]
 struct PrepareProjectInput {
     path: String,
-    section_name: Option<String>,
-    text: Option<String>,
-    operation: Option<String>,
+    project_name: String,
+    #[serde(default)]
+    project_facts: Vec<String>,
+    #[serde(default)]
+    user_context_facts: Vec<String>,
+    #[serde(default)]
+    user_contribution_facts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -64,7 +58,6 @@ struct PrepareProjectInput {
 enum PrepareProjectResult {
     Prepared { project: PreparedProject },
     AlreadyAdded { project: ExistingProject },
-    SummarySaved { project: ExistingProject },
     Blocked { reason: BlockedReason },
 }
 
@@ -99,8 +92,7 @@ enum BlockedReason {
     NoGithubRemote,
     RepositoryNotClean,
     StorageFailure,
-    InvalidSectionUpdate,
-    NotRegistered,
+    InvalidProjectName,
 }
 
 struct PrepareProject {
@@ -133,26 +125,13 @@ impl PrepareProject {
             Ok(registry) => registry,
             Err(()) => return PrepareProjectResult::blocked(BlockedReason::StorageFailure),
         };
-        match (input.section_name, input.text, input.operation) {
-            (None, None, None) => {}
-            (Some(section_name), Some(text), Some(operation)) => {
-                if section_name != "summary" || operation != "replace" || text.trim().is_empty() {
-                    return PrepareProjectResult::blocked(BlockedReason::InvalidSectionUpdate);
-                }
-                return match registry.replace_section(&project_path, &section_name, &text) {
-                    Ok(Some(registration)) => PrepareProjectResult::SummarySaved {
-                        project: existing_project(registration),
-                    },
-                    Ok(None) => PrepareProjectResult::blocked(BlockedReason::NotRegistered),
-                    Err(_) => PrepareProjectResult::blocked(BlockedReason::StorageFailure),
-                };
-            }
-            _ => return PrepareProjectResult::blocked(BlockedReason::InvalidSectionUpdate),
+        if input.project_name.trim().is_empty() {
+            return PrepareProjectResult::blocked(BlockedReason::InvalidProjectName);
         }
         match registry.lookup(&project_path) {
             Ok(RegistrationLookup::Registered(registration)) => {
                 return PrepareProjectResult::AlreadyAdded {
-                    project: existing_project(*registration),
+                    project: existing_project(*registration, &project_path),
                 };
             }
             Ok(RegistrationLookup::Absent) => {}
@@ -175,9 +154,19 @@ impl PrepareProject {
         if !git_is_clean(&project_path) || git_operation_in_progress(&project_path) {
             return PrepareProjectResult::blocked(BlockedReason::RepositoryNotClean);
         }
-        match registry.register(&project_path, github_remote, baseline_commit) {
-            Ok(registration) => PrepareProjectResult::Prepared {
-                project: prepared_project(registration),
+        let metadata = RepositoryMetadata {
+            github_remote,
+            baseline_commit,
+        };
+        let snapshot = ProjectSnapshot {
+            project_name: input.project_name,
+            project_facts: input.project_facts,
+            user_context_facts: input.user_context_facts,
+            user_contribution_facts: input.user_contribution_facts,
+        };
+        match registry.register(&project_path, snapshot, &metadata) {
+            Ok(snapshot) => PrepareProjectResult::Prepared {
+                project: prepared_project(snapshot, &project_path, metadata),
             },
             Err(_) => PrepareProjectResult::blocked(BlockedReason::StorageFailure),
         }
@@ -198,19 +187,23 @@ fn canonical_project_path(context: &ToolContext, path: &str) -> Option<PathBuf> 
     canonical.is_dir().then_some(canonical)
 }
 
-fn existing_project(registration: ProjectRegistration) -> ExistingProject {
+fn existing_project(snapshot: ProjectSnapshot, project_path: &Path) -> ExistingProject {
     ExistingProject {
-        name: registration.name,
-        path: registration.canonical_path,
+        name: snapshot.project_name,
+        path: project_path.to_string_lossy().into_owned(),
     }
 }
 
-fn prepared_project(registration: ProjectRegistration) -> PreparedProject {
+fn prepared_project(
+    snapshot: ProjectSnapshot,
+    project_path: &Path,
+    metadata: RepositoryMetadata,
+) -> PreparedProject {
     PreparedProject {
-        name: registration.name,
-        path: registration.canonical_path,
-        github_remote: registration.github_remote,
-        baseline_commit: registration.baseline_commit,
+        name: snapshot.project_name,
+        path: project_path.to_string_lossy().into_owned(),
+        github_remote: metadata.github_remote,
+        baseline_commit: metadata.baseline_commit,
     }
 }
 
@@ -335,9 +328,11 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::storage::{ProjectRegistry, RegistrationLookup};
+    use crate::storage::{
+        ProjectRegistry, ProjectSnapshot, RegistrationLookup, RepositoryMetadata,
+    };
 
-    use super::super::{RovenToolCall, definitions, dispatch};
+    use super::super::definitions;
     use super::*;
     fn temp_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("roven-{name}-{}", uuid::Uuid::now_v7()));
@@ -352,18 +347,36 @@ mod tests {
     fn input(path: &Path) -> PrepareProjectInput {
         PrepareProjectInput {
             path: path.to_string_lossy().into_owned(),
-            section_name: None,
-            text: None,
-            operation: None,
+            project_name: "Test Project".to_owned(),
+            project_facts: Vec::new(),
+            user_context_facts: Vec::new(),
+            user_contribution_facts: Vec::new(),
         }
     }
 
     fn input_value(path: &str) -> PrepareProjectInput {
         PrepareProjectInput {
             path: path.to_owned(),
-            section_name: None,
-            text: None,
-            operation: None,
+            project_name: "Test Project".to_owned(),
+            project_facts: Vec::new(),
+            user_context_facts: Vec::new(),
+            user_contribution_facts: Vec::new(),
+        }
+    }
+
+    fn snapshot(name: &str) -> ProjectSnapshot {
+        ProjectSnapshot {
+            project_name: name.to_owned(),
+            project_facts: Vec::new(),
+            user_context_facts: Vec::new(),
+            user_contribution_facts: Vec::new(),
+        }
+    }
+
+    fn metadata() -> RepositoryMetadata {
+        RepositoryMetadata {
+            github_remote: "https://github.com/roven/example".to_owned(),
+            baseline_commit: "abc123".to_owned(),
         }
     }
 
@@ -417,11 +430,7 @@ mod tests {
         fs::create_dir_all(&sibling).unwrap();
         let registry = ProjectRegistry::for_data_root(&data);
         let existing = registry
-            .register(
-                &sibling,
-                "https://github.com/roven/project-two".to_owned(),
-                "existing-baseline".to_owned(),
-            )
+            .register(&sibling, snapshot("Existing"), &metadata())
             .unwrap();
         let tool = PrepareProject::for_data_root(&data);
 
@@ -531,6 +540,7 @@ mod tests {
             value["project"]["path"],
             project.canonicalize().unwrap().to_string_lossy().as_ref()
         );
+        assert_eq!(value["project"]["name"], "Test Project");
         assert_eq!(
             value["project"]["github_remote"],
             "git@github.com:roven/example.git"
@@ -550,11 +560,7 @@ mod tests {
         let project = temp_root("project");
         let registry = ProjectRegistry::for_data_root(&data);
         registry
-            .register(
-                &project,
-                "https://github.com/roven/example".to_owned(),
-                "abc123".to_owned(),
-            )
+            .register(&project, snapshot("Existing"), &metadata())
             .unwrap();
         let tool = PrepareProject::for_data_root(&data);
 
@@ -589,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_project_input_rejects_values_beyond_the_project_path() {
+    fn prepare_project_input_requires_a_project_name_and_rejects_unknown_fields() {
         assert!(
             serde_json::from_value::<PrepareProjectInput>(serde_json::json!({
                 "path": "C:/project",
@@ -597,136 +603,39 @@ mod tests {
             }))
             .is_err()
         );
+        assert!(
+            serde_json::from_value::<PrepareProjectInput>(serde_json::json!({
+                "path": "C:/project"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
-    fn prepare_project_schema_allows_only_the_summary_replace_update() {
+    fn prepare_project_schema_requires_a_project_name() {
         let prepare_project = definitions()
             .into_iter()
             .find(|definition| definition.name == "prepare_project")
             .expect("prepare_project must be registered");
         assert_eq!(
-            prepare_project.input_schema["properties"]["section_name"]["enum"],
-            json!(["summary"])
+            prepare_project.input_schema["properties"]["project_name"]["type"],
+            "string"
         );
         assert_eq!(
-            prepare_project.input_schema["properties"]["operation"]["enum"],
-            json!(["replace"])
+            prepare_project.input_schema["required"],
+            json!(["path", "project_name"])
         );
-        assert_eq!(prepare_project.input_schema["required"], json!(["path"]));
-        assert_eq!(prepare_project.input_schema["additionalProperties"], false);
-    }
-
-    #[test]
-    fn prepare_project_dispatch_blocks_explicit_null_section_fields() {
-        let workspace = temp_root("null-section-workspace");
-        let result = dispatch(
-            &context(&workspace),
-            RovenToolCall {
-                id: "null-section".to_owned(),
-                name: "prepare_project".to_owned(),
-                arguments: json!({ "path": ".", "section_name": null }),
-            },
-        );
-
-        assert_eq!(
-            result.result,
-            json!({
-                "status": "blocked",
-                "reason": "invalid_section_update"
-            })
-        );
-        fs::remove_dir_all(workspace).unwrap();
-    }
-
-    #[test]
-    fn summary_update_requires_a_registered_project_and_replaces_text() {
-        let data = temp_root("summary-data");
-        let project = ready_project("summary-project");
-        let registry = ProjectRegistry::for_data_root(&data);
-        let tool = PrepareProject::for_data_root(&data);
-        let update = |text: &str| PrepareProjectInput {
-            path: ".".to_owned(),
-            section_name: Some("summary".to_owned()),
-            text: Some(text.to_owned()),
-            operation: Some("replace".to_owned()),
-        };
-
-        assert_eq!(
-            tool.execute(&context(&project), update("report")),
-            PrepareProjectResult::Blocked {
-                reason: BlockedReason::NotRegistered
-            }
-        );
-        assert!(matches!(
-            tool.execute(&context(&project), input_value(".")),
-            PrepareProjectResult::Prepared { .. }
-        ));
-        let result = tool.execute(&context(&project), update("report"));
-        assert_eq!(
-            serde_json::to_value(result).unwrap()["status"],
-            "summary_saved"
-        );
-        let saved = registry.lookup(&project).unwrap();
-        let RegistrationLookup::Registered(saved) = saved else {
-            panic!("summary update should keep registration");
-        };
-        assert_eq!(saved.sections["summary"], "report");
-        let registration_files = fs::read_dir(data.join("projects"))
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    == Some("json")
-            })
-            .count();
-        assert_eq!(registration_files, 1);
-        assert_eq!(
-            tool.execute(
-                &context(&project),
-                PrepareProjectInput {
-                    path: ".".to_owned(),
-                    section_name: Some("summary".to_owned()),
-                    text: Some("  ".to_owned()),
-                    operation: Some("replace".to_owned()),
-                },
-            ),
-            PrepareProjectResult::Blocked {
-                reason: BlockedReason::InvalidSectionUpdate
-            }
-        );
-        for invalid in [
-            PrepareProjectInput {
-                path: ".".to_owned(),
-                section_name: Some("summary".to_owned()),
-                text: Some("report".to_owned()),
-                operation: None,
-            },
-            PrepareProjectInput {
-                path: ".".to_owned(),
-                section_name: Some("details".to_owned()),
-                text: Some("report".to_owned()),
-                operation: Some("replace".to_owned()),
-            },
-            PrepareProjectInput {
-                path: ".".to_owned(),
-                section_name: Some("summary".to_owned()),
-                text: Some("report".to_owned()),
-                operation: Some("append".to_owned()),
-            },
+        for property in [
+            "project_facts",
+            "user_context_facts",
+            "user_contribution_facts",
         ] {
             assert_eq!(
-                tool.execute(&context(&project), invalid),
-                PrepareProjectResult::Blocked {
-                    reason: BlockedReason::InvalidSectionUpdate
-                }
+                prepare_project.input_schema["properties"][property]["type"],
+                "array"
             );
         }
-        fs::remove_dir_all(data).unwrap();
-        fs::remove_dir_all(project).unwrap();
+        assert_eq!(prepare_project.input_schema["additionalProperties"], false);
     }
 
     #[test]

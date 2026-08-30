@@ -57,9 +57,12 @@ impl ListProject {
                 reason: ListProjectErrorReason::StorageFailure,
             };
         };
-        match registry.list() {
+        match registry.list_snapshots() {
             Ok(projects) => ListProjectResult::Ok {
-                projects: projects.into_iter().map(|project| project.name).collect(),
+                projects: projects
+                    .into_iter()
+                    .map(|project| project.project_name)
+                    .collect(),
             },
             Err(_) => ListProjectResult::Error {
                 reason: ListProjectErrorReason::StorageFailure,
@@ -77,6 +80,8 @@ mod tests {
     };
 
     use serde_json::json;
+
+    use crate::storage::{ProjectSnapshot, RepositoryMetadata};
 
     use super::super::{RovenToolCall, ToolContext, definitions, dispatch};
     use super::*;
@@ -147,6 +152,45 @@ mod tests {
             tool.name == "list_project" && tool.description == LIST_PROJECT_DESCRIPTION
         }));
 
+        fs::remove_dir_all(zeta).unwrap();
+    }
+
+    #[test]
+    fn list_project_returns_snapshot_names_alphabetically() {
+        let data = temp_root("successful-list");
+        let alpha = temp_root("alpha-project");
+        let zeta = temp_root("zeta-project");
+        let registry = ProjectRegistry::for_data_root(&data);
+        let metadata = RepositoryMetadata {
+            github_remote: "https://github.com/roven/example.git".to_owned(),
+            baseline_commit: "abc123".to_owned(),
+        };
+        for (project, name) in [(&zeta, "Zeta"), (&alpha, "Alpha")] {
+            registry
+                .register(
+                    project,
+                    ProjectSnapshot {
+                        project_name: name.to_owned(),
+                        project_facts: Vec::new(),
+                        user_context_facts: Vec::new(),
+                        user_contribution_facts: Vec::new(),
+                    },
+                    &metadata,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            ListProject {
+                registry: Ok(registry),
+            }
+            .execute(),
+            ListProjectResult::Ok {
+                projects: vec!["Alpha".to_owned(), "Zeta".to_owned()]
+            }
+        );
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(alpha).unwrap();
         fs::remove_dir_all(zeta).unwrap();
     }
 }

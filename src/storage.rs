@@ -1,7 +1,7 @@
 //! Project-scoped, crash-resistant conversation storage.
 
 use std::{
-    collections::BTreeMap,
+    collections::BTreeSet,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -21,40 +21,72 @@ pub(crate) enum StorageError {
     Io(#[from] std::io::Error),
     #[error("local Roven storage contains invalid structured data")]
     Json(#[from] serde_json::Error),
+    #[error("project is already registered")]
+    AlreadyRegistered,
+    #[error("project name is already registered: {0}")]
+    DuplicateProjectName(String),
+    #[error("local Roven storage contains invalid project data: {0}")]
+    InvalidProjectData(String),
 }
 
-/// Minimal durable identity for a project that has passed preparation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ProjectRegistration {
-    pub(crate) name: String,
-    pub(crate) canonical_path: String,
+pub(crate) struct ProjectSnapshot {
+    pub(crate) project_name: String,
+    pub(crate) project_facts: Vec<String>,
+    pub(crate) user_context_facts: Vec<String>,
+    pub(crate) user_contribution_facts: Vec<String>,
+}
+
+impl ProjectSnapshot {
+    fn validate(&self) -> Result<(), StorageError> {
+        if self.project_name.trim().is_empty() {
+            return Err(StorageError::InvalidProjectData(
+                "project_name must not be blank".to_owned(),
+            ));
+        }
+        if self
+            .project_facts
+            .iter()
+            .chain(&self.user_context_facts)
+            .chain(&self.user_contribution_facts)
+            .any(|fact| fact.trim().is_empty())
+        {
+            return Err(StorageError::InvalidProjectData(
+                "fact entries must not be blank".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RepositoryMetadata {
     pub(crate) github_remote: String,
     pub(crate) baseline_commit: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) sections: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProjectEvidence {
-    pub(crate) name: String,
-    pub(crate) summary: String,
-}
-
-impl ProjectEvidence {
-    fn from_registration(registration: ProjectRegistration) -> Option<Self> {
-        let summary = registration.sections.get("summary")?.clone();
-        (!summary.trim().is_empty()).then_some(Self {
-            name: registration.name,
-            summary,
-        })
+impl RepositoryMetadata {
+    fn validate(&self) -> Result<(), StorageError> {
+        if self.github_remote.trim().is_empty() {
+            return Err(StorageError::InvalidProjectData(
+                "github_remote must not be blank".to_owned(),
+            ));
+        }
+        if self.baseline_commit.trim().is_empty() {
+            return Err(StorageError::InvalidProjectData(
+                "baseline_commit must not be blank".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RegistrationLookup {
     Absent,
-    Registered(Box<ProjectRegistration>),
+    Registered(Box<ProjectSnapshot>),
 }
 
 /// Registration storage deliberately separate from conversation storage.
@@ -106,139 +138,97 @@ impl ProjectRegistry {
 
     pub(crate) fn lookup(&self, project_root: &Path) -> Result<RegistrationLookup, StorageError> {
         let canonical_root = project_root.canonicalize()?;
-        if let Some(registration) = self.find_registration(&canonical_root)? {
-            return Ok(RegistrationLookup::Registered(Box::new(registration)));
+        let project_dir = self.project_dir(&canonical_root);
+        if project_dir.exists() {
+            let (snapshot, _) = self.read(&canonical_root)?;
+            return Ok(RegistrationLookup::Registered(Box::new(snapshot)));
         }
         Ok(RegistrationLookup::Absent)
     }
 
-    pub(crate) fn list(&self) -> Result<Vec<ProjectRegistration>, StorageError> {
+    pub(crate) fn list_snapshots(&self) -> Result<Vec<ProjectSnapshot>, StorageError> {
         let projects_dir = self.projects_dir();
         if !projects_dir.exists() {
             return Ok(Vec::new());
         }
-        let mut registrations = fs::read_dir(projects_dir)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension().and_then(|extension| extension.to_str()) == Some("json")
-            })
-            .map(|path| read_json::<ProjectRegistration>(&path))
-            .collect::<Result<Vec<_>, _>>()?;
-        registrations.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(registrations)
-    }
-
-    pub(crate) fn resume_evidence(&self) -> Result<Vec<ProjectEvidence>, StorageError> {
-        Ok(self
-            .list()?
-            .into_iter()
-            .filter_map(ProjectEvidence::from_registration)
-            .collect())
+        let mut names = BTreeSet::new();
+        let mut snapshots = Vec::new();
+        for entry in fs::read_dir(projects_dir)? {
+            let path = entry?.path();
+            if !path.is_dir() {
+                return Err(StorageError::InvalidProjectData(
+                    "project storage entries must be directories".to_owned(),
+                ));
+            }
+            let (snapshot, _) = self.read_project_dir(&path)?;
+            if !names.insert(snapshot.project_name.clone()) {
+                return Err(StorageError::DuplicateProjectName(snapshot.project_name));
+            }
+            snapshots.push(snapshot);
+        }
+        snapshots.sort_by(|left, right| left.project_name.cmp(&right.project_name));
+        Ok(snapshots)
     }
 
     pub(crate) fn register(
         &self,
         project_root: &Path,
-        github_remote: String,
-        baseline_commit: String,
-    ) -> Result<ProjectRegistration, StorageError> {
+        snapshot: ProjectSnapshot,
+        metadata: &RepositoryMetadata,
+    ) -> Result<ProjectSnapshot, StorageError> {
         let canonical_root = project_root.canonicalize()?;
-        let name = project_name(&canonical_root);
-        let registration = ProjectRegistration {
-            name: name.clone(),
-            canonical_path: canonical_root.to_string_lossy().into_owned(),
-            github_remote,
-            baseline_commit,
-            sections: BTreeMap::new(),
-        };
-        let project_dir = self.projects_dir();
-        fs::create_dir_all(&project_dir)?;
-        write_json(
-            &self.project_registration_file(&canonical_root, &name)?,
-            &registration,
-        )?;
-        Ok(registration)
+        snapshot.validate()?;
+        metadata.validate()?;
+        if self
+            .list_snapshots()?
+            .iter()
+            .any(|existing| existing.project_name == snapshot.project_name)
+        {
+            return Err(StorageError::DuplicateProjectName(
+                snapshot.project_name.clone(),
+            ));
+        }
+        fs::create_dir_all(self.projects_dir())?;
+        let project_dir = self.project_dir(&canonical_root);
+        if project_dir.exists() {
+            return Err(StorageError::AlreadyRegistered);
+        }
+        fs::create_dir(&project_dir)?;
+        if let Err(error) = write_json(&project_dir.join("repository_metadata.json"), &metadata)
+            .and_then(|()| write_json(&project_dir.join("project_snapshot.json"), &snapshot))
+        {
+            let _ = fs::remove_dir_all(&project_dir);
+            return Err(error);
+        }
+        Ok(snapshot)
     }
 
-    pub(crate) fn replace_section(
+    pub(crate) fn read(
         &self,
         project_root: &Path,
-        section_name: &str,
-        text: &str,
-    ) -> Result<Option<ProjectRegistration>, StorageError> {
+    ) -> Result<(ProjectSnapshot, RepositoryMetadata), StorageError> {
         let canonical_root = project_root.canonicalize()?;
-        let Some((path, mut registration)) = self.find_registration_entry(&canonical_root)? else {
-            return Ok(None);
-        };
-        registration
-            .sections
-            .insert(section_name.to_owned(), text.to_owned());
-        write_json(&path, &registration)?;
-        Ok(Some(registration))
+        self.read_project_dir(&self.project_dir(&canonical_root))
     }
 
     fn projects_dir(&self) -> PathBuf {
         self.data_root.join("projects")
     }
 
-    fn find_registration(
-        &self,
-        project_root: &Path,
-    ) -> Result<Option<ProjectRegistration>, StorageError> {
-        Ok(self
-            .find_registration_entry(project_root)?
-            .map(|(_, registration)| registration))
+    fn project_dir(&self, project_root: &Path) -> PathBuf {
+        self.projects_dir().join(project_id(project_root))
     }
 
-    fn find_registration_entry(
+    fn read_project_dir(
         &self,
-        project_root: &Path,
-    ) -> Result<Option<(PathBuf, ProjectRegistration)>, StorageError> {
-        let projects_dir = self.projects_dir();
-        if !projects_dir.exists() {
-            return Ok(None);
-        }
-        let canonical_path = project_root.to_string_lossy();
-        for entry in fs::read_dir(projects_dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-                continue;
-            }
-            let registration: ProjectRegistration = read_json(&path)?;
-            if registration.canonical_path == canonical_path {
-                return Ok(Some((path, registration)));
-            }
-        }
-        Ok(None)
-    }
-
-    fn project_registration_file(
-        &self,
-        project_root: &Path,
-        name: &str,
-    ) -> Result<PathBuf, StorageError> {
-        let base = safe_project_file_stem(name);
-        let default_path = self.projects_dir().join(format!("{base}.json"));
-        if self.file_is_available_for_project(&default_path, project_root)? {
-            return Ok(default_path);
-        }
-        Err(StorageError::Io(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "project registration file name collision",
-        )))
-    }
-
-    fn file_is_available_for_project(
-        &self,
-        path: &Path,
-        project_root: &Path,
-    ) -> Result<bool, StorageError> {
-        if !path.exists() {
-            return Ok(true);
-        }
-        let registration: ProjectRegistration = read_json(path)?;
-        Ok(registration.canonical_path == project_root.to_string_lossy())
+        project_dir: &Path,
+    ) -> Result<(ProjectSnapshot, RepositoryMetadata), StorageError> {
+        let snapshot: ProjectSnapshot = read_json(&project_dir.join("project_snapshot.json"))?;
+        let metadata: RepositoryMetadata =
+            read_json(&project_dir.join("repository_metadata.json"))?;
+        snapshot.validate()?;
+        metadata.validate()?;
+        Ok((snapshot, metadata))
     }
 }
 
@@ -413,33 +403,6 @@ pub(crate) fn project_id(project_root: &Path) -> String {
     )
 }
 
-fn project_name(project_root: &Path) -> String {
-    project_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or("project")
-        .to_owned()
-}
-
-fn safe_project_file_stem(name: &str) -> String {
-    let sanitized = name
-        .chars()
-        .map(|character| match character {
-            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
-            character if character.is_control() => '-',
-            character => character,
-        })
-        .collect::<String>()
-        .trim_matches([' ', '.'])
-        .to_owned();
-    if sanitized.is_empty() {
-        "project".to_owned()
-    } else {
-        sanitized
-    }
-}
-
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -483,8 +446,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        ConversationEvent, EventKind, ProjectEvidence, ProjectRegistration, ProjectRegistry,
-        ProjectStore, RegistrationLookup, ResumeStore, project_id,
+        ConversationEvent, EventKind, ProjectRegistry, ProjectSnapshot, ProjectStore,
+        RepositoryMetadata, ResumeStore, StorageError, project_id,
     };
 
     fn temp_root(name: &str) -> std::path::PathBuf {
@@ -500,272 +463,201 @@ mod tests {
         fs::remove_dir_all(root).expect("temporary root should be removed");
     }
 
-    #[test]
-    fn registration_is_written_as_a_project_named_json_file() {
-        let data = temp_root("data");
-        let project = temp_root("visible-project");
-        let registry = ProjectRegistry::for_data_root(&data);
+    fn snapshot(name: &str) -> ProjectSnapshot {
+        ProjectSnapshot {
+            project_name: name.to_owned(),
+            project_facts: vec!["Uses PostgreSQL.".to_owned()],
+            user_context_facts: vec!["Team project.".to_owned()],
+            user_contribution_facts: vec!["Built authentication.".to_owned()],
+        }
+    }
 
-        let registration = registry
-            .register(
-                &project,
-                "https://github.com/roven/visible-project.git".to_owned(),
-                "abc123".to_owned(),
-            )
+    fn metadata() -> RepositoryMetadata {
+        RepositoryMetadata {
+            github_remote: "https://github.com/example/project.git".to_owned(),
+            baseline_commit: "abc123".to_owned(),
+        }
+    }
+
+    #[test]
+    fn writes_and_reads_a_v2_snapshot_with_repository_metadata() {
+        let data = temp_root("v2-data");
+        let project = temp_root("project");
+        let registry = ProjectRegistry::for_data_root(&data);
+        let expected = snapshot("PayFlow");
+        let expected_metadata = metadata();
+
+        registry
+            .register(&project, expected.clone(), &expected_metadata)
             .unwrap();
 
-        let path = data.join("projects").join(format!(
-            "{}.json",
-            project.file_name().unwrap().to_string_lossy()
-        ));
-        assert!(path.is_file());
-        let value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert!(value.get("id").is_none());
-        assert!(value.get("created_at_ms").is_none());
-        assert!(value.get("updated_at_ms").is_none());
-        assert_eq!(value["name"], registration.name);
-        assert_eq!(value["canonical_path"], registration.canonical_path);
+        let project_dir = data.join("projects").join(project_id(&project));
+        assert!(project_dir.join("project_snapshot.json").is_file());
+        assert!(project_dir.join("repository_metadata.json").is_file());
+        assert_eq!(
+            registry.read(&project).unwrap(),
+            (expected, expected_metadata)
+        );
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(project).unwrap();
     }
 
     #[test]
-    fn registration_requires_the_current_shape() {
-        let registration = serde_json::json!({
-            "name": "project",
-            "canonical_path": "C:\\\\work\\\\project",
-            "github_remote": "https://github.com/roven/project.git",
-            "baseline_commit": "abc123"
-        });
-        let parsed = serde_json::from_value::<ProjectRegistration>(registration.clone()).unwrap();
-        assert_eq!(parsed.name, "project");
-        assert!(parsed.sections.is_empty());
-        for required in ["name", "canonical_path", "github_remote", "baseline_commit"] {
-            let mut incomplete = registration.clone();
-            incomplete.as_object_mut().unwrap().remove(required);
-            assert!(serde_json::from_value::<ProjectRegistration>(incomplete).is_err());
-        }
+    fn snapshot_json_has_exact_v2_fields() {
+        let value = serde_json::to_value(snapshot("Project")).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "project_name": "Project",
+                "project_facts": ["Uses PostgreSQL."],
+                "user_context_facts": ["Team project."],
+                "user_contribution_facts": ["Built authentication."]
+            })
+        );
         assert!(
-            serde_json::from_value::<ProjectRegistration>(serde_json::json!({
-                "name": "project",
-                "canonical_path": "C:\\\\work\\\\project",
-                "github_remote": "https://github.com/roven/project.git",
-                "baseline_commit": "abc123",
-                "unexpected": true
+            serde_json::from_value::<ProjectSnapshot>(serde_json::json!({
+                "project_name": "Project",
+                "project_facts": [],
+                "user_context_facts": [],
+                "user_contribution_facts": [],
+                "summary": "obsolete"
             }))
             .is_err()
         );
-        assert_eq!(
-            serde_json::from_value::<EventKind>(serde_json::json!("function_call_output")).unwrap(),
-            EventKind::FunctionCallOutput
-        );
     }
 
     #[test]
-    fn registry_reader_rejects_unknown_registration_fields() {
-        let data = temp_root("strict-reader-data");
-        let project = temp_root("strict-reader-project");
-        let registry = ProjectRegistry::for_data_root(&data);
-        let projects = data.join("projects");
-        fs::create_dir_all(&projects).unwrap();
+    fn rejects_malformed_json() {
+        let data = temp_root("malformed");
+        let project = temp_root("project");
+        let project_dir = data.join("projects").join(project_id(&project));
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(project_dir.join("project_snapshot.json"), "not json").unwrap();
         fs::write(
-            projects.join("invalid.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "name": "project",
-                "canonical_path": project.canonicalize().unwrap().to_string_lossy(),
-                "github_remote": "https://github.com/roven/project.git",
-                "baseline_commit": "abc123",
-                "unexpected": true
-            }))
-            .unwrap(),
+            project_dir.join("repository_metadata.json"),
+            serde_json::to_vec(&metadata()).unwrap(),
         )
         .unwrap();
-        assert!(registry.lookup(&project).is_err());
-        fs::remove_dir_all(data).unwrap();
-        fs::remove_dir_all(project).unwrap();
-    }
 
-    #[test]
-    fn registry_lookup_scans_project_json_files_by_canonical_path() {
-        let data = temp_root("data");
-        let project = temp_root("scan-project");
-        let registry = ProjectRegistry::for_data_root(&data);
-        let registration = registry
-            .register(
-                &project,
-                "https://github.com/roven/scan-project.git".to_owned(),
-                "abc123".to_owned(),
-            )
-            .unwrap();
-        let projects_dir = data.join("projects");
-        let original = projects_dir.join(format!(
-            "{}.json",
-            project.file_name().unwrap().to_string_lossy()
+        assert!(matches!(
+            ProjectRegistry::for_data_root(&data).list_snapshots(),
+            Err(StorageError::Json(_))
         ));
-        let renamed = projects_dir.join("user-chosen-name.json");
-        fs::rename(original, renamed).unwrap();
-
-        assert_eq!(
-            registry.lookup(&project).unwrap(),
-            RegistrationLookup::Registered(Box::new(registration))
-        );
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(project).unwrap();
     }
 
     #[test]
-    fn registry_lists_project_names_in_order_and_handles_empty_storage() {
-        let data = temp_root("list-projects");
-        let first = temp_root("zeta-project");
-        let second = temp_root("alpha-project");
+    fn lists_snapshot_names_alphabetically() {
+        let data = temp_root("sorted");
         let registry = ProjectRegistry::for_data_root(&data);
-
-        assert!(registry.list().unwrap().is_empty());
-        registry
-            .register(
-                &first,
-                "https://github.com/roven/zeta.git".to_owned(),
-                "abc".to_owned(),
-            )
-            .unwrap();
-        registry
-            .register(
-                &second,
-                "https://github.com/roven/alpha.git".to_owned(),
-                "def".to_owned(),
-            )
-            .unwrap();
+        for (folder, name) in [("zeta", "Zeta"), ("alpha", "Alpha")] {
+            let project = temp_root(folder);
+            registry
+                .register(&project, snapshot(name), &metadata())
+                .unwrap();
+        }
 
         let names = registry
-            .list()
+            .list_snapshots()
             .unwrap()
             .into_iter()
-            .map(|project| project.name)
+            .map(|snapshot| snapshot.project_name)
             .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec![
-                second.file_name().unwrap().to_string_lossy().into_owned(),
-                first.file_name().unwrap().to_string_lossy().into_owned(),
-            ]
-        );
+        assert_eq!(names, ["Alpha", "Zeta"]);
+        fs::remove_dir_all(data).unwrap();
+    }
 
+    #[test]
+    fn rejects_duplicate_path_without_overwriting() {
+        let data = temp_root("duplicate-path");
+        let project = temp_root("project");
+        let registry = ProjectRegistry::for_data_root(&data);
+        let first = snapshot("First");
+        registry
+            .register(&project, first.clone(), &metadata())
+            .unwrap();
+
+        assert!(matches!(
+            registry.register(&project, snapshot("Second"), &metadata()),
+            Err(StorageError::AlreadyRegistered)
+        ));
+        assert_eq!(registry.read(&project).unwrap().0, first);
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_project_name_across_paths() {
+        let data = temp_root("duplicate-name");
+        let first = temp_root("first");
+        let second = temp_root("second");
+        let registry = ProjectRegistry::for_data_root(&data);
+        registry
+            .register(&first, snapshot("Same"), &metadata())
+            .unwrap();
+
+        assert!(matches!(
+            registry.register(&second, snapshot("Same"), &metadata()),
+            Err(StorageError::DuplicateProjectName(_))
+        ));
+        assert!(!data.join("projects").join(project_id(&second)).exists());
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(first).unwrap();
         fs::remove_dir_all(second).unwrap();
     }
 
     #[test]
-    fn replacing_a_section_updates_the_existing_registration_file() {
-        let data = temp_root("section-data");
-        let project = temp_root("section-project");
-        let registry = ProjectRegistry::for_data_root(&data);
-        registry
-            .register(
-                &project,
-                "https://github.com/roven/section-project.git".to_owned(),
-                "abc123".to_owned(),
-            )
-            .unwrap();
-        let projects_dir = data.join("projects");
-        let original = projects_dir.join(format!(
-            "{}.json",
-            project.file_name().unwrap().to_string_lossy()
-        ));
-        let renamed = projects_dir.join("saved-report.json");
-        fs::rename(&original, &renamed).unwrap();
-
-        let updated = registry
-            .replace_section(&project, "summary", "concise report")
-            .unwrap()
-            .expect("registered project should update");
-
-        assert_eq!(updated.sections["summary"], "concise report");
-        assert!(!original.exists());
-        let saved: ProjectRegistration =
-            serde_json::from_slice(&fs::read(renamed).unwrap()).unwrap();
-        assert_eq!(saved.sections["summary"], "concise report");
-        fs::remove_dir_all(data).unwrap();
-        fs::remove_dir_all(project).unwrap();
-    }
-
-    #[test]
-    fn registry_does_not_duplicate_an_existing_canonical_path() {
-        let data = temp_root("data");
-        let project = temp_root("duplicate-project");
-        let registry = ProjectRegistry::for_data_root(&data);
-        registry
-            .register(
-                &project,
-                "https://github.com/roven/duplicate-project.git".to_owned(),
-                "abc123".to_owned(),
-            )
-            .unwrap();
-        registry
-            .register(
-                &project,
-                "https://github.com/roven/duplicate-project.git".to_owned(),
-                "def456".to_owned(),
-            )
-            .unwrap();
-
-        let files = fs::read_dir(data.join("projects"))
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    == Some("json")
-            })
-            .count();
-        assert_eq!(files, 1);
-        fs::remove_dir_all(data).unwrap();
-        fs::remove_dir_all(project).unwrap();
-    }
-
-    #[test]
-    fn same_project_folder_names_do_not_overwrite_each_other() {
-        let data = temp_root("data");
-        let parent = temp_root("same-name-parent");
-        let left = parent.join("left").join("app");
-        let right = parent.join("right").join("app");
-        fs::create_dir_all(&left).unwrap();
-        fs::create_dir_all(&right).unwrap();
+    fn rejects_blank_snapshot_and_metadata_strings() {
+        let data = temp_root("invalid-values");
+        let project = temp_root("project");
         let registry = ProjectRegistry::for_data_root(&data);
 
-        registry
-            .register(
-                &left,
-                "https://github.com/roven/left-app.git".to_owned(),
-                "abc123".to_owned(),
-            )
-            .unwrap();
-        registry
-            .register(
-                &right,
-                "https://github.com/roven/right-app.git".to_owned(),
-                "def456".to_owned(),
-            )
-            .unwrap_err();
-
-        assert!(data.join("projects").join("app.json").is_file());
-        assert_eq!(
-            registry.lookup(&left).unwrap(),
-            RegistrationLookup::Registered(Box::new(
-                registry
-                    .find_registration(&left.canonicalize().unwrap())
-                    .unwrap()
-                    .unwrap(),
-            ))
+        assert!(
+            registry
+                .register(&project, snapshot(" "), &metadata())
+                .is_err()
         );
-        assert!(matches!(
-            registry.lookup(&right).unwrap(),
-            RegistrationLookup::Absent
-        ));
+        assert!(
+            registry
+                .register(
+                    &project,
+                    snapshot("Valid"),
+                    &RepositoryMetadata {
+                        github_remote: " ".to_owned(),
+                        baseline_commit: "abc".to_owned(),
+                    }
+                )
+                .is_err()
+        );
+        assert!(!data.join("projects").exists());
         fs::remove_dir_all(data).unwrap();
-        fs::remove_dir_all(parent).unwrap();
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn unsupported_v1_file_rejects_listing() {
+        let data = temp_root("legacy-file");
+        let projects = data.join("projects");
+        fs::create_dir_all(&projects).unwrap();
+        fs::write(
+            projects.join("old.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "Old",
+                "canonical_path": "C:\\\\old",
+                "github_remote": "https://github.com/example/old.git",
+                "baseline_commit": "abc"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            ProjectRegistry::for_data_root(&data)
+                .list_snapshots()
+                .is_err()
+        );
+        fs::remove_dir_all(data).unwrap();
     }
 
     #[test]
@@ -852,57 +744,6 @@ mod tests {
         fs::remove_dir_all(data).unwrap();
         fs::remove_dir_all(current_project).unwrap();
         fs::remove_dir_all(other_project).unwrap();
-    }
-
-    #[test]
-    fn resume_evidence_uses_non_empty_stored_summaries_in_list_order() {
-        let data = temp_root("resume-evidence-data");
-        let alpha = temp_root("alpha");
-        let blank = temp_root("blank");
-        let whitespace = temp_root("whitespace");
-        let registry = ProjectRegistry::for_data_root(&data);
-
-        registry
-            .register(
-                &blank,
-                "https://github.com/roven/blank.git".to_owned(),
-                "abc".to_owned(),
-            )
-            .unwrap();
-        registry
-            .register(
-                &alpha,
-                "https://github.com/roven/alpha.git".to_owned(),
-                "def".to_owned(),
-            )
-            .unwrap();
-        registry
-            .register(
-                &whitespace,
-                "https://github.com/roven/whitespace.git".to_owned(),
-                "ghi".to_owned(),
-            )
-            .unwrap();
-        registry.replace_section(&blank, "summary", " ").unwrap();
-        registry
-            .replace_section(&alpha, "summary", "verified evidence")
-            .unwrap();
-        registry
-            .replace_section(&whitespace, "summary", "\n\t")
-            .unwrap();
-
-        assert_eq!(
-            registry.resume_evidence().unwrap(),
-            vec![ProjectEvidence {
-                name: alpha.file_name().unwrap().to_string_lossy().into_owned(),
-                summary: "verified evidence".into(),
-            }]
-        );
-
-        fs::remove_dir_all(data).unwrap();
-        fs::remove_dir_all(alpha).unwrap();
-        fs::remove_dir_all(blank).unwrap();
-        fs::remove_dir_all(whitespace).unwrap();
     }
 
     #[test]

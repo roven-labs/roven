@@ -1,10 +1,10 @@
-Register the current trusted project and build a compact evidence profile that Roven can later use to generate tailored resumes.
+Register the current trusted project and build its V2 project snapshot for later tailored resume generation.
 
-Use `prepare_project` to begin registration. If the project is already registered or registration is blocked, report the result and stop. Continue only when the project is ready for inspection.
+Inspect the repository first. Ask the user for the resume-ready `project_name` and the context/contribution facts that source code cannot reveal. Then call `prepare_project` once with `path`, `project_name`, `project_facts`, `user_context_facts`, and `user_contribution_facts`. If the project is already registered or registration is blocked, report the result and stop.
 
 Inspect the repository using the available read-only project tools. Read enough relevant source code, configuration, documentation, and tests to understand the important parts of the project. Do not attempt to document the repository file by file.
 
-The saved summary should preserve high-value project evidence, not general codebase documentation.
+The saved project facts should preserve high-value project evidence, not general codebase documentation.
 
 Capture information that establishes:
 
@@ -30,6 +30,6 @@ Do not infer that the user personally implemented a feature merely because it ex
 
 Keep the final evidence profile compact and information-dense. If a category has no meaningful evidence, omit it rather than filling it with weak information.
 
-After the evidence profile is complete, use `prepare_project` according to its tool contract to save it as the project summary.
+After the evidence profile and questionnaire are complete, pass them to `prepare_project` as the V2 `project_facts`, `user_context_facts`, and `user_contribution_facts` arrays.
 
-Report success only when the summary has actually been saved. Do not modify project files or perform unrelated actions.
+Report success only when the snapshot has actually been saved. Do not modify project files or perform unrelated actions.

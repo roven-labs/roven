@@ -30,7 +30,7 @@ use crate::{
     provider::{OpenAiCompatibleProvider, Provider},
     runtime_log::RuntimeLog,
     storage::{
-        ConversationEvent, EventKind, ProjectEvidence, ProjectRegistry, ProjectStore, ResumeStore,
+        ConversationEvent, EventKind, ProjectRegistry, ProjectSnapshot, ProjectStore, ResumeStore,
         SessionMeta,
     },
     tools::{RovenToolCall, RovenToolResult, ToolContext},
@@ -69,10 +69,16 @@ fn slash_command_prompt(input: &str) -> Option<&'static str> {
     (slash_command(input) == Some(SlashCommand::Register)).then_some(REGISTER_PROJECT_PROMPT)
 }
 
-fn resume_generation_prompt(job_description: &str, evidence: &[ProjectEvidence]) -> String {
-    let evidence = evidence
+fn resume_generation_prompt(job_description: &str, snapshots: &[ProjectSnapshot]) -> String {
+    let evidence = snapshots
         .iter()
-        .map(|project| format!("Project: {}\nSummary: {}", project.name, project.summary))
+        .map(|project| {
+            format!(
+                "Project: {}\nFacts:\n- {}",
+                project.project_name,
+                project.project_facts.join("\n- ")
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n\n");
     format!(
@@ -104,7 +110,7 @@ struct WorkerTurn {
 
 fn prepare_resume_generation(
     input: &str,
-    load_evidence: impl FnOnce() -> Result<Vec<ProjectEvidence>, String>,
+    load_evidence: impl FnOnce() -> Result<Vec<ProjectSnapshot>, String>,
 ) -> Result<Option<ResumeGeneration>, String> {
     if input.trim() == "/generate-resume" {
         return Err("Enter a job description after /generate-resume.".to_owned());
@@ -113,13 +119,19 @@ fn prepare_resume_generation(
         return Ok(None);
     };
     let mut evidence = load_evidence()?;
-    evidence
-        .retain(|project| !project.name.trim().is_empty() && !project.summary.trim().is_empty());
-    evidence.sort_by(|left, right| left.name.cmp(&right.name));
+    evidence.retain(|project| {
+        !project.project_name.trim().is_empty()
+            && project
+                .project_facts
+                .iter()
+                .chain(&project.user_context_facts)
+                .chain(&project.user_contribution_facts)
+                .any(|fact| !fact.trim().is_empty())
+    });
+    evidence.sort_by(|left, right| left.project_name.cmp(&right.project_name));
     if evidence.is_empty() {
         return Err(
-            "No project summaries available. Prepare projects before generating a resume."
-                .to_owned(),
+            "No project facts available. Prepare projects before generating a resume.".to_owned(),
         );
     }
     Ok(Some(ResumeGeneration {
@@ -133,7 +145,7 @@ fn submit_terminal_turn(
     session: &mut Option<SessionMeta>,
     project_instructions: &str,
     runtime_log: Option<&RuntimeLog>,
-    load_evidence: impl FnOnce() -> Result<Vec<ProjectEvidence>, String>,
+    load_evidence: impl FnOnce() -> Result<Vec<ProjectSnapshot>, String>,
 ) -> anyhow::Result<Option<WorkerTurn>> {
     let raw = state.input.clone();
     let resume_generation = match prepare_resume_generation(&raw, load_evidence) {
@@ -509,7 +521,7 @@ fn run_loop(runtime_log: Option<&RuntimeLog>) -> anyhow::Result<()> {
                     runtime_log,
                     || {
                         ProjectRegistry::for_current_user()
-                            .and_then(|registry| registry.resume_evidence())
+                            .and_then(|registry| registry.list_snapshots())
                             .map_err(|error| format!("Could not read project evidence: {error}"))
                     },
                 )? {
@@ -1226,7 +1238,7 @@ mod tests {
         WorkerEvent, apply_worker_event_with_resume_store, prepare_resume_generation,
         resume_generation_prompt, submit_terminal_turn,
     };
-    use crate::storage::{ProjectEvidence, ResumeStore};
+    use crate::storage::{ProjectSnapshot, ResumeStore};
     use crate::tools::{RovenToolCall, RovenToolResult};
 
     #[derive(Default)]
@@ -1329,7 +1341,7 @@ mod tests {
         let prompt = super::slash_command_prompt("  /register  ").expect("command should expand");
 
         assert!(prompt.contains("prepare_project"));
-        assert!(prompt.contains("summary"));
+        assert!(prompt.contains("project_name"));
         assert!(super::slash_command("/unknown").is_none());
         assert_eq!(
             super::slash_command("/resume"),
@@ -1343,9 +1355,11 @@ mod tests {
 
     #[test]
     fn resume_generation_prompt_uses_only_supplied_evidence() {
-        let evidence = vec![ProjectEvidence {
-            name: "Roven".to_owned(),
-            summary: "Project memory assistant".to_owned(),
+        let evidence = vec![ProjectSnapshot {
+            project_name: "Roven".to_owned(),
+            project_facts: vec!["Project memory assistant".to_owned()],
+            user_context_facts: Vec::new(),
+            user_contribution_facts: Vec::new(),
         }];
         let prompt = resume_generation_prompt("Rust role", &evidence);
 
@@ -1364,11 +1378,7 @@ mod tests {
         assert!(blank.unwrap_err().contains("Enter a job description"));
 
         let missing = prepare_resume_generation("/generate-resume\nRust role", || Ok(Vec::new()));
-        assert!(
-            missing
-                .unwrap_err()
-                .contains("No project summaries available")
-        );
+        assert!(missing.unwrap_err().contains("No project facts available"));
     }
 
     #[test]
@@ -1416,9 +1426,11 @@ mod tests {
         state.input = raw.to_owned();
 
         let turn = submit_terminal_turn(&mut state, &store, &mut session, "", None, || {
-            Ok(vec![ProjectEvidence {
-                name: "Roven".to_owned(),
-                summary: "Project memory assistant".to_owned(),
+            Ok(vec![ProjectSnapshot {
+                project_name: "Roven".to_owned(),
+                project_facts: vec!["Project memory assistant".to_owned()],
+                user_context_facts: Vec::new(),
+                user_contribution_facts: Vec::new(),
             }])
         })
         .unwrap()
@@ -1455,17 +1467,23 @@ mod tests {
     fn resume_generation_terminal_turn_preserves_raw_history_and_rejects_tools() {
         let generation = prepare_resume_generation("/generate-resume\nRust role", || {
             Ok(vec![
-                ProjectEvidence {
-                    name: "Zeta".to_owned(),
-                    summary: "Zeta summary".to_owned(),
+                ProjectSnapshot {
+                    project_name: "Zeta".to_owned(),
+                    project_facts: vec!["Zeta summary".to_owned()],
+                    user_context_facts: Vec::new(),
+                    user_contribution_facts: Vec::new(),
                 },
-                ProjectEvidence {
-                    name: "Ignored".to_owned(),
-                    summary: "   ".to_owned(),
+                ProjectSnapshot {
+                    project_name: "Ignored".to_owned(),
+                    project_facts: vec!["   ".to_owned()],
+                    user_context_facts: Vec::new(),
+                    user_contribution_facts: Vec::new(),
                 },
-                ProjectEvidence {
-                    name: "Alpha".to_owned(),
-                    summary: "Alpha summary".to_owned(),
+                ProjectSnapshot {
+                    project_name: "Alpha".to_owned(),
+                    project_facts: vec!["Alpha summary".to_owned()],
+                    user_context_facts: Vec::new(),
+                    user_contribution_facts: Vec::new(),
                 },
             ])
         })
