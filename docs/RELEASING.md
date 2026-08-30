@@ -1,11 +1,12 @@
 # Releasing Roven
 
-Version 1 uses `Cargo.toml` as the version source. Keep `Cargo.lock`, the
-changelog, and user-facing setup instructions in sync with it.
+Use `Cargo.toml` as the version source. Keep `Cargo.lock`, the changelog, and
+user-facing setup instructions in sync with it. The V2 project snapshot and
+registration changes are breaking, so their eventual release is `2.0.0`.
 
 ## Release checklist
 
-1. Update `package.version` in `Cargo.toml`.
+1. Update `version` in `Cargo.toml`.
 2. Run `cargo check` to refresh the package entry in `Cargo.lock`.
 3. Add the release entry to `CHANGELOG.md`.
 4. Update release-facing documentation if install behavior changed.
@@ -22,8 +23,8 @@ changelog, and user-facing setup instructions in sync with it.
 6. Review the diff and create a tag matching the package version:
 
    ```powershell
-   git tag v1.0.0
-   git push origin v1.0.0
+   git tag vX.Y.Z
+   git push origin vX.Y.Z
    ```
 
 The release workflow rebuilds the Windows executable, packages it with the

@@ -1,6 +1,7 @@
 # Setup
 
-Version 1.0.0.
+Latest released version: 1.0.0. The current development branch uses the
+unreleased V2 project snapshot format.
 
 ## Install
 
@@ -102,10 +103,13 @@ After accepting the trust prompt, enter:
 /register
 ```
 
-Roven validates the current GitHub-backed project, inspects relevant files with
-its read-only tools, and saves a compact project summary under
+Roven asks for a resume-ready project name and the context/contribution facts
+that source code cannot establish. It validates the current GitHub-backed
+project, inspects relevant files with its read-only tools, and saves an
+immutable V2 project snapshot plus Rust-generated repository metadata under
 `%LOCALAPPDATA%\Roven\data\projects`. It does not modify the project
-repository. Registration requires a committed, clean working tree.
+repository. Registration requires a committed, clean working tree, a GitHub
+remote, and a baseline commit.
 
 ## Local data locations
 
@@ -113,7 +117,8 @@ On Windows, Roven uses:
 
 ```text
 %LOCALAPPDATA%\Roven\data\provider-profiles.json
-%LOCALAPPDATA%\Roven\data\projects\<project-name>.json
+%LOCALAPPDATA%\Roven\data\projects\<sha256-of-canonical-project-path>\project_snapshot.json
+%LOCALAPPDATA%\Roven\data\projects\<sha256-of-canonical-project-path>\repository_metadata.json
 %LOCALAPPDATA%\Roven\data\sessions\<workspace-sha256>\<session-uuid>\
 %LOCALAPPDATA%\Roven\data\ollama-stream-failures.log  (only after an Ollama stream failure)
 ```
@@ -121,6 +126,9 @@ On Windows, Roven uses:
 Each session directory contains `meta.json` and
 `events.jsonl`. Tool calls are persisted in `events.jsonl` as structured
 `function_call_output` records containing the tool name, input, and output.
+Legacy V1 project JSON files are not migrated and are treated as unsupported
+project data; remove them and register the project again when storage reports
+a failure.
 
 ## Troubleshooting
 
