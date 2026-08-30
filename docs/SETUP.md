@@ -1,7 +1,6 @@
 # Setup
 
-Latest released version: 1.0.0. The current development branch uses the
-unreleased V2 project snapshot format.
+Version 1.1.0.
 
 ## Install
 

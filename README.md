@@ -4,8 +4,7 @@
 
 # Roven
 
-Latest released version: 1.0.0. The current development branch contains the
-unreleased V2 project snapshot format.
+Version 1.1.0.
 
 Roven is a native terminal project-memory assistant. The shipped executable is
 `roven`. It keeps conversations

@@ -2,7 +2,7 @@
 
 Use `Cargo.toml` as the version source. Keep `Cargo.lock`, the changelog, and
 user-facing setup instructions in sync with it. The V2 project snapshot and
-registration changes are breaking, so their eventual release is `2.0.0`.
+registration changes are part of the `1.1.0` continuation release.
 
 ## Release checklist
 

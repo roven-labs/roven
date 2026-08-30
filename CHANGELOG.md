@@ -1,8 +1,6 @@
 # Changelog
 
-## [Unreleased]
-
-The next breaking release for this work is planned as `2.0.0`.
+## [1.1.0] - 2026-08-30
 
 ### Added
 
